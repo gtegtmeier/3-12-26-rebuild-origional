@@ -3821,6 +3821,22 @@ def generate_schedule(model: DataModel, label: str,
     def step(cur: List[Assignment]) -> List[Assignment]:
         if not cur:
             return cur
+
+        def _employee_day_hard_valid(assigns: List[Assignment], emp_obj: Optional[Employee], day_name: str) -> bool:
+            if emp_obj is None:
+                return False
+            if not respects_daily_shift_limits(assigns, emp_obj, day_name):
+                return False
+            min_h = float(getattr(emp_obj, "min_hours_per_shift", 1.0) or 0.0)
+            mx_h = employee_allowed_max_shift_hours(emp_obj)
+            for st_blk, en_blk in daily_shift_blocks(assigns, emp_obj.name, day_name):
+                h_blk = hours_between_ticks(st_blk, en_blk)
+                if min_h > 0.0 and h_blk + 1e-9 < min_h:
+                    return False
+                if h_blk - mx_h > 1e-9:
+                    return False
+            return True
+
         cand = list(cur)
         # choose a non-locked assignment to mutate
         movables = [i for i,a in enumerate(cand) if not a.locked]
@@ -3836,13 +3852,19 @@ def generate_schedule(model: DataModel, label: str,
             day, area, st, en = a.day, a.area, a.start_t, a.end_t
             # remove then reassign
             old = cand.pop(i)
+            old_emp = next((x for x in model.employees if x.name == old.employee_name), None)
+            if not _employee_day_hard_valid(cand, old_emp, day):
+                cand.insert(i, old)
+                return cand
             # pick candidate employees
             pool = [e for e in model.employees if e.work_status=="Active" and bool(getattr(e, "wants_hours", True)) and area in e.areas_allowed and e.name!=old.employee_name]
             rnd.shuffle(pool)
             for e2 in pool[:20]:
                 if feasible_add(e2, day, st, en, area, cand):
-                    cand.append(Assignment(day, area, st, en, e2.name, locked=False, source="solver"))
-                    return cand
+                    trial = list(cand)
+                    trial.append(Assignment(day, area, st, en, e2.name, locked=False, source="solver"))
+                    if _employee_day_hard_valid(trial, e2, day):
+                        return trial
             # revert
             cand.insert(i, old)
             return cand
@@ -3863,10 +3885,16 @@ def generate_schedule(model: DataModel, label: str,
                 return cand
             # build temp list with removals
             temp_list = [x for k,x in enumerate(cand) if k not in (i,j)]
+            if not _employee_day_hard_valid(temp_list, empA, a.day):
+                return cand
+            if not _employee_day_hard_valid(temp_list, empB, b.day):
+                return cand
             if feasible_add(empB, a.day, a.start_t, a.end_t, a.area, temp_list) and feasible_add(empA, b.day, b.start_t, b.end_t, b.area, temp_list):
-                temp_list.append(Assignment(a.day,a.area,a.start_t,a.end_t,empB.name,locked=False,source="solver"))
-                temp_list.append(Assignment(b.day,b.area,b.start_t,b.end_t,empA.name,locked=False,source="solver"))
-                return temp_list
+                trial = list(temp_list)
+                trial.append(Assignment(a.day,a.area,a.start_t,a.end_t,empB.name,locked=False,source="solver"))
+                trial.append(Assignment(b.day,b.area,b.start_t,b.end_t,empA.name,locked=False,source="solver"))
+                if _employee_day_hard_valid(trial, empB, a.day) and _employee_day_hard_valid(trial, empA, b.day):
+                    return trial
             return cand
 
     # Multi-start local search (random restarts)
