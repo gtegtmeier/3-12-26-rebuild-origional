@@ -1824,6 +1824,77 @@ def daily_shift_blocks(assigns: List[Assignment], emp_name: str, day: str, extra
         intervals.append(extra)
     return _merge_touching_intervals(intervals)
 
+def _practical_shift_target_hours(e: Optional[Employee], learned_patterns: Optional[Dict[str, Any]] = None) -> float:
+    """Soft practical target for contiguous shift length.
+
+    Priority: learned preferred length -> midpoint of employee min/max -> conservative default.
+    """
+    if e is None:
+        return 4.0
+    try:
+        if learned_patterns:
+            p = (learned_patterns.get(e.name) or {}) if isinstance(learned_patterns, dict) else {}
+            pref_len_ticks = int((p or {}).get("preferred_len_ticks", 0) or 0)
+            if pref_len_ticks > 0:
+                return max(2.0, min(8.0, pref_len_ticks / float(TICKS_PER_HOUR)))
+    except Exception:
+        pass
+    min_h = max(0.5, float(getattr(e, "min_hours_per_shift", 1.0) or 1.0))
+    max_h = max(min_h, float(employee_allowed_max_shift_hours(e) or min_h))
+    if max_h - min_h <= 0.25:
+        return max(2.0, min(8.0, max_h))
+    return max(2.0, min(8.0, (min_h + min(max_h, 8.0)) * 0.5))
+
+def _schedule_quality_penalty_units(model: DataModel,
+                                    assignments: List[Assignment],
+                                    learned_patterns: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
+    """Returns soft quality units used to discourage fragmented and micro shifts."""
+    emp_by_name = {e.name: e for e in getattr(model, "employees", []) or []}
+    by_emp_day: Dict[Tuple[str, str], List[Tuple[int, int]]] = {}
+    for a in assignments or []:
+        by_emp_day.setdefault((a.employee_name, a.day), []).append((int(a.start_t), int(a.end_t)))
+
+    frag_units = 0.0
+    short_units = 0.0
+    pref_len_units = 0.0
+    fragmented_days = 0
+    micro_1h = 0
+    micro_2h = 0
+
+    for (emp_name, _day), intervals in by_emp_day.items():
+        blocks = _merge_touching_intervals(intervals)
+        if not blocks:
+            continue
+        e = emp_by_name.get(emp_name)
+        split_ok = bool(getattr(e, "split_shifts_ok", True)) if e else True
+        if len(blocks) > 1:
+            fragmented_days += 1
+            base_mult = 1.25 if split_ok else 4.0
+            frag_units += (len(blocks) - 1) * base_mult
+
+        target_h = _practical_shift_target_hours(e, learned_patterns)
+        for st, en in blocks:
+            h = hours_between_ticks(st, en)
+            if h <= 1.0 + 1e-9:
+                micro_1h += 1
+                short_units += 8.0
+            elif h <= 2.0 + 1e-9:
+                micro_2h += 1
+                short_units += 3.5
+            elif h < 3.0 - 1e-9:
+                short_units += 1.25
+            if target_h > 0.0:
+                pref_len_units += min(4.0, abs(h - target_h))
+
+    return {
+        "frag_units": float(frag_units),
+        "short_units": float(short_units),
+        "pref_len_units": float(pref_len_units),
+        "fragmented_days": float(fragmented_days),
+        "micro_1h": float(micro_1h),
+        "micro_2h": float(micro_2h),
+    }
+
 def respects_daily_shift_limits(assigns: List[Assignment], e: Employee, day: str, extra: Optional[Tuple[int,int]] = None) -> bool:
     blocks = daily_shift_blocks(assigns, e.name, day, extra=extra)
     n = len(blocks)
@@ -2230,6 +2301,18 @@ def schedule_score(model: DataModel, label: str,
         except Exception:
             pass
 
+    # Phase 8B: aggressive anti-fragmentation / anti-micro-shift quality bias (soft)
+    try:
+        pats = getattr(model, "learned_patterns", {}) or {}
+        q = _schedule_quality_penalty_units(model, assignments, pats)
+        split_weight = max(6.0, w_split * 1.8)
+        short_weight = 9.0 if prefer_longer else 6.0
+        pref_len_weight = 2.5
+        pen += q.get("frag_units", 0.0) * split_weight
+        pen += q.get("short_units", 0.0) * short_weight
+        pen += q.get("pref_len_units", 0.0) * pref_len_weight
+    except Exception:
+        pass
 
     # Final score
     return float(pen)
@@ -2288,6 +2371,9 @@ def schedule_score_breakdown(model: DataModel, label: str,
         "employee_fit_pen": 0.0,
         "utilization_balance_pen": 0.0,
         "utilization_near_cap_pen": 0.0,
+        "fragmentation_quality_pen": 0.0,
+        "micro_shift_quality_pen": 0.0,
+        "preferred_length_quality_pen": 0.0,
     }
 
     # Phase 4 C3: Risk-Aware Optimization (soft resilience buffer)
@@ -2476,6 +2562,18 @@ def schedule_score_breakdown(model: DataModel, label: str,
                 if fit_score < 0:
                     fit_units += abs(float(fit_score))
             out['employee_fit_pen'] += fit_units
+    except Exception:
+        pass
+
+    try:
+        pats = getattr(model, "learned_patterns", {}) or {}
+        q = _schedule_quality_penalty_units(model, assignments, pats)
+        split_weight = max(6.0, w_split * 1.8)
+        short_weight = 9.0 if prefer_longer else 6.0
+        pref_len_weight = 2.5
+        out["fragmentation_quality_pen"] += q.get("frag_units", 0.0) * split_weight
+        out["micro_shift_quality_pen"] += q.get("short_units", 0.0) * short_weight
+        out["preferred_length_quality_pen"] += q.get("pref_len_units", 0.0) * pref_len_weight
     except Exception:
         pass
 
@@ -3377,14 +3475,40 @@ def generate_schedule(model: DataModel, label: str,
             try:
                 segs = emp_day_segments.get((e.name, day), [])
                 if segs:
-                    # Bonus for extending an adjacent shift in same area
-                    adj = any((aa==area and (aen==st or ast==en)) for (ast,aen,aa) in segs)
-                    if adj and w_extend > 0.0:
-                        score += w_extend
-                    # Penalty for creating an additional non-adjacent fragment in the day
-                    non_adj = any((aen < st or ast > en) for (ast,aen,aa) in segs)
-                    if non_adj and (not adj) and w_frag > 0.0:
-                        score -= w_frag
+                    merged_existing = _merge_touching_intervals([(int(ast), int(aen)) for (ast, aen, _aa) in segs])
+                    merged_with_new = _merge_touching_intervals([(int(ast), int(aen)) for (ast, aen, _aa) in segs] + [(int(st), int(en))])
+                    split_ok = bool(getattr(e, "split_shifts_ok", True))
+                    target_h = _practical_shift_target_hours(e, learned_patterns)
+                    seg_h = float(hours_between_ticks(st, en))
+
+                    created_new_block = len(merged_with_new) > len(merged_existing)
+                    if created_new_block:
+                        block_pen = (w_frag * 3.5) if split_ok else (w_frag * 9.0 + 20.0)
+                        score -= block_pen
+
+                    # Strong bonus for contiguous growth (touching existing block), regardless of area.
+                    extended = len(merged_with_new) < (len(merged_existing) + 1)
+                    if extended and w_extend > 0.0:
+                        score += (w_extend * 3.0)
+
+                    # Discourage isolated micro fragments.
+                    if seg_h <= 1.0 + 1e-9:
+                        score -= 22.0
+                    elif seg_h <= 2.0 + 1e-9:
+                        score -= 9.0
+
+                    # Prefer moves that help an existing block approach practical length.
+                    best_delta = None
+                    for bst, ben in merged_with_new:
+                        if int(bst) <= int(st) and int(en) <= int(ben):
+                            new_h = hours_between_ticks(bst, ben)
+                            old_h = max(0.0, new_h - seg_h)
+                            before_gap = abs(old_h - target_h)
+                            after_gap = abs(new_h - target_h)
+                            best_delta = (before_gap - after_gap)
+                            break
+                    if best_delta is not None:
+                        score += best_delta * 3.5
             except Exception as ex:
                 _log_once('util_segment_scoring', f"[solver] utilization(segment) scoring failed: {ex}")
 
@@ -3774,6 +3898,18 @@ def generate_schedule(model: DataModel, label: str,
     unfilled0 = compute_unfilled(base_assigns)
     best = (score_assignments(base_assigns, unfilled0), base_assigns)
 
+    def _quality_key(assigns: List[Assignment]) -> Tuple[float, float, float]:
+        try:
+            pats = getattr(model, "learned_patterns", {}) or {}
+            q = _schedule_quality_penalty_units(model, assigns, pats)
+            return (
+                float(q.get("short_units", 0.0)),
+                float(q.get("frag_units", 0.0)),
+                float(q.get("pref_len_units", 0.0)),
+            )
+        except Exception:
+            return (0.0, 0.0, 0.0)
+
     def feasible_add(emp: Employee, day: str, st: int, en: int, area: str, assigns: List[Assignment]) -> bool:
         # availability + overlap + max hours + hard global/coverage caps
         # clopen: approximate by recomputing a simple clopen map per evaluation (fast enough at small n)
@@ -3818,7 +3954,7 @@ def generate_schedule(model: DataModel, label: str,
             return False
         return True
 
-    def step(cur: List[Assignment]) -> List[Assignment]:
+    def step(cur: List[Assignment], cur_quality: Optional[Tuple[float,float,float]] = None) -> List[Assignment]:
         if not cur:
             return cur
 
@@ -3864,6 +4000,12 @@ def generate_schedule(model: DataModel, label: str,
                     trial = list(cand)
                     trial.append(Assignment(day, area, st, en, e2.name, locked=False, source="solver"))
                     if _employee_day_hard_valid(trial, e2, day):
+                        if cur_quality is not None:
+                            q_new = _quality_key(trial)
+                            if q_new[0] > cur_quality[0] + 0.5:
+                                continue
+                            if q_new[1] > cur_quality[1] + 0.25 and q_new[0] > cur_quality[0] - 0.25:
+                                continue
                         return trial
             # revert
             cand.insert(i, old)
@@ -3894,6 +4036,12 @@ def generate_schedule(model: DataModel, label: str,
                 trial.append(Assignment(a.day,a.area,a.start_t,a.end_t,empB.name,locked=False,source="solver"))
                 trial.append(Assignment(b.day,b.area,b.start_t,b.end_t,empA.name,locked=False,source="solver"))
                 if _employee_day_hard_valid(trial, empB, a.day) and _employee_day_hard_valid(trial, empA, b.day):
+                    if cur_quality is not None:
+                        q_new = _quality_key(trial)
+                        if q_new[0] > cur_quality[0] + 0.5:
+                            return cand
+                        if q_new[1] > cur_quality[1] + 0.25 and q_new[0] > cur_quality[0] - 0.25:
+                            return cand
                     return trial
             return cand
 
@@ -3907,7 +4055,7 @@ def generate_schedule(model: DataModel, label: str,
         # seed: deterministic-ish but different per restart
         rnd.seed((hash(label) & 0xffffffff) ^ (r * 2654435761))
         for _warm in range(10 + r):
-            cur = step(cur)
+            cur = step(cur, _quality_key(cur))
         unfilled = compute_unfilled(cur)
         cur_score = score_assignments(cur, unfilled)
 
@@ -3917,7 +4065,7 @@ def generate_schedule(model: DataModel, label: str,
             if time_limit_s:
                 if (datetime.datetime.now() - t0).total_seconds() >= time_limit_s:
                     break
-            nxt = step(cur)
+            nxt = step(cur, _quality_key(cur))
             unfilled = compute_unfilled(nxt)
             sc = score_assignments(nxt, unfilled)
             if sc < cur_score:
@@ -3943,7 +4091,7 @@ def generate_schedule(model: DataModel, label: str,
             break
         if stop_early and best[0] <= 0:
             break
-        nxt = step(cur)
+        nxt = step(cur, _quality_key(cur))
         unfilled = compute_unfilled(nxt)
         sc = score_assignments(nxt, unfilled)
         if sc < cur_score:
