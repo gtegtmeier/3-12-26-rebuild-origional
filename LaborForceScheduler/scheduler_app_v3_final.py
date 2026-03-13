@@ -481,6 +481,47 @@ def is_summer_for_minor_14_15(day_date: datetime.date) -> bool:
     ld = labor_day(day_date.year)
     return (day_date >= datetime.date(day_date.year, 6, 1)) and (day_date <= ld)
 
+def nd_minor_daily_hour_cap(model: "DataModel", e: "Employee", day: str) -> Optional[float]:
+    """Return ND daily legal cap (hours) for this employee/day, or None when not applicable."""
+    if not bool(getattr(getattr(model, "nd_rules", None), "enforce", False)):
+        return None
+    if str(getattr(e, "minor_type", "ADULT") or "ADULT") != "MINOR_14_15":
+        return None
+    if bool(getattr(model.nd_rules, "is_school_week", True)) and day in {"Mon", "Tue", "Wed", "Thu", "Fri"}:
+        return 3.0
+    return 8.0
+
+def nd_minor_weekly_hour_cap(model: "DataModel", e: "Employee") -> Optional[float]:
+    """Return ND weekly legal cap (hours) for this employee, or None when not applicable."""
+    if not bool(getattr(getattr(model, "nd_rules", None), "enforce", False)):
+        return None
+    if str(getattr(e, "minor_type", "ADULT") or "ADULT") != "MINOR_14_15":
+        return None
+    return 18.0 if bool(getattr(model.nd_rules, "is_school_week", True)) else 40.0
+
+def nd_minor_hours_feasible(model: "DataModel", e: "Employee", day: str, st: int, en: int,
+                            assignments: List["Assignment"]) -> bool:
+    """Hard feasibility check for ND minor daily/weekly hour limits."""
+    daily_cap = nd_minor_daily_hour_cap(model, e, day)
+    weekly_cap = nd_minor_weekly_hour_cap(model, e)
+    if daily_cap is None or weekly_cap is None:
+        return True
+    add_h = hours_between_ticks(st, en)
+    day_h = add_h
+    week_h = add_h
+    for a in assignments:
+        if a.employee_name != e.name:
+            continue
+        h = hours_between_ticks(a.start_t, a.end_t)
+        week_h += h
+        if a.day == day:
+            day_h += h
+    if day_h - daily_cap > 1e-9:
+        return False
+    if week_h - weekly_cap > 1e-9:
+        return False
+    return True
+
 # -----------------------------
 # Data models
 # -----------------------------
@@ -2356,6 +2397,8 @@ def _explain_feasible_reason(model: DataModel, label: str, emp: Employee,
     hours_now = sum(hours_between_ticks(a.start_t,a.end_t) for a in assignments if a.employee_name==emp.name)
     if hours_now + h > emp.max_weekly_hours + 1e-9:
         return False, "Would exceed employee max weekly hours"
+    if not nd_minor_hours_feasible(model, emp, day, st, en, assignments):
+        return False, "Would exceed ND minor daily/weekly hour limits"
     return True, ""
 
 def history_stats_from(model: DataModel) -> Dict[str, Dict[str,int]]:
@@ -3101,6 +3144,10 @@ def generate_schedule(model: DataModel, label: str,
             if locked_ok:
                 warnings.append(f"Locked fixed shift exceeds max weekly hours: {e.name} {a.day} {tick_to_hhmm(a.start_t)}-{tick_to_hhmm(a.end_t)}")
             return False
+        if not nd_minor_hours_feasible(model, e, a.day, a.start_t, a.end_t, assignments):
+            if locked_ok:
+                warnings.append(f"Locked fixed shift violates ND minor hour limits: {e.name} {a.day} {tick_to_hhmm(a.start_t)}-{tick_to_hhmm(a.end_t)}")
+            return False
         assignments.append(a)
         try:
             emp_day_segments[(a.employee_name, a.day)].append((int(a.start_t), int(a.end_t), a.area))
@@ -3300,6 +3347,8 @@ def generate_schedule(model: DataModel, label: str,
                 return False
         h = hours_between_ticks(st,en)
         if emp_hours[e.name] + h > e.max_weekly_hours + 1e-9:
+            return False
+        if not nd_minor_hours_feasible(model, e, day, st, en, assignments):
             return False
         # max cap per tick
         if _violates_max(day, area, st, en, coverage):
@@ -3648,6 +3697,8 @@ def generate_schedule(model: DataModel, label: str,
         hours_now = sum(hours_between_ticks(a.start_t,a.end_t) for a in assigns if a.employee_name==emp.name)
         if hours_now + h > emp.max_weekly_hours + 1e-9:
             return False
+        if not nd_minor_hours_feasible(model, emp, day, st, en, assigns):
+            return False
         return True
 
     def step(cur: List[Assignment]) -> List[Assignment]:
@@ -3919,6 +3970,8 @@ def generate_schedule(model: DataModel, label: str,
                     )
                     if candidate_weekly_hours - float(getattr(e, "max_weekly_hours", 9999.0)) > 1e-9:
                         continue
+                    if not nd_minor_hours_feasible(model, e, day, st, en, assignments):
+                        continue
                     if max_weekly_cap > 0.0:
                         candidate_total_labor = sum(hours_between_ticks(ax.start_t, ax.end_t) for ax in candidate_assignments)
                         if candidate_total_labor - max_weekly_cap > 1e-9:
@@ -3952,30 +4005,24 @@ def generate_schedule(model: DataModel, label: str,
             k = (day, area, tt)
             coverage[k] = coverage.get(k, 0) + 1
 
-    # minor daily/weekly checks for 14-15
+    # ND minor hour limits are now hard constraints during all add/mutate paths.
+    # Keep a lightweight invariant check for diagnostics; this should never fire.
     if model.nd_rules.enforce:
-        ws = week_sun_from_label(label) or datetime.date.today()
         for e in model.employees:
             if e.work_status!="Active" or e.minor_type!="MINOR_14_15":
                 continue
-            # daily hours
             daily: Dict[str,float] = {d: 0.0 for d in DAYS}
             for a in assignments:
                 if a.employee_name==e.name:
                     daily[a.day] += hours_between_ticks(a.start_t,a.end_t)
-            for d,h in daily.items():
-                # conservative: treat Mon-Fri as school days if school week
-                if model.nd_rules.is_school_week and d in ["Mon","Tue","Wed","Thu","Fri"]:
-                    if h > 3.0 + 1e-9:
-                        warnings.append(f"ND Minor 14-15: {e.name} exceeds 3 hrs on school day {d} ({h:.1f})")
-                else:
-                    if h > 8.0 + 1e-9:
-                        warnings.append(f"ND Minor 14-15: {e.name} exceeds 8 hrs on {d} ({h:.1f})")
-            week_h = sum(daily.values())
-            if model.nd_rules.is_school_week and week_h > 18.0 + 1e-9:
-                warnings.append(f"ND Minor 14-15: {e.name} exceeds 18 hrs in school week ({week_h:.1f})")
-            if (not model.nd_rules.is_school_week) and week_h > 40.0 + 1e-9:
-                warnings.append(f"ND Minor 14-15: {e.name} exceeds 40 hrs in non-school week ({week_h:.1f})")
+            weekly_h = float(sum(daily.values()))
+            weekly_cap = nd_minor_weekly_hour_cap(model, e)
+            if weekly_cap is not None and weekly_h - weekly_cap > 1e-9:
+                warnings.append(f"INTERNAL CHECK: ND minor weekly cap violated for {e.name} ({weekly_h:.1f} > {weekly_cap:.1f}).")
+            for d, h in daily.items():
+                daily_cap = nd_minor_daily_hour_cap(model, e, d)
+                if daily_cap is not None and h - daily_cap > 1e-9:
+                    warnings.append(f"INTERNAL CHECK: ND minor daily cap violated for {e.name} on {d} ({h:.1f} > {daily_cap:.1f}).")
 
     # participation reporting (Milestone 4)
     if participation_missed:
