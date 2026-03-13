@@ -3634,8 +3634,8 @@ def generate_schedule(model: DataModel, label: str,
         h = hours_between_ticks(st,en)
         max_weekly_cap = float(getattr(model.manager_goals, 'maximum_weekly_cap', 0.0) or 0.0)
         if max_weekly_cap > 0.0:
-            total_hours_now = sum(hours_between_ticks(a.start_t, a.end_t) for a in assigns)
-            if (total_hours_now + h) - max_weekly_cap > 1e-9:
+            candidate_total_hours = sum(hours_between_ticks(a.start_t, a.end_t) for a in assigns) + h
+            if candidate_total_hours - max_weekly_cap > 1e-9:
                 return False
         hours_now = sum(hours_between_ticks(a.start_t,a.end_t) for a in assigns if a.employee_name==emp.name)
         if hours_now + h > emp.max_weekly_hours + 1e-9:
@@ -3849,15 +3849,31 @@ def generate_schedule(model: DataModel, label: str,
 
         best = None
         best_score = -1
+        min_shift_ticks = max(one_hour_ticks, int(math.ceil(max(0.0, float(getattr(e, "min_hours_per_shift", 1.0) or 1.0)) * TICKS_PER_HOUR)))
+        max_shift_ticks = int(max(0, round(float(getattr(e, "max_hours_per_shift", 8.0) or 8.0) * TICKS_PER_HOUR)))
+        if max_shift_ticks < min_shift_ticks:
+            participation_missed[nm] = "Employee min shift exceeds employee max shift; no feasible repair segment."
+            continue
 
-        # Search for a feasible 1-hour segment, prioritizing places that help MIN then preferred coverage.
+        # Search for a feasible segment, prioritizing places that help MIN then preferred coverage.
         for day in DAYS:
             for area in getattr(e, "areas_allowed", []) or []:
-                for st in range(0, DAY_TICKS - one_hour_ticks + 1):
-                    en = st + one_hour_ticks
+                area_open_t, area_close_t = area_open_close_ticks(model, area)
+                earliest_st = max(0, int(area_open_t))
+                latest_st = min(DAY_TICKS - min_shift_ticks, int(area_close_t) - min_shift_ticks)
+                if latest_st < earliest_st:
+                    continue
+                max_len_for_area = int(area_close_t) - int(area_open_t)
+                seg_ticks = min(min_shift_ticks, max_shift_ticks, max_len_for_area)
+                if seg_ticks < min_shift_ticks:
+                    continue
+                for st in range(earliest_st, latest_st + 1):
+                    en = st + seg_ticks
 
                     # availability + hard constraints
                     if not is_employee_available(model, e, label, day, st, en, area, clopen_min_start):
+                        continue
+                    if not respects_max_consecutive_days(assignments, e, day):
                         continue
                     if not respects_daily_shift_limits(assignments, e, day, extra=(st, en)):
                         continue
@@ -3876,6 +3892,33 @@ def generate_schedule(model: DataModel, label: str,
                     if max_weekly_cap > 0.0 and (total_labor_hours_now + seg_h) - max_weekly_cap > 1e-9:
                         continue
 
+                    candidate_assignment = Assignment(day, area, st, en, e.name, locked=False, source="participation")
+                    candidate_assignments = assignments + [candidate_assignment]
+
+                    # Validate candidate schedule still respects hard rules after insertion.
+                    if not respects_max_consecutive_days(candidate_assignments, e, day):
+                        continue
+                    if any(
+                        ex.employee_name == e.name and ex.day == day and ex is not candidate_assignment
+                        and not (en <= ex.start_t or st >= ex.end_t)
+                        for ex in candidate_assignments
+                    ):
+                        continue
+                    candidate_weekly_hours = sum(
+                        hours_between_ticks(ax.start_t, ax.end_t)
+                        for ax in candidate_assignments
+                        if ax.employee_name == e.name
+                    )
+                    if candidate_weekly_hours - float(getattr(e, "max_weekly_hours", 9999.0)) > 1e-9:
+                        continue
+                    if max_weekly_cap > 0.0:
+                        candidate_total_labor = sum(hours_between_ticks(ax.start_t, ax.end_t) for ax in candidate_assignments)
+                        if candidate_total_labor - max_weekly_cap > 1e-9:
+                            continue
+                    candidate_cov = count_coverage_per_tick(candidate_assignments)
+                    if any(candidate_cov.get((day, area, tt), 0) > max_req2.get((day, area, tt), 10**9) for tt in range(st, en)):
+                        continue
+
                     sc = _segment_need_score(day, area, st, en)
                     if sc > best_score:
                         best_score = sc
@@ -3884,9 +3927,9 @@ def generate_schedule(model: DataModel, label: str,
         if best is None:
             # Record miss with a helpful reason
             if max_weekly_cap > 0.0 and total_labor_hours_now + 1.0 - max_weekly_cap > 1e-9:
-                participation_missed[nm] = "No feasible 1-hour slot without exceeding Maximum Weekly Labor Cap."
+                participation_missed[nm] = "No feasible participation slot without exceeding Maximum Weekly Labor Cap."
             else:
-                participation_missed[nm] = "No feasible 1-hour slot found under hard constraints (availability/max staffing/daily rules)."
+                participation_missed[nm] = "No feasible participation slot found under hard constraints (availability/max staffing/daily/consecutive-day rules)."
             continue
 
         day, area, st, en = best
