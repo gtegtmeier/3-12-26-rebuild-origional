@@ -1805,19 +1805,27 @@ def respects_max_consecutive_days(assigns: List[Assignment], e: Employee, day: s
     lim = int(getattr(e, "max_consecutive_days", 0) or 0)
     if lim <= 0:
         return True
+    if lim >= len(DAYS):
+        return True
     days_worked = {a.day for a in assigns if a.employee_name == e.name}
     days_worked.add(day)
-    idxs = sorted({DAYS.index(d) for d in days_worked if d in DAYS})
-    if not idxs:
+    flags = [False] * len(DAYS)
+    for d in days_worked:
+        if d in DAYS:
+            flags[DAYS.index(d)] = True
+    if not any(flags):
         return True
-    run = 1
-    maxrun = 1
-    for i in range(1, len(idxs)):
-        if idxs[i] == idxs[i-1] + 1:
+    doubled = flags + flags
+    run = 0
+    maxrun = 0
+    for worked in doubled:
+        if worked:
             run += 1
+            if run > len(DAYS):
+                run = len(DAYS)
             maxrun = max(maxrun, run)
         else:
-            run = 1
+            run = 0
     return maxrun <= lim
 
 
