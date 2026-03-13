@@ -2,13 +2,46 @@
 import argparse
 import copy
 import json
+import os
 import random
 import sys
+import tempfile
+import zipfile
 from collections import Counter, defaultdict
 
 sys.path.append('LaborForceScheduler')
 import scheduler_app_v3_final as sched
 
+
+
+
+def resolve_data_path(data_arg):
+    if data_arg and os.path.exists(data_arg):
+        return data_arg
+
+    if data_arg and '::' in data_arg:
+        zip_path, member = data_arg.split('::', 1)
+        if os.path.exists(zip_path):
+            with zipfile.ZipFile(zip_path) as zf:
+                with zf.open(member) as src:
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
+                    tmp.write(src.read())
+                    tmp.flush()
+                    tmp.close()
+                    return tmp.name
+
+    zip_default = 'LaborForceScheduler_V3_5_Phase5_E3_M12_EMPLOYEE_LOCKED_PATCH.zip'
+    zip_member = 'LaborForceScheduler/data/scheduler_data.json'
+    if data_arg in (None, '', 'auto') and os.path.exists(zip_default):
+        with zipfile.ZipFile(zip_default) as zf:
+            with zf.open(zip_member) as src:
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
+                tmp.write(src.read())
+                tmp.flush()
+                tmp.close()
+                return tmp.name
+
+    return data_arg
 
 def max_consecutive_info(assignments, employee):
     lim = int(getattr(employee, 'max_consecutive_days', 0) or 0)
@@ -121,15 +154,19 @@ def run_once(model, label, seed, optimizer_iterations=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--data', default='LaborForceScheduler/data/scheduler_data.json')
+    ap.add_argument('--data', default='auto',
+                    help="Path to scheduler_data.json. Also supports ZIP::member syntax; default auto-loads from the bundled project ZIP.")
     ap.add_argument('--label', default='')
     ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args()
 
+    resolved_data = resolve_data_path(args.data)
     try:
-        model = sched.load_data(args.data)
+        model = sched.load_data(resolved_data)
     except FileNotFoundError:
         print(f"ERROR: data file not found: {args.data}")
+        if resolved_data != args.data:
+            print(f"Resolved path attempted: {resolved_data}")
         print("Pass --data with the included dataset path and rerun.")
         raise SystemExit(2)
     label = args.label or f"Week starting {model.week_start_sun or '2026-03-08'}"
@@ -150,6 +187,8 @@ def main():
     }
 
     print('=== MAX CONSECUTIVE DAYS TRACE ===')
+    print(f"data={args.data}")
+    print(f"resolved_data={resolved_data}")
     print(f"label={label}")
     print(f"seed={args.seed}")
     print(f"optimizer_iterations(full)={model.settings.optimizer_iterations}")
