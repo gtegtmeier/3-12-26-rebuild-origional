@@ -1870,6 +1870,123 @@ def respects_max_consecutive_days(assigns: List[Assignment], e: Employee, day: s
     return maxrun <= lim
 
 
+def validate_final_schedule_hard(model: DataModel, label: str, assignments: List[Assignment]) -> List[str]:
+    """Strict hard-rule validation for the final schedule returned by generate_schedule()."""
+    violations: List[str] = []
+    emp_by_name: Dict[str, Employee] = {e.name: e for e in getattr(model, "employees", []) or []}
+    by_emp: Dict[str, List[Assignment]] = {}
+    for a in assignments or []:
+        by_emp.setdefault(a.employee_name, []).append(a)
+
+    # Per-employee hard checks (availability/work status/overlap/daily limits/consecutive-day/weekly caps/minor rules).
+    for emp_name, emp_assigns in by_emp.items():
+        e = emp_by_name.get(emp_name)
+        if e is None:
+            violations.append(f"employee={emp_name} rule=unknown-employee assignments={len(emp_assigns)}")
+            continue
+
+        ordered = sorted(emp_assigns, key=lambda x: (DAYS.index(x.day), int(x.start_t), int(x.end_t), AREAS.index(x.area) if x.area in AREAS else 999))
+
+        for i in range(len(ordered)):
+            for j in range(i + 1, len(ordered)):
+                if ordered[i].day != ordered[j].day:
+                    break
+                if overlaps(ordered[i], ordered[j]):
+                    violations.append(
+                        f"employee={emp_name} day={ordered[i].day} rule=overlap "
+                        f"assignments={tick_to_hhmm(ordered[i].start_t)}-{tick_to_hhmm(ordered[i].end_t)} {ordered[i].area} and "
+                        f"{tick_to_hhmm(ordered[j].start_t)}-{tick_to_hhmm(ordered[j].end_t)} {ordered[j].area}"
+                    )
+
+        clopen_min_start: Dict[Tuple[str, str], int] = {}
+        weekly_hours = 0.0
+        daily_hours: Dict[str, float] = {d: 0.0 for d in DAYS}
+        for a in ordered:
+            if not is_employee_available(model, e, label, a.day, int(a.start_t), int(a.end_t), a.area, clopen_min_start):
+                violations.append(
+                    f"employee={emp_name} day={a.day} rule=availability/override/blocked-time "
+                    f"assignment={tick_to_hhmm(a.start_t)}-{tick_to_hhmm(a.end_t)} {a.area}"
+                )
+            h = hours_between_ticks(int(a.start_t), int(a.end_t))
+            weekly_hours += h
+            daily_hours[a.day] += h
+            apply_clopen_from(model, e, a, clopen_min_start)
+
+        for day in DAYS:
+            day_assigns = [a for a in ordered if a.day == day]
+            if not day_assigns:
+                continue
+            if not respects_daily_shift_limits(ordered, e, day):
+                violations.append(f"employee={emp_name} day={day} rule=max-shifts-per-day/split-shift/max-hours-per-shift")
+            blocks = daily_shift_blocks(ordered, emp_name, day)
+            min_h = float(getattr(e, "min_hours_per_shift", 1.0) or 0.0)
+            mx_h = employee_allowed_max_shift_hours(e)
+            for st, en in blocks:
+                block_h = hours_between_ticks(st, en)
+                if min_h > 0.0 and block_h + 1e-9 < min_h:
+                    violations.append(
+                        f"employee={emp_name} day={day} rule=min-hours-per-shift "
+                        f"block={tick_to_hhmm(st)}-{tick_to_hhmm(en)} hours={block_h:.1f} min={min_h:.1f}"
+                    )
+                if block_h - mx_h > 1e-9:
+                    violations.append(
+                        f"employee={emp_name} day={day} rule=max-hours-per-shift "
+                        f"block={tick_to_hhmm(st)}-{tick_to_hhmm(en)} hours={block_h:.1f} max={mx_h:.1f}"
+                    )
+            if not respects_max_consecutive_days(ordered, e, day):
+                violations.append(f"employee={emp_name} day={day} rule=max-consecutive-days")
+
+        max_weekly = float(getattr(e, "max_weekly_hours", 0.0) or 0.0)
+        if max_weekly > 0.0 and (weekly_hours - max_weekly) > 1e-9:
+            violations.append(
+                f"employee={emp_name} rule=employee-max-weekly-hours scheduled={weekly_hours:.1f} max={max_weekly:.1f}"
+            )
+
+        if model.nd_rules.enforce and e.minor_type == "MINOR_14_15":
+            weekly_cap = nd_minor_weekly_hour_cap(model, e)
+            if weekly_cap is not None and (weekly_hours - weekly_cap) > 1e-9:
+                violations.append(
+                    f"employee={emp_name} rule=nd-minor-weekly-hours scheduled={weekly_hours:.1f} max={weekly_cap:.1f}"
+                )
+            for day, day_h in daily_hours.items():
+                daily_cap = nd_minor_daily_hour_cap(model, e, day)
+                if daily_cap is not None and (day_h - daily_cap) > 1e-9:
+                    violations.append(
+                        f"employee={emp_name} day={day} rule=nd-minor-daily-hours scheduled={day_h:.1f} max={daily_cap:.1f}"
+                    )
+            ws = week_sun_from_label(label) or datetime.date.today()
+            for a in ordered:
+                ddate = day_date(ws, a.day)
+                summer = is_summer_for_minor_14_15(ddate)
+                earliest = hhmm_to_tick("07:00")
+                latest = hhmm_to_tick("21:00") if summer else hhmm_to_tick("19:00")
+                if int(a.start_t) < earliest or int(a.end_t) > latest:
+                    violations.append(
+                        f"employee={emp_name} day={a.day} rule=nd-minor-time-window "
+                        f"assignment={tick_to_hhmm(a.start_t)}-{tick_to_hhmm(a.end_t)} allowed={tick_to_hhmm(earliest)}-{tick_to_hhmm(latest)}"
+                    )
+
+    # Global caps (max staffing + weekly labor cap).
+    coverage = count_coverage_per_tick(assignments)
+    _min_req, _pref_req, max_req = build_requirement_maps(model.requirements, goals=getattr(model, 'manager_goals', None), store_info=getattr(model, "store_info", None))
+    for k, cap in max_req.items():
+        cov = int(coverage.get(k, 0))
+        if cov > int(cap):
+            day, area, tick = k
+            violations.append(
+                f"day={day} rule=max-staffing-cap area={area} tick={tick_to_hhmm(int(tick))} scheduled={cov} max={int(cap)}"
+            )
+
+    total_hours = float(sum(hours_between_ticks(int(a.start_t), int(a.end_t)) for a in assignments))
+    max_weekly_cap = float(getattr(model.manager_goals, 'maximum_weekly_cap', 0.0) or 0.0)
+    if max_weekly_cap > 0.0 and (total_hours - max_weekly_cap) > 1e-9:
+        violations.append(
+            f"rule=maximum-weekly-labor-cap scheduled={total_hours:.1f} cap={max_weekly_cap:.1f}"
+        )
+
+    return violations
+
+
 def schedule_score(model: DataModel, label: str,
                    assignments: List[Assignment],
                    unfilled: int,
@@ -4046,6 +4163,15 @@ def generate_schedule(model: DataModel, label: str,
         over = total_hours - preferred_weekly_cap
         warnings.append(f"Soft: exceeded Preferred Weekly Labor Hours Cap by {over:.1f} hours (preferred={preferred_weekly_cap:.1f}, scheduled={total_hours:.1f}).")
 
+    # Phase 5: Final strict hard-rule validation gate before return.
+    final_hard_violations = validate_final_schedule_hard(model, label, assignments)
+    if final_hard_violations:
+        warnings.append(
+            f"INFEASIBLE: final hard-rule validation failed with {len(final_hard_violations)} violation(s)."
+        )
+        for msg in final_hard_violations:
+            warnings.append(f"FINAL HARD VALIDATION: {msg}")
+
     # Explainability/Diagnostics (P2-2): store limiting factors in a structured form.
     limiting: List[str] = []
     try:
@@ -4093,6 +4219,10 @@ def generate_schedule(model: DataModel, label: str,
     "pattern_learning_enabled": bool(pattern_learning_enabled) if 'pattern_learning_enabled' in locals() else False,
     "learned_patterns_count": int(len(learned_patterns)) if 'learned_patterns' in locals() else 0,
     "w_pattern_learning": float(w_pattern_learning) if 'w_pattern_learning' in locals() else 0.0,
+
+    "final_hard_validation_failed": bool(final_hard_violations),
+    "final_hard_validation_violation_count": int(len(final_hard_violations)),
+    "final_hard_validation_violations": list(final_hard_violations),
 
     "limiting_factors": list(limiting),
 }
