@@ -2306,8 +2306,8 @@ def schedule_score(model: DataModel, label: str,
         pats = getattr(model, "learned_patterns", {}) or {}
         q = _schedule_quality_penalty_units(model, assignments, pats)
         split_weight = max(6.0, w_split * 1.8)
-        short_weight = 9.0 if prefer_longer else 6.0
-        pref_len_weight = 2.5
+        short_weight = 12.0 if prefer_longer else 8.0
+        pref_len_weight = 3.2
         pen += q.get("frag_units", 0.0) * split_weight
         pen += q.get("short_units", 0.0) * short_weight
         pen += q.get("pref_len_units", 0.0) * pref_len_weight
@@ -2778,11 +2778,16 @@ def improve_weak_areas(model: DataModel,
         windows.sort(key=lambda x: (x[0], x[1], -x[4]), reverse=True)
         return windows
 
-    def _metrics(assigns: List[Assignment]) -> Tuple[int, int, int, float]:
+    def _metrics(assigns: List[Assignment]) -> Tuple[int, int, int, int, float]:
         cov = _coverage(assigns)
         min_short, pref_short, max_viol = compute_requirement_shortfalls(min_req, pref_req, max_req, cov)
         score = float(schedule_score(model, label, assigns, int(min_short), history_stats, prev_tick_map or {}))
-        return int(min_short), int(pref_short), int(max_viol), float(score)
+        try:
+            q = _schedule_quality_penalty_units(model, assigns, getattr(model, "learned_patterns", {}) or {})
+            short_count = int((q.get("micro_1h", 0.0) or 0.0) + (q.get("micro_2h", 0.0) or 0.0))
+        except Exception:
+            short_count = 0
+        return int(min_short), int(pref_short), int(max_viol), int(short_count), float(score)
 
     def _overlaps_emp(assigns: List[Assignment], employee_name: str, day: str, st: int, en: int) -> bool:
         for a in assigns:
@@ -2815,10 +2820,11 @@ def improve_weak_areas(model: DataModel,
         return (stab_match, gap, f"{100000-cur_h:09.3f}:{e.name.lower()}")
 
     current = list(base_assignments)
-    cur_min, cur_pref, cur_max, cur_score = _metrics(current)
+    cur_min, cur_pref, cur_max, cur_short, cur_score = _metrics(current)
     diagnostics["before_min_shortfall"] = int(cur_min)
     diagnostics["before_pref_shortfall"] = int(cur_pref)
     diagnostics["before_max_violations"] = int(cur_max)
+    diagnostics["before_short_shift_count"] = int(cur_short)
     diagnostics["before_score"] = float(cur_score)
 
     total_window_budget = max(1, int(max_windows))
@@ -2844,7 +2850,7 @@ def improve_weak_areas(model: DataModel,
             if int(wst) > 0:
                 starts.append(int(wst) - 1)
             starts = sorted(set([t for t in starts if 0 <= t < DAY_TICKS]))
-            segment_lengths = [2, 4, 6] if wkind != "fragile" else [2, 4]
+            segment_lengths = [8, 6, 4, 2] if wkind != "fragile" else [6, 4, 2]
             accepted_here = False
             for st in starts:
                 if accepted_here or window_attempts >= max_attempts_per_window:
@@ -2880,14 +2886,15 @@ def improve_weak_areas(model: DataModel,
                             continue
                         trial = list(current)
                         trial.append(Assignment(day=day, area=area, start_t=st, end_t=en, employee_name=e.name, locked=False, source="weak_area_improve"))
-                        t_min, t_pref, t_max, t_score = _metrics(trial)
+                        t_min, t_pref, t_max, t_short, t_score = _metrics(trial)
                         min_ok = (t_min <= cur_min)
                         score_ok = (t_score <= cur_score + 1e-9)
                         max_ok = (t_max <= cur_max)
-                        strict_better = (t_min < cur_min) or (t_score < cur_score - 1e-9)
-                        if min_ok and score_ok and max_ok and strict_better:
+                        short_ok = (t_short <= cur_short)
+                        strict_better = (t_min < cur_min) or (t_short < cur_short) or (t_score < cur_score - 1e-9)
+                        if min_ok and score_ok and max_ok and short_ok and strict_better:
                             current = trial
-                            cur_min, cur_pref, cur_max, cur_score = t_min, t_pref, t_max, t_score
+                            cur_min, cur_pref, cur_max, cur_short, cur_score = t_min, t_pref, t_max, t_short, t_score
                             cov_now = _coverage(current)
                             emp_hours[e.name] = emp_hours.get(e.name, 0.0) + seg_h
                             clopen = _clopen_map_from_assignments(model, current)
@@ -2915,6 +2922,7 @@ def improve_weak_areas(model: DataModel,
     diagnostics["after_min_shortfall"] = int(cur_min)
     diagnostics["after_pref_shortfall"] = int(cur_pref)
     diagnostics["after_max_violations"] = int(cur_max)
+    diagnostics["after_short_shift_count"] = int(cur_short)
     diagnostics["after_score"] = float(cur_score)
     changed = list(current) != list(base_assignments)
     diagnostics["changed"] = bool(changed)
@@ -3493,12 +3501,13 @@ def generate_schedule(model: DataModel, label: str,
 
                     # Discourage isolated micro fragments.
                     if seg_h <= 1.0 + 1e-9:
-                        score -= 22.0
+                        score -= 34.0
                     elif seg_h <= 2.0 + 1e-9:
-                        score -= 9.0
+                        score -= 16.0
 
                     # Prefer moves that help an existing block approach practical length.
                     best_delta = None
+                    contains_new_block = None
                     for bst, ben in merged_with_new:
                         if int(bst) <= int(st) and int(en) <= int(ben):
                             new_h = hours_between_ticks(bst, ben)
@@ -3506,9 +3515,15 @@ def generate_schedule(model: DataModel, label: str,
                             before_gap = abs(old_h - target_h)
                             after_gap = abs(new_h - target_h)
                             best_delta = (before_gap - after_gap)
+                            contains_new_block = (old_h <= 1e-9)
+                            if old_h < 3.0 - 1e-9 and new_h >= 3.0 - 1e-9:
+                                score += 14.0
+                            if old_h < 4.0 - 1e-9 and new_h >= 4.0 - 1e-9:
+                                score += 6.0
                             break
                     if best_delta is not None:
-                        score += best_delta * 3.5
+                        mult = 5.0 if contains_new_block else 4.2
+                        score += best_delta * mult
             except Exception as ex:
                 _log_once('util_segment_scoring', f"[solver] utilization(segment) scoring failed: {ex}")
 
@@ -3830,6 +3845,70 @@ def generate_schedule(model: DataModel, label: str,
         if not placed:
             # infeasible for this employee; leave for warnings/score
             pass
+
+    # Phase 8C: targeted short-shift growth pass (soft quality; hard rules still enforced).
+    # Attempt to extend <3h single-block days by adding adjacent 1h/2h segments for the same employee.
+    emp_by_name = {e.name: e for e in model.employees}
+
+    def _edge_area_for_block(emp_name: str, day: str, edge_t: int, side: str) -> Optional[str]:
+        day_as = [a for a in assignments if a.employee_name == emp_name and a.day == day]
+        if not day_as:
+            return None
+        if side == "left":
+            cands = [a for a in day_as if int(a.start_t) == int(edge_t)]
+            if cands:
+                cands.sort(key=lambda a: int(a.end_t))
+                return cands[0].area
+        else:
+            cands = [a for a in day_as if int(a.end_t) == int(edge_t)]
+            if cands:
+                cands.sort(key=lambda a: int(a.start_t), reverse=True)
+                return cands[0].area
+        return None
+
+    short_growth_progress = True
+    short_growth_passes = 0
+    while short_growth_progress and short_growth_passes < 4:
+        short_growth_progress = False
+        short_growth_passes += 1
+        active_names = [e.name for e in model.employees if getattr(e, "work_status", "") == "Active"]
+        for emp_name in active_names:
+            e = emp_by_name.get(emp_name)
+            if not e:
+                continue
+            for day in DAYS:
+                blocks = daily_shift_blocks(assignments, emp_name, day)
+                if len(blocks) != 1:
+                    continue
+                bst, ben = blocks[0]
+                bh = hours_between_ticks(bst, ben)
+                if bh >= 3.0 - 1e-9:
+                    continue
+
+                # Prefer 2-hour growth first, then 1-hour, on either side of the existing block.
+                attempts: List[Tuple[str, int]] = [("left", 4), ("right", 4), ("left", 2), ("right", 2)]
+                for side, L in attempts:
+                    if side == "left":
+                        st = int(bst) - int(L)
+                        en = int(bst)
+                        area = _edge_area_for_block(emp_name, day, int(bst), "left")
+                    else:
+                        st = int(ben)
+                        en = int(ben) + int(L)
+                        area = _edge_area_for_block(emp_name, day, int(ben), "right")
+                    if st < 0 or en > DAY_TICKS or en <= st or not area:
+                        continue
+                    if area not in getattr(e, "areas_allowed", []):
+                        continue
+                    if not feasible_segment(e, day, area, st, en):
+                        continue
+                    if add_assignment(Assignment(day, area, st, en, emp_name, locked=False, source="short_shift_repair"), locked_ok=False, cov=coverage):
+                        short_growth_progress = True
+                        break
+                if short_growth_progress:
+                    break
+            if short_growth_progress:
+                break
 
     # Compute shortfalls for reporting/scoring
     min_short, pref_short, max_viol = compute_requirement_shortfalls(min_req, pref_req, max_req, coverage)
