@@ -1,0 +1,1605 @@
+{
+  "runtime_sec": 42.13100621600006,
+  "assignment_count": 202,
+  "total_scheduled_hours": 438.0,
+  "employees_used_count": 24,
+  "employees_unused_count": 2,
+  "employees_used": [
+    "Aedan",
+    "Brianna",
+    "Bryan",
+    "Caleb",
+    "Emma",
+    "Finely",
+    "Jaden",
+    "Jared",
+    "Jayden",
+    "Jess",
+    "Kelsey",
+    "Kenny",
+    "Kris Tegtmeier",
+    "Laura",
+    "Lauren",
+    "Lisa",
+    "Mandy",
+    "Mary",
+    "Paris",
+    "Quincy",
+    "Ryanne",
+    "Simon",
+    "Stacy",
+    "Sue"
+  ],
+  "employees_unused": [
+    "Acelynn",
+    "Gail"
+  ],
+  "average_shift_length": 2.1683168316831685,
+  "median_shift_length": 2.0,
+  "uncovered_min_demand_by_area": {
+    "CSTORE": 256,
+    "KITCHEN": 116,
+    "CARWASH": 58
+  },
+  "total_uncovered_requirement_blocks": 278,
+  "total_uncovered_shortfall_ticks": 430,
+  "hard_rule_violation_count": 0,
+  "engine_hard_violation_count": 0,
+  "phase_diagnostics": {},
+  "uncovered_min_by_area_diag": {},
+  "master_envelope_consistency": {},
+  "warnings_count": 1,
+  "utilization_buckets": {
+    "lt10": 5,
+    "10to20": 14,
+    "20to30": 5,
+    "gt30": 2
+  },
+  "schedule_grouped": {
+    "Aedan": {
+      "Sat": [
+        {
+          "start": "15:00",
+          "end": "17:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "17:00",
+          "end": "21:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Sun": [
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "KITCHEN"
+        }
+      ]
+    },
+    "Brianna": {
+      "Tue": [
+        {
+          "start": "21:00",
+          "end": "24:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Sat": [
+        {
+          "start": "06:00",
+          "end": "07:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "07:00",
+          "end": "11:00",
+          "area": "CARWASH"
+        }
+      ],
+      "Sun": [
+        {
+          "start": "06:00",
+          "end": "10:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "10:00",
+          "end": "14:00",
+          "area": "KITCHEN"
+        }
+      ]
+    },
+    "Bryan": {
+      "Fri": [
+        {
+          "start": "08:00",
+          "end": "12:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "12:00",
+          "end": "14:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Mon": [
+        {
+          "start": "11:00",
+          "end": "13:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "13:00",
+          "end": "15:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "15:00",
+          "end": "19:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Thu": [
+        {
+          "start": "08:00",
+          "end": "12:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "12:00",
+          "end": "14:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Wed": [
+        {
+          "start": "14:00",
+          "end": "15:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "15:00",
+          "end": "16:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Tue": [
+        {
+          "start": "09:00",
+          "end": "13:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "13:00",
+          "end": "17:00",
+          "area": "CSTORE"
+        }
+      ]
+    },
+    "Caleb": {
+      "Wed": [
+        {
+          "start": "16:00",
+          "end": "20:00",
+          "area": "CARWASH"
+        }
+      ],
+      "Sun": [
+        {
+          "start": "08:00",
+          "end": "11:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "11:00",
+          "end": "15:00",
+          "area": "CARWASH"
+        }
+      ],
+      "Thu": [
+        {
+          "start": "18:00",
+          "end": "19:00",
+          "area": "CARWASH"
+        },
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Mon": [
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CARWASH"
+        }
+      ]
+    },
+    "Emma": {
+      "Fri": [
+        {
+          "start": "16:00",
+          "end": "19:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Sat": [
+        {
+          "start": "17:00",
+          "end": "18:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "18:00",
+          "end": "19:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Sun": [
+        {
+          "start": "18:00",
+          "end": "19:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CSTORE"
+        }
+      ]
+    },
+    "Finely": {
+      "Sun": [
+        {
+          "start": "15:00",
+          "end": "19:00",
+          "area": "CARWASH"
+        },
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CARWASH"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Sat": [
+        {
+          "start": "09:00",
+          "end": "11:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "11:00",
+          "end": "15:00",
+          "area": "CARWASH"
+        },
+        {
+          "start": "15:00",
+          "end": "17:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Tue": [
+        {
+          "start": "17:00",
+          "end": "18:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "18:00",
+          "end": "19:00",
+          "area": "CARWASH"
+        },
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CSTORE"
+        }
+      ]
+    },
+    "Jaden": {
+      "Fri": [
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "21:00",
+          "end": "24:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Sun": [
+        {
+          "start": "11:00",
+          "end": "12:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "12:00",
+          "end": "13:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "13:00",
+          "end": "15:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "15:00",
+          "end": "18:00",
+          "area": "CSTORE"
+        }
+      ]
+    },
+    "Jared": {
+      "Thu": [
+        {
+          "start": "14:00",
+          "end": "18:00",
+          "area": "CARWASH"
+        }
+      ],
+      "Sat": [
+        {
+          "start": "14:00",
+          "end": "18:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "18:00",
+          "end": "19:00",
+          "area": "CSTORE"
+        }
+      ]
+    },
+    "Jayden": {
+      "Mon": [
+        {
+          "start": "14:00",
+          "end": "18:00",
+          "area": "CARWASH"
+        }
+      ],
+      "Fri": [
+        {
+          "start": "14:00",
+          "end": "15:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "15:00",
+          "end": "19:00",
+          "area": "CARWASH"
+        }
+      ],
+      "Tue": [
+        {
+          "start": "14:00",
+          "end": "18:00",
+          "area": "CARWASH"
+        }
+      ],
+      "Thu": [
+        {
+          "start": "14:00",
+          "end": "18:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Sun": [
+        {
+          "start": "14:00",
+          "end": "15:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "15:00",
+          "end": "18:00",
+          "area": "CSTORE"
+        }
+      ]
+    },
+    "Jess": {
+      "Wed": [
+        {
+          "start": "20:00",
+          "end": "21:00",
+          "area": "CARWASH"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Thu": [
+        {
+          "start": "18:00",
+          "end": "19:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CARWASH"
+        }
+      ],
+      "Tue": [
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CSTORE"
+        }
+      ]
+    },
+    "Kelsey": {
+      "Wed": [
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "KITCHEN"
+        }
+      ]
+    },
+    "Kenny": {
+      "Sun": [
+        {
+          "start": "14:00",
+          "end": "15:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "15:00",
+          "end": "18:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "18:00",
+          "end": "19:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Sat": [
+        {
+          "start": "06:00",
+          "end": "10:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "10:00",
+          "end": "14:00",
+          "area": "CSTORE"
+        }
+      ]
+    },
+    "Kris Tegtmeier": {
+      "Fri": [
+        {
+          "start": "14:00",
+          "end": "15:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "15:00",
+          "end": "19:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CARWASH"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CARWASH"
+        }
+      ],
+      "Thu": [
+        {
+          "start": "14:00",
+          "end": "15:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "15:00",
+          "end": "19:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CARWASH"
+        }
+      ],
+      "Tue": [
+        {
+          "start": "18:00",
+          "end": "19:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CARWASH"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CARWASH"
+        }
+      ],
+      "Wed": [
+        {
+          "start": "14:00",
+          "end": "15:00",
+          "area": "CARWASH"
+        },
+        {
+          "start": "15:00",
+          "end": "18:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "18:00",
+          "end": "21:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CARWASH"
+        }
+      ],
+      "Mon": [
+        {
+          "start": "14:00",
+          "end": "15:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "15:00",
+          "end": "18:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "18:00",
+          "end": "21:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CSTORE"
+        }
+      ]
+    },
+    "Laura": {
+      "Fri": [
+        {
+          "start": "06:00",
+          "end": "08:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "08:00",
+          "end": "09:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Thu": [
+        {
+          "start": "06:00",
+          "end": "08:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "08:00",
+          "end": "09:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Wed": [
+        {
+          "start": "08:00",
+          "end": "09:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Mon": [
+        {
+          "start": "06:00",
+          "end": "08:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "08:00",
+          "end": "09:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Tue": [
+        {
+          "start": "07:00",
+          "end": "08:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "08:00",
+          "end": "09:00",
+          "area": "KITCHEN"
+        }
+      ]
+    },
+    "Lauren": {
+      "Wed": [
+        {
+          "start": "16:00",
+          "end": "18:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "18:00",
+          "end": "21:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Sat": [
+        {
+          "start": "16:00",
+          "end": "18:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "18:00",
+          "end": "19:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CSTORE"
+        }
+      ]
+    },
+    "Lisa": {
+      "Fri": [
+        {
+          "start": "05:00",
+          "end": "09:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Mon": [
+        {
+          "start": "05:00",
+          "end": "09:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "09:00",
+          "end": "13:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Sat": [
+        {
+          "start": "05:00",
+          "end": "09:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Sun": [
+        {
+          "start": "05:00",
+          "end": "09:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Thu": [
+        {
+          "start": "05:00",
+          "end": "09:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "09:00",
+          "end": "11:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Tue": [
+        {
+          "start": "05:00",
+          "end": "09:00",
+          "area": "CSTORE"
+        }
+      ]
+    },
+    "Mandy": {
+      "Fri": [
+        {
+          "start": "15:00",
+          "end": "19:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Sat": [
+        {
+          "start": "14:00",
+          "end": "15:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "15:00",
+          "end": "19:00",
+          "area": "CARWASH"
+        },
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CARWASH"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CARWASH"
+        }
+      ],
+      "Thu": [
+        {
+          "start": "15:00",
+          "end": "16:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "16:00",
+          "end": "20:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "20:00",
+          "end": "21:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Tue": [
+        {
+          "start": "14:00",
+          "end": "15:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "15:00",
+          "end": "19:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Mon": [
+        {
+          "start": "15:00",
+          "end": "19:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CSTORE"
+        }
+      ]
+    },
+    "Mary": {
+      "Thu": [
+        {
+          "start": "06:00",
+          "end": "08:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "08:00",
+          "end": "09:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Wed": [
+        {
+          "start": "06:00",
+          "end": "08:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "08:00",
+          "end": "09:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Mon": [
+        {
+          "start": "06:00",
+          "end": "08:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "08:00",
+          "end": "10:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Tue": [
+        {
+          "start": "06:00",
+          "end": "08:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "08:00",
+          "end": "10:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Fri": [
+        {
+          "start": "06:00",
+          "end": "08:00",
+          "area": "KITCHEN"
+        }
+      ]
+    },
+    "Paris": {
+      "Fri": [
+        {
+          "start": "07:00",
+          "end": "11:00",
+          "area": "CARWASH"
+        },
+        {
+          "start": "11:00",
+          "end": "15:00",
+          "area": "CARWASH"
+        }
+      ],
+      "Sun": [
+        {
+          "start": "06:00",
+          "end": "07:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "07:00",
+          "end": "11:00",
+          "area": "CARWASH"
+        }
+      ],
+      "Sat": [
+        {
+          "start": "06:00",
+          "end": "10:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "10:00",
+          "end": "14:00",
+          "area": "CSTORE"
+        }
+      ]
+    },
+    "Quincy": {
+      "Fri": [
+        {
+          "start": "16:00",
+          "end": "20:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Sun": [
+        {
+          "start": "11:00",
+          "end": "12:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "12:00",
+          "end": "13:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "13:00",
+          "end": "14:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "14:00",
+          "end": "15:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "15:00",
+          "end": "19:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Thu": [
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Mon": [
+        {
+          "start": "18:00",
+          "end": "21:00",
+          "area": "CARWASH"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "KITCHEN"
+        }
+      ]
+    },
+    "Ryanne": {
+      "Wed": [
+        {
+          "start": "11:00",
+          "end": "13:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "13:00",
+          "end": "15:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "15:00",
+          "end": "19:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Fri": [
+        {
+          "start": "08:00",
+          "end": "12:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "12:00",
+          "end": "14:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "14:00",
+          "end": "16:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Tue": [
+        {
+          "start": "11:00",
+          "end": "13:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "13:00",
+          "end": "15:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "15:00",
+          "end": "19:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Sat": [
+        {
+          "start": "11:00",
+          "end": "14:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Sun": [
+        {
+          "start": "11:00",
+          "end": "14:00",
+          "area": "CSTORE"
+        }
+      ]
+    },
+    "Simon": {
+      "Sat": [
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "21:00",
+          "end": "24:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Sun": [
+        {
+          "start": "18:00",
+          "end": "19:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "19:00",
+          "end": "21:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "21:00",
+          "end": "24:00",
+          "area": "CARWASH"
+        }
+      ],
+      "Fri": [
+        {
+          "start": "20:00",
+          "end": "21:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "21:00",
+          "end": "22:00",
+          "area": "CSTORE"
+        }
+      ]
+    },
+    "Stacy": {
+      "Mon": [
+        {
+          "start": "06:00",
+          "end": "08:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "08:00",
+          "end": "12:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "12:00",
+          "end": "13:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "13:00",
+          "end": "14:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Thu": [
+        {
+          "start": "10:00",
+          "end": "12:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "12:00",
+          "end": "13:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "13:00",
+          "end": "14:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Tue": [
+        {
+          "start": "12:00",
+          "end": "13:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "13:00",
+          "end": "14:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Wed": [
+        {
+          "start": "12:00",
+          "end": "13:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "13:00",
+          "end": "14:00",
+          "area": "CSTORE"
+        }
+      ],
+      "Fri": [
+        {
+          "start": "12:00",
+          "end": "13:00",
+          "area": "CSTORE"
+        },
+        {
+          "start": "13:00",
+          "end": "14:00",
+          "area": "CSTORE"
+        }
+      ]
+    },
+    "Sue": {
+      "Fri": [
+        {
+          "start": "09:00",
+          "end": "11:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "11:00",
+          "end": "15:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "15:00",
+          "end": "16:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Mon": [
+        {
+          "start": "09:00",
+          "end": "13:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "13:00",
+          "end": "15:00",
+          "area": "KITCHEN"
+        }
+      ],
+      "Thu": [
+        {
+          "start": "09:00",
+          "end": "11:00",
+          "area": "KITCHEN"
+        },
+        {
+          "start": "11:00",
+          "end": "15:00",
+          "area": "KITCHEN"
+        }
+      ]
+    }
+  },
+  "weekly_summary": [
+    {
+      "employee": "Acelynn",
+      "total_hours": 0.0,
+      "num_shifts": 0,
+      "areas_worked": []
+    },
+    {
+      "employee": "Aedan",
+      "total_hours": 10.0,
+      "num_shifts": 5,
+      "areas_worked": [
+        "KITCHEN"
+      ]
+    },
+    {
+      "employee": "Brianna",
+      "total_hours": 16.0,
+      "num_shifts": 5,
+      "areas_worked": [
+        "CARWASH",
+        "CSTORE",
+        "KITCHEN"
+      ]
+    },
+    {
+      "employee": "Bryan",
+      "total_hours": 30.0,
+      "num_shifts": 11,
+      "areas_worked": [
+        "CSTORE",
+        "KITCHEN"
+      ]
+    },
+    {
+      "employee": "Caleb",
+      "total_hours": 18.0,
+      "num_shifts": 8,
+      "areas_worked": [
+        "CARWASH",
+        "CSTORE"
+      ]
+    },
+    {
+      "employee": "Emma",
+      "total_hours": 15.0,
+      "num_shifts": 10,
+      "areas_worked": [
+        "CSTORE"
+      ]
+    },
+    {
+      "employee": "Finely",
+      "total_hours": 19.0,
+      "num_shifts": 9,
+      "areas_worked": [
+        "CARWASH",
+        "CSTORE"
+      ]
+    },
+    {
+      "employee": "Gail",
+      "total_hours": 0.0,
+      "num_shifts": 0,
+      "areas_worked": []
+    },
+    {
+      "employee": "Jaden",
+      "total_hours": 12.0,
+      "num_shifts": 6,
+      "areas_worked": [
+        "CSTORE"
+      ]
+    },
+    {
+      "employee": "Jared",
+      "total_hours": 9.0,
+      "num_shifts": 3,
+      "areas_worked": [
+        "CARWASH",
+        "CSTORE"
+      ]
+    },
+    {
+      "employee": "Jayden",
+      "total_hours": 21.0,
+      "num_shifts": 7,
+      "areas_worked": [
+        "CARWASH",
+        "CSTORE"
+      ]
+    },
+    {
+      "employee": "Jess",
+      "total_hours": 8.0,
+      "num_shifts": 6,
+      "areas_worked": [
+        "CARWASH",
+        "CSTORE"
+      ]
+    },
+    {
+      "employee": "Kelsey",
+      "total_hours": 3.0,
+      "num_shifts": 2,
+      "areas_worked": [
+        "KITCHEN"
+      ]
+    },
+    {
+      "employee": "Kenny",
+      "total_hours": 16.0,
+      "num_shifts": 7,
+      "areas_worked": [
+        "CSTORE"
+      ]
+    },
+    {
+      "employee": "Kris Tegtmeier",
+      "total_hours": 36.0,
+      "num_shifts": 19,
+      "areas_worked": [
+        "CARWASH",
+        "CSTORE"
+      ]
+    },
+    {
+      "employee": "Laura",
+      "total_hours": 12.0,
+      "num_shifts": 9,
+      "areas_worked": [
+        "KITCHEN"
+      ]
+    },
+    {
+      "employee": "Lauren",
+      "total_hours": 12.0,
+      "num_shifts": 7,
+      "areas_worked": [
+        "CSTORE"
+      ]
+    },
+    {
+      "employee": "Lisa",
+      "total_hours": 30.0,
+      "num_shifts": 8,
+      "areas_worked": [
+        "CSTORE"
+      ]
+    },
+    {
+      "employee": "Mandy",
+      "total_hours": 37.0,
+      "num_shifts": 18,
+      "areas_worked": [
+        "CARWASH",
+        "CSTORE",
+        "KITCHEN"
+      ]
+    },
+    {
+      "employee": "Mary",
+      "total_hours": 16.0,
+      "num_shifts": 9,
+      "areas_worked": [
+        "KITCHEN"
+      ]
+    },
+    {
+      "employee": "Paris",
+      "total_hours": 21.0,
+      "num_shifts": 6,
+      "areas_worked": [
+        "CARWASH",
+        "CSTORE"
+      ]
+    },
+    {
+      "employee": "Quincy",
+      "total_hours": 17.0,
+      "num_shifts": 9,
+      "areas_worked": [
+        "CARWASH",
+        "CSTORE",
+        "KITCHEN"
+      ]
+    },
+    {
+      "employee": "Ryanne",
+      "total_hours": 30.0,
+      "num_shifts": 11,
+      "areas_worked": [
+        "CSTORE",
+        "KITCHEN"
+      ]
+    },
+    {
+      "employee": "Simon",
+      "total_hours": 13.0,
+      "num_shifts": 7,
+      "areas_worked": [
+        "CARWASH",
+        "CSTORE",
+        "KITCHEN"
+      ]
+    },
+    {
+      "employee": "Stacy",
+      "total_hours": 18.0,
+      "num_shifts": 13,
+      "areas_worked": [
+        "CSTORE"
+      ]
+    },
+    {
+      "employee": "Sue",
+      "total_hours": 19.0,
+      "num_shifts": 7,
+      "areas_worked": [
+        "KITCHEN"
+      ]
+    }
+  ],
+  "top10_uncovered_blocks": [
+    {
+      "day": "Fri",
+      "area": "CSTORE",
+      "tick": 18,
+      "required_staff": 3,
+      "scheduled_staff": 0,
+      "shortfall": 3,
+      "time": "09:00"
+    },
+    {
+      "day": "Fri",
+      "area": "CSTORE",
+      "tick": 19,
+      "required_staff": 3,
+      "scheduled_staff": 0,
+      "shortfall": 3,
+      "time": "09:30"
+    },
+    {
+      "day": "Fri",
+      "area": "CSTORE",
+      "tick": 20,
+      "required_staff": 3,
+      "scheduled_staff": 0,
+      "shortfall": 3,
+      "time": "10:00"
+    },
+    {
+      "day": "Fri",
+      "area": "CSTORE",
+      "tick": 21,
+      "required_staff": 3,
+      "scheduled_staff": 0,
+      "shortfall": 3,
+      "time": "10:30"
+    },
+    {
+      "day": "Fri",
+      "area": "CSTORE",
+      "tick": 22,
+      "required_staff": 3,
+      "scheduled_staff": 0,
+      "shortfall": 3,
+      "time": "11:00"
+    },
+    {
+      "day": "Fri",
+      "area": "CSTORE",
+      "tick": 23,
+      "required_staff": 3,
+      "scheduled_staff": 0,
+      "shortfall": 3,
+      "time": "11:30"
+    },
+    {
+      "day": "Fri",
+      "area": "KITCHEN",
+      "tick": 11,
+      "required_staff": 3,
+      "scheduled_staff": 0,
+      "shortfall": 3,
+      "time": "05:30"
+    },
+    {
+      "day": "Mon",
+      "area": "CSTORE",
+      "tick": 46,
+      "required_staff": 3,
+      "scheduled_staff": 0,
+      "shortfall": 3,
+      "time": "23:00"
+    },
+    {
+      "day": "Mon",
+      "area": "CSTORE",
+      "tick": 47,
+      "required_staff": 3,
+      "scheduled_staff": 0,
+      "shortfall": 3,
+      "time": "23:30"
+    },
+    {
+      "day": "Mon",
+      "area": "KITCHEN",
+      "tick": 11,
+      "required_staff": 3,
+      "scheduled_staff": 0,
+      "shortfall": 3,
+      "time": "05:30"
+    }
+  ]
+}
