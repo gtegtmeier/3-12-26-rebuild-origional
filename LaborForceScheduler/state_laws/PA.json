@@ -1,0 +1,9 @@
+{
+  "state_code": "PA",
+  "state_name": "Pennsylvania",
+  "complete": false,
+  "notes": "Placeholder profile. Program will fall back to default rules until this is completed.",
+  "minor_rules": {
+    "mode": "default_fallback"
+  }
+}

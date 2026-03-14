@@ -1,0 +1,9 @@
+{
+  "state_code": "CO",
+  "state_name": "Colorado",
+  "complete": false,
+  "notes": "Placeholder profile. Program will fall back to default rules until this is completed.",
+  "minor_rules": {
+    "mode": "default_fallback"
+  }
+}

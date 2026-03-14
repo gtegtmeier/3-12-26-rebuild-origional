@@ -218,6 +218,76 @@ def app_dir() -> str:
 def rel_path(*parts: str) -> str:
     return os.path.join(app_dir(), *parts)
 
+
+US_STATES: List[Tuple[str, str]] = [
+    ("AL", "Alabama"), ("AK", "Alaska"), ("AZ", "Arizona"), ("AR", "Arkansas"), ("CA", "California"),
+    ("CO", "Colorado"), ("CT", "Connecticut"), ("DE", "Delaware"), ("FL", "Florida"), ("GA", "Georgia"),
+    ("HI", "Hawaii"), ("ID", "Idaho"), ("IL", "Illinois"), ("IN", "Indiana"), ("IA", "Iowa"),
+    ("KS", "Kansas"), ("KY", "Kentucky"), ("LA", "Louisiana"), ("ME", "Maine"), ("MD", "Maryland"),
+    ("MA", "Massachusetts"), ("MI", "Michigan"), ("MN", "Minnesota"), ("MS", "Mississippi"), ("MO", "Missouri"),
+    ("MT", "Montana"), ("NE", "Nebraska"), ("NV", "Nevada"), ("NH", "New Hampshire"), ("NJ", "New Jersey"),
+    ("NM", "New Mexico"), ("NY", "New York"), ("NC", "North Carolina"), ("ND", "North Dakota"), ("OH", "Ohio"),
+    ("OK", "Oklahoma"), ("OR", "Oregon"), ("PA", "Pennsylvania"), ("RI", "Rhode Island"), ("SC", "South Carolina"),
+    ("SD", "South Dakota"), ("TN", "Tennessee"), ("TX", "Texas"), ("UT", "Utah"), ("VT", "Vermont"),
+    ("VA", "Virginia"), ("WA", "Washington"), ("WV", "West Virginia"), ("WI", "Wisconsin"), ("WY", "Wyoming"),
+]
+US_STATE_CODES: Set[str] = {c for c, _ in US_STATES}
+US_STATE_LABELS: Dict[str, str] = {c: f"{c} - {n}" for c, n in US_STATES}
+
+
+def _state_law_dir() -> str:
+    return rel_path("state_laws")
+
+
+def _state_law_file(code: str) -> str:
+    return os.path.join(_state_law_dir(), f"{str(code or '').strip().upper()}.json")
+
+
+def ensure_state_law_seed_files() -> None:
+    """Create placeholder state law profiles for all 50 states (idempotent)."""
+    try:
+        ensure_dir(_state_law_dir())
+        for code, name in US_STATES:
+            p = _state_law_file(code)
+            if os.path.isfile(p):
+                continue
+            payload = {
+                "state_code": code,
+                "state_name": name,
+                "complete": False,
+                "notes": "Placeholder profile. Program will fall back to default rules until this is completed.",
+                "minor_rules": {
+                    "mode": "default_fallback"
+                }
+            }
+            _atomic_write_json(p, payload, indent=2)
+    except Exception as ex:
+        _write_run_log(f"STATE_LAW | seed creation failed: {repr(ex)}")
+
+
+def load_state_law_profile(state_code: str) -> Tuple[Dict[str, Any], str]:
+    """Return (profile, warning_message). Empty warning means profile is usable."""
+    code = str(state_code or "").strip().upper()
+    if code not in US_STATE_CODES:
+        return {}, "Store State is required and must be a valid U.S. state. Falling back to current/default rules."
+    ensure_state_law_seed_files()
+    p = _state_law_file(code)
+    if not os.path.isfile(p):
+        return {}, f"No state law profile found for {code}. Falling back to current/default rules."
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return {}, f"State law profile for {code} could not be read. Falling back to current/default rules."
+
+    if not isinstance(payload, dict):
+        return {}, f"State law profile for {code} is invalid. Falling back to current/default rules."
+    if not bool(payload.get("complete", False)):
+        return payload, f"State law profile for {code} is incomplete. Using current/default rules for now."
+    if not isinstance(payload.get("minor_rules", {}), dict):
+        return payload, f"State law profile for {code} is missing required sections. Falling back to current/default rules."
+    return payload, ""
+
 def _safe_export_label_token(label: str, max_len: int = 24) -> str:
     raw = str(label or '').strip()
     wk = week_sun_from_label(raw)
@@ -556,6 +626,50 @@ def compute_weekly_eligibility(model: "DataModel", label: str) -> Tuple[Dict[str
 def today_iso() -> str:
     return datetime.date.today().isoformat()
 
+
+def _safe_date_from_iso(v: str) -> Optional[datetime.date]:
+    try:
+        return datetime.date.fromisoformat(str(v or "").strip())
+    except Exception:
+        return None
+
+
+def _add_months(d: datetime.date, months: int) -> datetime.date:
+    y = d.year + ((d.month - 1 + months) // 12)
+    m = ((d.month - 1 + months) % 12) + 1
+    # clamp to last day of target month
+    nxt_m = datetime.date(y + (1 if m == 12 else 0), 1 if m == 12 else m + 1, 1)
+    last_day = (nxt_m - datetime.timedelta(days=1)).day
+    return datetime.date(y, m, min(d.day, last_day))
+
+
+def roll_task_window(earliest_iso: str, due_iso: str, recurrence: str) -> Tuple[str, str]:
+    est = _safe_date_from_iso(earliest_iso)
+    due = _safe_date_from_iso(due_iso)
+    if est is None or due is None:
+        return earliest_iso, due_iso
+    rec = _normalize_recurrence(recurrence)
+    if rec == "Weekly":
+        delta = datetime.timedelta(days=7)
+        return (est + delta).isoformat(), (due + delta).isoformat()
+    if rec == "Bi-Weekly":
+        delta = datetime.timedelta(days=14)
+        return (est + delta).isoformat(), (due + delta).isoformat()
+    if rec == "Monthly":
+        return _add_months(est, 1).isoformat(), _add_months(due, 1).isoformat()
+    if rec == "Quarterly":
+        return _add_months(est, 3).isoformat(), _add_months(due, 3).isoformat()
+    if rec == "Yearly":
+        return _add_months(est, 12).isoformat(), _add_months(due, 12).isoformat()
+    return earliest_iso, due_iso
+
+
+def week_window_for_label(label: str) -> Tuple[Optional[datetime.date], Optional[datetime.date]]:
+    wk = week_sun_from_label(label)
+    if wk is None:
+        return None, None
+    return wk, wk + datetime.timedelta(days=6)
+
 def weekend_days() -> Set[str]:
     return {"Sat","Sun"}
 
@@ -717,6 +831,44 @@ class TimeOffRequest:
     status: str = "pending"
     note: str = ""
 
+
+@dataclass
+class ManagerTask:
+    task_id: str
+    title: str = ""
+    description: str = ""
+    earliest_start_date: str = ""
+    due_date: str = ""
+    recurrence: str = "One-Time"  # One-Time / Weekly / Bi-Weekly / Monthly / Quarterly / Yearly
+    completed: bool = False
+    completed_on: str = ""
+    last_rolled_on: str = ""
+
+
+@dataclass
+class CallOffIncident:
+    incident_id: str
+    week_label: str = ""
+    day: str = ""
+    incident_date: str = ""
+    called_out_employee: str = ""
+    replacement_employee: str = ""
+    recorded_on: str = ""
+    note: str = ""
+    status: str = "reported"
+
+
+@dataclass
+class EmployeeReliabilityEvent:
+    event_id: str
+    employee_name: str = ""
+    event_type: str = ""  # call_out / extra_shift_pickup
+    date: str = ""
+    week_label: str = ""
+    related_employee: str = ""
+    note: str = ""
+    source: str = ""
+
 @dataclass
 class RequirementBlock:
     day: str
@@ -755,6 +907,7 @@ class StoreInfo:
     store_address: str = ""
     store_phone: str = ""
     store_manager: str = ""
+    store_state: str = ""
     cstore_open: str = "00:00"
     cstore_close: str = "24:00"
     kitchen_open: str = "00:00"
@@ -964,6 +1117,9 @@ class DataModel:
     learned_patterns: Dict[str, Any] = field(default_factory=dict)
 
     history: List[ScheduleSummary] = field(default_factory=list)
+    manager_tasks: List[ManagerTask] = field(default_factory=list)
+    calloff_incidents: List[CallOffIncident] = field(default_factory=list)
+    reliability_events: List[EmployeeReliabilityEvent] = field(default_factory=list)
 
 # -----------------------------
 # Defaults
@@ -1316,6 +1472,102 @@ def _normalize_time_off_requests(raw: Any, label_hint: str = '') -> List[TimeOff
     return out
 
 
+def _normalize_recurrence(v: Any) -> str:
+    raw = str(v or "One-Time").strip().lower().replace("_", "-")
+    mapping = {
+        "one-time": "One-Time",
+        "onetime": "One-Time",
+        "weekly": "Weekly",
+        "bi-weekly": "Bi-Weekly",
+        "biweekly": "Bi-Weekly",
+        "monthly": "Monthly",
+        "quarterly": "Quarterly",
+        "yearly": "Yearly",
+    }
+    return mapping.get(raw, "One-Time")
+
+
+def _norm_iso_date(v: Any) -> str:
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    try:
+        return datetime.date.fromisoformat(s).isoformat()
+    except Exception:
+        return ""
+
+
+def _normalize_manager_tasks(raw: Any) -> List[ManagerTask]:
+    out: List[ManagerTask] = []
+    if not isinstance(raw, list):
+        return out
+    for i, row in enumerate(raw):
+        if not isinstance(row, dict):
+            continue
+        tid = str(row.get("task_id", "")).strip() or f"task_{i}_{random.randint(1000,9999)}"
+        out.append(ManagerTask(
+            task_id=tid,
+            title=str(row.get("title", "")).strip(),
+            description=str(row.get("description", "")).strip(),
+            earliest_start_date=_norm_iso_date(row.get("earliest_start_date", "")),
+            due_date=_norm_iso_date(row.get("due_date", "")),
+            recurrence=_normalize_recurrence(row.get("recurrence", "One-Time")),
+            completed=bool(row.get("completed", False)),
+            completed_on=_norm_iso_date(row.get("completed_on", "")),
+            last_rolled_on=_norm_iso_date(row.get("last_rolled_on", "")),
+        ))
+    return out
+
+
+def _normalize_calloff_incidents(raw: Any) -> List[CallOffIncident]:
+    out: List[CallOffIncident] = []
+    if not isinstance(raw, list):
+        return out
+    for i, row in enumerate(raw):
+        if not isinstance(row, dict):
+            continue
+        iid = str(row.get("incident_id", "")).strip() or f"inc_{i}_{random.randint(1000,9999)}"
+        day = str(row.get("day", "")).strip().title()[:3]
+        if day and day not in DAYS:
+            day = ""
+        out.append(CallOffIncident(
+            incident_id=iid,
+            week_label=str(row.get("week_label", "")).strip(),
+            day=day,
+            incident_date=_norm_iso_date(row.get("incident_date", "")),
+            called_out_employee=str(row.get("called_out_employee", "")).strip(),
+            replacement_employee=str(row.get("replacement_employee", "")).strip(),
+            recorded_on=_norm_iso_date(row.get("recorded_on", "")),
+            note=str(row.get("note", "")).strip(),
+            status=str(row.get("status", "reported")).strip() or "reported",
+        ))
+    return out
+
+
+def _normalize_reliability_events(raw: Any) -> List[EmployeeReliabilityEvent]:
+    out: List[EmployeeReliabilityEvent] = []
+    if not isinstance(raw, list):
+        return out
+    for i, row in enumerate(raw):
+        if not isinstance(row, dict):
+            continue
+        ev_id = str(row.get("event_id", "")).strip() or f"rel_{i}_{random.randint(1000,9999)}"
+        ev_type = str(row.get("event_type", "")).strip().lower().replace("-", "_")
+        if ev_type not in {"call_out", "extra_shift_pickup"}:
+            ev_type = ""
+        out.append(EmployeeReliabilityEvent(
+            event_id=ev_id,
+            employee_name=str(row.get("employee_name", "")).strip(),
+            event_type=ev_type,
+            date=_norm_iso_date(row.get("date", "")),
+            week_label=str(row.get("week_label", "")).strip(),
+            related_employee=str(row.get("related_employee", "")).strip(),
+            note=str(row.get("note", "")).strip(),
+            source=str(row.get("source", "")).strip(),
+        ))
+    return out
+
+
 def _normalize_weekly_exception_settings(raw: Any, model: Optional[DataModel] = None) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     if isinstance(raw, dict):
@@ -1505,6 +1757,9 @@ def save_data(model: DataModel, path: str):
         "weekly_overrides": [ser_override(o) for o in model.weekly_overrides],
         "weekly_exception_settings": _normalize_weekly_exception_settings(getattr(model, "weekly_exception_settings", {}) or {}, model),
         "history": [ser_summary(s) for s in model.history],
+        "manager_tasks": [asdict(x) for x in getattr(model, "manager_tasks", []) or []],
+        "calloff_incidents": [asdict(x) for x in getattr(model, "calloff_incidents", []) or []],
+        "reliability_events": [asdict(x) for x in getattr(model, "reliability_events", []) or []],
     }
     ensure_dir(os.path.dirname(path))
     _atomic_write_json(path, payload, indent=2)
@@ -1612,6 +1867,9 @@ def load_data(path: str) -> DataModel:
     m.weekly_overrides = [des_override(o) for o in payload.get("weekly_overrides", [])]
     m.weekly_exception_settings = _normalize_weekly_exception_settings(payload.get("weekly_exception_settings", {}), m)
     m.history = [des_summary(s) for s in payload.get("history", [])]
+    m.manager_tasks = _normalize_manager_tasks(payload.get("manager_tasks", []))
+    m.calloff_incidents = _normalize_calloff_incidents(payload.get("calloff_incidents", []))
+    m.reliability_events = _normalize_reliability_events(payload.get("reliability_events", []))
     return m
 
 # -----------------------------
@@ -6716,6 +6974,26 @@ def _clopen_map_from_assignments(model: DataModel, assignments: List[Assignment]
         apply_clopen_from(model, e, a, cl)
     return cl
 
+
+def active_manager_tasks_for_label(model: DataModel, label: str) -> List[ManagerTask]:
+    wk_start, wk_end = week_window_for_label(label)
+    if wk_start is None or wk_end is None:
+        return []
+    out: List[ManagerTask] = []
+    for t in list(getattr(model, "manager_tasks", []) or []):
+        if bool(getattr(t, "completed", False)):
+            continue
+        est = _safe_date_from_iso(getattr(t, "earliest_start_date", ""))
+        due = _safe_date_from_iso(getattr(t, "due_date", ""))
+        if est is None or due is None:
+            continue
+        overlaps = (wk_end >= est and wk_start <= due)
+        overdue_unfinished = wk_start > due
+        if overlaps or overdue_unfinished:
+            out.append(t)
+    out.sort(key=lambda x: (_safe_date_from_iso(x.due_date) or datetime.date.max, _safe_date_from_iso(x.earliest_start_date) or datetime.date.max, x.title.lower()))
+    return out
+
 def make_manager_report_html(model: DataModel, label: str, assignments: List[Assignment]) -> str:
     goals = model.manager_goals
     req, sched = _req_sched_counts(model, assignments)
@@ -6896,6 +7174,24 @@ def make_manager_report_html(model: DataModel, label: str, assignments: List[Ass
     for day, d_req, d_sched, d_short, d_over in daily_rows:
         dtrs += f"<tr><td>{day}</td><td>{_hours_to_blocks(d_req)}</td><td>{_hours_to_blocks(d_sched)}</td><td>{_hours_to_blocks(d_short)}</td><td>{_hours_to_blocks(d_over)}</td></tr>"
 
+    active_tasks = active_manager_tasks_for_label(model, label)
+    tasks_html = ""
+    if active_tasks:
+        rows = []
+        for t in active_tasks:
+            rows.append(
+                f"<tr><td style='width:40px;'>☐</td><td>{html_escape(t.title)}</td><td>{html_escape(t.description or '')}</td></tr>"
+            )
+        tasks_html = f"""
+        <div class=\"card\" style=\"grid-column: 1 / span 2;\">
+          <h3>Manager Task Checklist</h3>
+          <table>
+            <thead><tr><th>Done</th><th>Task</th><th>Description</th></tr></thead>
+            <tbody>{''.join(rows)}</tbody>
+          </table>
+        </div>
+        """
+
     html = f"""
     <html><head><meta charset="utf-8">{css}</head>
     <body>
@@ -6965,6 +7261,8 @@ def make_manager_report_html(model: DataModel, label: str, assignments: List[Ass
       </div>
 
       {''.join(call_sections) if call_sections else '<div class="block"><em>No shortages detected from requirements.</em></div>'}
+
+      {tasks_html}
 
       <div class="foot">This report is advisory; always verify real-time availability and compliance.</div>
     </body></html>
@@ -7543,6 +7841,10 @@ class SchedulerApp(tk.Tk):
                 self.model = load_data(self.data_path)
             except Exception:
                 self.model = DataModel()
+        try:
+            ensure_state_law_seed_files()
+        except Exception:
+            pass
         # load learned patterns (Phase 2 P2-4)
         try:
             self.model.learned_patterns = load_patterns()
@@ -7758,37 +8060,50 @@ class SchedulerApp(tk.Tk):
         ttk.Button(btns, text="Save As...", command=self.save_as_dialog).pack(side="right", padx=6)
         ttk.Button(btns, text="New", command=self.new_data).pack(side="right", padx=6)
 
-        self.nb = ttk.Notebook(self); self.nb.pack(fill="both", expand=True, padx=10, pady=(6,10))
+        shell = ttk.Frame(self); shell.pack(fill="both", expand=True, padx=10, pady=(6,10))
+        sched_box = ttk.LabelFrame(shell, text="Scheduling")
+        sched_box.pack(fill="both", expand=True, pady=(0,8))
+        mgmt_box = ttk.LabelFrame(shell, text="Management & System")
+        mgmt_box.pack(fill="both", expand=True)
 
-        self.tab_store = ttk.Frame(self.nb)
-        self.tab_emps = ttk.Frame(self.nb)
-        self.tab_over = ttk.Frame(self.nb)
-        self.tab_reqs = ttk.Frame(self.nb)
-        self.tab_gen = ttk.Frame(self.nb)
-        self.tab_preview = ttk.Frame(self.nb)
-        self.tab_manual = ttk.Frame(self.nb)
-        self.tab_mgr = ttk.Frame(self.nb)
-        self.tab_analysis = ttk.Frame(self.nb)
-        self.tab_changes = ttk.Frame(self.nb)
-        self.tab_heatmap = ttk.Frame(self.nb)
-        self.tab_calloff = ttk.Frame(self.nb)
-        self.tab_history = ttk.Frame(self.nb)
-        self.tab_settings = ttk.Frame(self.nb)
+        self.nb_sched = ttk.Notebook(sched_box); self.nb_sched.pack(fill="both", expand=True, padx=6, pady=6)
+        self.nb_mgmt = ttk.Notebook(mgmt_box); self.nb_mgmt.pack(fill="both", expand=True, padx=6, pady=6)
 
-        self.nb.add(self.tab_store, text="1) Store")
-        self.nb.add(self.tab_emps, text="2) Employees")
-        self.nb.add(self.tab_over, text="3) Schedule Exceptions (One-Week)")
-        self.nb.add(self.tab_reqs, text="4) Staffing Requirements")
-        self.nb.add(self.tab_gen, text="5) Generate")
-        self.nb.add(self.tab_preview, text="6) Print / Export")
-        self.nb.add(self.tab_manual, text="7) Manual Edit")
-        self.nb.add(self.tab_mgr, text="8) Manager Goals")
-        self.nb.add(self.tab_analysis, text="9) Schedule Analysis")
-        self.nb.add(self.tab_changes, text="10) Schedule Changes")
-        self.nb.add(self.tab_heatmap, text="11) Coverage Heatmap")
-        self.nb.add(self.tab_calloff, text="12) Call-Off Simulator")
-        self.nb.add(self.tab_history, text="13) History")
-        self.nb.add(self.tab_settings, text="14) Settings")
+        self.tab_store = ttk.Frame(self.nb_sched)
+        self.tab_reqs = ttk.Frame(self.nb_sched)
+        self.tab_emps = ttk.Frame(self.nb_sched)
+        self.tab_over = ttk.Frame(self.nb_sched)
+        self.tab_gen = ttk.Frame(self.nb_sched)
+        self.tab_preview = ttk.Frame(self.nb_sched)
+
+        self.tab_manager_tasks = ttk.Frame(self.nb_mgmt)
+        self.tab_perf = ttk.Frame(self.nb_mgmt)
+        self.tab_analysis = ttk.Frame(self.nb_mgmt)
+        self.tab_calloff = ttk.Frame(self.nb_mgmt)
+        self.tab_mgr = ttk.Frame(self.nb_mgmt)
+        self.tab_history = ttk.Frame(self.nb_mgmt)
+        self.tab_settings = ttk.Frame(self.nb_mgmt)
+
+        # Hidden/internal tool frames retained for popup workflows and compatibility.
+        self.hidden_tools_host = ttk.Frame(self)
+        self.tab_manual = ttk.Frame(self.hidden_tools_host)
+        self.tab_changes = ttk.Frame(self.hidden_tools_host)
+        self.tab_heatmap = ttk.Frame(self.hidden_tools_host)
+
+        self.nb_sched.add(self.tab_store, text="1) Store")
+        self.nb_sched.add(self.tab_reqs, text="2) Staffing Requirements")
+        self.nb_sched.add(self.tab_emps, text="3) Employee")
+        self.nb_sched.add(self.tab_over, text="4) Schedule Exceptions (One-Week)")
+        self.nb_sched.add(self.tab_gen, text="5) Schedule Workspace / Generate")
+        self.nb_sched.add(self.tab_preview, text="6) Print / Export")
+
+        self.nb_mgmt.add(self.tab_manager_tasks, text="1) Manager Tasks")
+        self.nb_mgmt.add(self.tab_perf, text="2) Employee Performance & Reliability")
+        self.nb_mgmt.add(self.tab_analysis, text="3) Schedule Analysis")
+        self.nb_mgmt.add(self.tab_calloff, text="4) Call-Off Simulator")
+        self.nb_mgmt.add(self.tab_mgr, text="5) Manager Goals")
+        self.nb_mgmt.add(self.tab_history, text="6) History")
+        self.nb_mgmt.add(self.tab_settings, text="7) Settings")
 
         self._build_store_tab()
         self._build_emps_tab()
@@ -7797,6 +8112,8 @@ class SchedulerApp(tk.Tk):
         self._build_generate_tab()
         self._build_preview_tab()
         self._build_manual_tab()
+        self._build_manager_tasks_tab()
+        self._build_performance_tab()
         self._build_manager_tab()
         self._build_analysis_tab()
         self._build_changes_tab()
@@ -7821,6 +8138,7 @@ class SchedulerApp(tk.Tk):
         self.store_addr_var = tk.StringVar()
         self.store_phone_var = tk.StringVar()
         self.store_mgr_var = tk.StringVar()
+        self.store_state_var = tk.StringVar(value="")
         self.cstore_open_var = tk.StringVar(value="00:00")
         self.cstore_close_var = tk.StringVar(value="24:00")
         self.kitchen_open_var = tk.StringVar(value="00:00")
@@ -7846,6 +8164,24 @@ class SchedulerApp(tk.Tk):
         r+=1
         ttk.Label(box, text="Manager:").grid(row=r, column=0, sticky="w", padx=10, pady=6)
         ttk.Entry(box, textvariable=self.store_mgr_var, width=28).grid(row=r, column=1, sticky="w", padx=10, pady=6)
+
+        r += 1
+        law = ttk.LabelFrame(box, text="Labor Rule Jurisdiction")
+        law.grid(row=r, column=0, columnspan=4, sticky="ew", padx=10, pady=8)
+        ttk.Label(law, text="Store State (Required):").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+        self.store_state_combo = ttk.Combobox(
+            law,
+            textvariable=self.store_state_var,
+            values=[US_STATE_LABELS[c] for c, _ in US_STATES],
+            state="readonly",
+            width=28,
+        )
+        self.store_state_combo.grid(row=0, column=1, sticky="w", padx=8, pady=6)
+        ttk.Label(
+            law,
+            text="State selection controls labor-law profile loading. Incomplete profiles safely fall back to current/default rules.",
+            style="Hint.TLabel",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 6))
 
         r += 1
         hours = ttk.LabelFrame(box, text="Hours of Operation (Hard Rules)")
@@ -7893,6 +8229,12 @@ class SchedulerApp(tk.Tk):
         ttk.Button(frm, text="Save Store Info", command=self.save_store_info).pack(anchor="w", padx=6, pady=10)
 
     def save_store_info(self):
+        raw_state = str(self.store_state_var.get() or "").strip()
+        store_state = raw_state.split(" - ", 1)[0].strip().upper() if raw_state else ""
+        if store_state not in US_STATE_CODES:
+            messagebox.showerror("Store", "Store State is required. Please select one of the 50 U.S. states.")
+            return
+
         checks = [
             ("CSTORE", self.cstore_open_var.get(), self.cstore_close_var.get()),
             ("KITCHEN", self.kitchen_open_var.get(), self.kitchen_close_var.get()),
@@ -7938,6 +8280,7 @@ class SchedulerApp(tk.Tk):
             store_address=self.store_addr_var.get().strip(),
             store_phone=self.store_phone_var.get().strip(),
             store_manager=self.store_mgr_var.get().strip(),
+            store_state=store_state,
             cstore_open=self.cstore_open_var.get().strip() or "00:00",
             cstore_close=self.cstore_close_var.get().strip() or "24:00",
             kitchen_open=self.kitchen_open_var.get().strip() or "00:00",
@@ -7946,6 +8289,10 @@ class SchedulerApp(tk.Tk):
             carwash_close=self.carwash_close_var.get().strip() or "24:00",
             peak_hours_soft=peak_hours_soft,
         )
+        prof, warn = load_state_law_profile(store_state)
+        if warn:
+            _write_run_log(f"STATE_LAW | {warn}")
+            messagebox.showwarning("Store State Profile", warn)
         self.autosave()
         messagebox.showinfo("Store", "Saved.")
 
@@ -8889,8 +9236,8 @@ class SchedulerApp(tk.Tk):
         ttk.Button(trow, text="Open Manual Edit (Popup)", command=self._open_manual_popup).pack(side="left", padx=(0, 8))
         ttk.Button(trow, text="Open Coverage Heatmap (Popup)", command=self._open_heatmap_popup).pack(side="left", padx=8)
         ttk.Button(trow, text="Run Analyzer Review (Popup)", command=self._open_analyzer_popup).pack(side="left", padx=8)
-        ttk.Button(trow, text="Compare Versions", command=lambda: self.nb.select(self.tab_changes)).pack(side="left", padx=8)
-        ttk.Button(trow, text="Call-Off Simulator", command=lambda: self.nb.select(self.tab_calloff)).pack(side="left", padx=8)
+        ttk.Button(trow, text="Compare Versions", command=self._open_changes_popup).pack(side="left", padx=8)
+        ttk.Button(trow, text="Call-Off Simulator", command=self._show_calloff_tab).pack(side="left", padx=8)
 
         ns_box = ttk.LabelFrame(frm, text="Selected-Week No School Days")
         ns_box.pack(fill="x", pady=(0, 8))
@@ -10887,6 +11234,57 @@ class SchedulerApp(tk.Tk):
                 self.analysis_text.insert("end", f"• {item}\n")
 
     # -------- Schedule Change Viewer tab (Phase 4 D4) --------
+    def _show_calloff_tab(self):
+        try:
+            self.nb_mgmt.select(self.tab_calloff)
+        except Exception:
+            pass
+
+    def _open_changes_popup(self):
+        sources = self._change_view_sources()
+        names = list(sources.keys())
+        if len(names) < 2:
+            messagebox.showinfo("Compare Versions", "Not enough schedule sources available yet.")
+            return
+
+        left_name = "Current Schedule" if "Current Schedule" in sources else names[0]
+        right_name = "Published Final (This Week)" if "Published Final (This Week)" in sources else names[1]
+        left = sources.get(left_name, {})
+        right = sources.get(right_name, {})
+        segments = self._coalesce_change_segments(list(left.get("assignments", []) or []), list(right.get("assignments", []) or []))
+
+        win = tk.Toplevel(self)
+        win.title("Schedule Change Viewer (Popup)")
+        win.geometry("980x700")
+        wrap = ttk.Frame(win); wrap.pack(fill="both", expand=True, padx=10, pady=10)
+        ttk.Label(wrap, text=f"Compare: {left_name} vs {right_name}", style="Header.TLabel").pack(anchor="w", pady=(0,8))
+
+        txt = tk.Text(wrap, wrap="word")
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        if not segments:
+            txt.insert("end", "No schedule differences were found between these two sources.\n")
+            return
+
+        added = sum(1 for s in segments if s["type"] == "Added")
+        removed = sum(1 for s in segments if s["type"] == "Removed")
+        reassigned = sum(1 for s in segments if s["type"] == "Reassigned")
+        txt.insert("end", f"Added segments: {added}\nRemoved segments: {removed}\nReassigned segments: {reassigned}\nTotal segments: {len(segments)}\n\n")
+        by_day = {d: [] for d in DAYS}
+        for seg in segments:
+            by_day.setdefault(seg["day"], []).append(seg)
+        for d in DAYS:
+            items = by_day.get(d, [])
+            if not items:
+                continue
+            txt.insert("end", f"{d}\n")
+            for seg in items:
+                txt.insert("end", f"  - {seg['area']} {tick_to_ampm(seg['start_t'])}-{tick_to_ampm(seg['end_t'])}: {seg['type']} | {seg['from']} -> {seg['to']}\n")
+            txt.insert("end", "\n")
+
     def _build_changes_tab(self):
         frm = ttk.Frame(self.tab_changes); frm.pack(fill="both", expand=True, padx=12, pady=12)
 
@@ -11396,6 +11794,10 @@ class SchedulerApp(tk.Tk):
         ttk.Label(top, text="Employee:").pack(side="left")
 
         self.co_emp_var = tk.StringVar(value="")
+        try:
+            self.co_emp_var.trace_add("write", lambda *_: self._calloff_refresh_replacements())
+        except Exception:
+            pass
         self.co_emp_menu = ttk.OptionMenu(top, self.co_emp_var, "")
         self.co_emp_menu.pack(side="left", padx=(6,12))
         ttk.Button(top, text="Refresh Employee List", command=self._calloff_refresh_employees).pack(side="left")
@@ -11409,6 +11811,25 @@ class SchedulerApp(tk.Tk):
 
         ttk.Button(top, text="Simulate Call-Off", command=self._simulate_calloff).pack(side="right")
 
+        report_box = ttk.LabelFrame(frm, text="Call-Off Report Recording")
+        report_box.pack(fill="x", pady=(0,10))
+        ttk.Label(report_box, text="Record the call-out and replacement to feed Employee Performance & Reliability metrics. This does not mutate the live schedule.", style="Hint.TLabel").grid(row=0, column=0, columnspan=6, sticky="w", padx=8, pady=(6,4))
+
+        ttk.Label(report_box, text="Date (YYYY-MM-DD):").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        self.co_report_date_var = tk.StringVar(value=today_iso())
+        ttk.Entry(report_box, textvariable=self.co_report_date_var, width=14).grid(row=1, column=1, sticky="w", padx=8, pady=4)
+
+        ttk.Label(report_box, text="Replacement Employee:").grid(row=1, column=2, sticky="w", padx=8, pady=4)
+        self.co_repl_var = tk.StringVar(value="")
+        self.co_repl_menu = ttk.OptionMenu(report_box, self.co_repl_var, "")
+        self.co_repl_menu.grid(row=1, column=3, sticky="w", padx=8, pady=4)
+
+        ttk.Label(report_box, text="Note/Reason:").grid(row=1, column=4, sticky="w", padx=8, pady=4)
+        self.co_note_var = tk.StringVar(value="")
+        ttk.Entry(report_box, textvariable=self.co_note_var, width=30).grid(row=1, column=5, sticky="w", padx=8, pady=4)
+
+        ttk.Button(report_box, text="Record Call-Off Incident", command=self.record_calloff_incident).grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=(4,8))
+
         body = ttk.Frame(frm); body.pack(fill="both", expand=True)
         self.co_text = tk.Text(body, wrap="word", height=18)
         vs = ttk.Scrollbar(body, orient="vertical", command=self.co_text.yview)
@@ -11419,6 +11840,7 @@ class SchedulerApp(tk.Tk):
         body.columnconfigure(0, weight=1)
 
         self._calloff_refresh_employees()
+        self._calloff_refresh_replacements()
         self._calloff_sync_days()
         self._calloff_write_intro()
 
@@ -11471,8 +11893,88 @@ class SchedulerApp(tk.Tk):
             cur = (self.co_emp_var.get() or "").strip()
             if cur not in names:
                 self.co_emp_var.set(names[0])
+            self._calloff_refresh_replacements()
         except Exception:
             pass
+
+    def _calloff_refresh_replacements(self):
+        try:
+            selected = str(getattr(self, "co_emp_var", tk.StringVar(value="")).get() or "").strip()
+            names = []
+            for e in getattr(self.model, "employees", []) or []:
+                if getattr(e, "work_status", "Active") != "Active":
+                    continue
+                nm = str(getattr(e, "name", "") or "").strip()
+                if not nm or nm == selected:
+                    continue
+                names.append(nm)
+            names = sorted(set(names), key=str.lower)
+            if not names:
+                names = [""]
+            menu = self.co_repl_menu["menu"]
+            menu.delete(0, "end")
+            for n in names:
+                menu.add_command(label=n, command=lambda v=n: self.co_repl_var.set(v))
+            if (self.co_repl_var.get() or "").strip() not in names:
+                self.co_repl_var.set(names[0])
+        except Exception:
+            pass
+
+    def record_calloff_incident(self):
+        emp_name = (self.co_emp_var.get() or "").strip()
+        if not emp_name:
+            messagebox.showwarning("Call-Off Simulator", "Pick the called-out employee first.")
+            return
+        date_s = (self.co_report_date_var.get() or "").strip()
+        dt = _safe_date_from_iso(date_s)
+        if dt is None:
+            messagebox.showerror("Call-Off Simulator", "Date must be YYYY-MM-DD.")
+            return
+        replacement = (self.co_repl_var.get() or "").strip()
+        if replacement == emp_name:
+            messagebox.showerror("Call-Off Simulator", "Replacement employee must be different from called-out employee.")
+            return
+        note = (self.co_note_var.get() or "").strip()
+        week_label = str(self.current_label or self.label_var.get().strip() or self._default_week_label())
+
+        day = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][dt.weekday()]
+        incident = CallOffIncident(
+            incident_id=f"incident_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}",
+            week_label=week_label,
+            day=day,
+            incident_date=dt.isoformat(),
+            called_out_employee=emp_name,
+            replacement_employee=replacement,
+            recorded_on=today_iso(),
+            note=note,
+            status="reported",
+        )
+        self.model.calloff_incidents.append(incident)
+        self.model.reliability_events.append(EmployeeReliabilityEvent(
+            event_id=f"ev_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}",
+            employee_name=emp_name,
+            event_type="call_out",
+            date=dt.isoformat(),
+            week_label=week_label,
+            related_employee=replacement,
+            note=note,
+            source="calloff_workflow",
+        ))
+        if replacement:
+            self.model.reliability_events.append(EmployeeReliabilityEvent(
+                event_id=f"ev_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}",
+                employee_name=replacement,
+                event_type="extra_shift_pickup",
+                date=dt.isoformat(),
+                week_label=week_label,
+                related_employee=emp_name,
+                note=note,
+                source="calloff_workflow",
+            ))
+        self.autosave()
+        self.refresh_performance_view()
+        _write_run_log(f"CALL_OFF | incident recorded called_out={emp_name} replacement={replacement} date={dt.isoformat()}")
+        messagebox.showinfo("Call-Off Simulator", "Call-off incident recorded. The schedule was not changed automatically.")
 
     def _simulate_calloff(self):
         try:
@@ -11752,6 +12254,269 @@ class SchedulerApp(tk.Tk):
             self._manual_set_warning_text(["Analyze Manual Edits to check coverage, availability, overlaps, minors rules, and weekly hours before applying."])
         except Exception:
             pass
+
+
+    # -------- Manager Tasks tab --------
+    def _new_manager_task_id(self) -> str:
+        return f"task_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+
+    def _task_is_active_for_label(self, t: ManagerTask, label: str) -> bool:
+        if bool(getattr(t, "completed", False)):
+            return False
+        wk_start, wk_end = week_window_for_label(label)
+        est = _safe_date_from_iso(getattr(t, "earliest_start_date", ""))
+        due = _safe_date_from_iso(getattr(t, "due_date", ""))
+        if wk_start is None or wk_end is None or est is None or due is None:
+            return False
+        if wk_end >= est and wk_start <= due:
+            return True
+        return wk_start > due
+
+    def _roll_completed_recurring_tasks(self):
+        changed = False
+        for i, t in enumerate(list(getattr(self.model, "manager_tasks", []) or [])):
+            rec = _normalize_recurrence(getattr(t, "recurrence", "One-Time"))
+            if rec == "One-Time" or not bool(getattr(t, "completed", False)):
+                continue
+            new_est, new_due = roll_task_window(t.earliest_start_date, t.due_date, rec)
+            if new_est == t.earliest_start_date and new_due == t.due_date:
+                continue
+            t.earliest_start_date = new_est
+            t.due_date = new_due
+            t.completed = False
+            t.completed_on = ""
+            t.last_rolled_on = today_iso()
+            self.model.manager_tasks[i] = t
+            changed = True
+            _write_run_log(f"MANAGER_TASKS | rolled task {t.task_id} ({rec}) -> {new_est}..{new_due}")
+        if changed:
+            self.autosave()
+
+    def _manager_tasks_sorted(self) -> List[ManagerTask]:
+        items = list(getattr(self.model, "manager_tasks", []) or [])
+        def k(t: ManagerTask):
+            due = _safe_date_from_iso(t.due_date) or datetime.date.max
+            est = _safe_date_from_iso(t.earliest_start_date) or datetime.date.max
+            return (1 if t.completed else 0, due, est, t.title.lower())
+        return sorted(items, key=k)
+
+    def _build_manager_tasks_tab(self):
+        frm = ttk.Frame(self.tab_manager_tasks); frm.pack(fill="both", expand=True, padx=12, pady=12)
+        ttk.Label(frm, text="Manager Tasks", style="Header.TLabel").pack(anchor="w", pady=(0,4))
+        ttk.Label(frm, text="Track projects, reports, and recurring manager obligations. Active tasks are included in weekly manager printouts.", style="Hint.TLabel").pack(anchor="w", pady=(0,10))
+
+        row = ttk.Frame(frm); row.pack(fill="x", pady=(0,8))
+        ttk.Button(row, text="Add Task", command=self.add_manager_task).pack(side="left")
+        ttk.Button(row, text="Edit Task", command=self.edit_manager_task).pack(side="left", padx=8)
+        ttk.Button(row, text="Delete Task", command=self.delete_manager_task).pack(side="left", padx=8)
+        ttk.Button(row, text="Toggle Done", command=self.toggle_manager_task_done).pack(side="left", padx=8)
+
+        cols = ("Title", "Earliest", "Due", "Recurrence", "Status", "Description")
+        self.manager_tasks_tree = ttk.Treeview(frm, columns=cols, show="headings", height=12)
+        for c in cols:
+            self.manager_tasks_tree.heading(c, text=c)
+            self.manager_tasks_tree.column(c, width=170 if c != "Description" else 360)
+        self.manager_tasks_tree.pack(fill="both", expand=True)
+        self.manager_tasks_tree.tag_configure("done", foreground="#8a8a8a")
+        self.refresh_manager_tasks_tree()
+
+    def refresh_manager_tasks_tree(self):
+        if not hasattr(self, "manager_tasks_tree"):
+            return
+        self._roll_completed_recurring_tasks()
+        for i in self.manager_tasks_tree.get_children():
+            self.manager_tasks_tree.delete(i)
+        for t in self._manager_tasks_sorted():
+            status = "Done" if t.completed else "Active"
+            self.manager_tasks_tree.insert("", "end", iid=t.task_id, tags=(("done",) if t.completed else ()), values=(t.title, t.earliest_start_date, t.due_date, t.recurrence, status, t.description))
+
+    def _selected_manager_task(self) -> Optional[ManagerTask]:
+        if not hasattr(self, "manager_tasks_tree"):
+            return None
+        sel = self.manager_tasks_tree.selection()
+        if not sel:
+            return None
+        tid = str(sel[0])
+        for t in getattr(self.model, "manager_tasks", []) or []:
+            if t.task_id == tid:
+                return t
+        return None
+
+    def _open_manager_task_popup(self, mode: str, seed: Optional[ManagerTask] = None):
+        top = tk.Toplevel(self)
+        top.title("Add Manager Task" if mode == "add" else "Edit Manager Task")
+        top.geometry("620x360")
+        box = ttk.Frame(top); box.pack(fill="both", expand=True, padx=12, pady=12)
+
+        title_var = tk.StringVar(value=getattr(seed, "title", ""))
+        desc_var = tk.StringVar(value=getattr(seed, "description", ""))
+        est_var = tk.StringVar(value=getattr(seed, "earliest_start_date", ""))
+        due_var = tk.StringVar(value=getattr(seed, "due_date", ""))
+        rec_var = tk.StringVar(value=_normalize_recurrence(getattr(seed, "recurrence", "One-Time")))
+
+        ttk.Label(box, text="Task Title:").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        ttk.Entry(box, textvariable=title_var, width=54).grid(row=0, column=1, sticky="w", padx=6, pady=6)
+        ttk.Label(box, text="Task Description:").grid(row=1, column=0, sticky="nw", padx=6, pady=6)
+        ttk.Entry(box, textvariable=desc_var, width=54).grid(row=1, column=1, sticky="w", padx=6, pady=6)
+        ttk.Label(box, text="Earliest Date (YYYY-MM-DD):").grid(row=2, column=0, sticky="w", padx=6, pady=6)
+        ttk.Entry(box, textvariable=est_var, width=18).grid(row=2, column=1, sticky="w", padx=6, pady=6)
+        ttk.Label(box, text="Due Date (YYYY-MM-DD):").grid(row=3, column=0, sticky="w", padx=6, pady=6)
+        ttk.Entry(box, textvariable=due_var, width=18).grid(row=3, column=1, sticky="w", padx=6, pady=6)
+        ttk.Label(box, text="Recurrence:").grid(row=4, column=0, sticky="w", padx=6, pady=6)
+        ttk.Combobox(box, textvariable=rec_var, values=["One-Time", "Weekly", "Bi-Weekly", "Monthly", "Quarterly", "Yearly"], state="readonly", width=16).grid(row=4, column=1, sticky="w", padx=6, pady=6)
+
+        def _save():
+            title = title_var.get().strip()
+            if not title:
+                messagebox.showerror("Manager Tasks", "Task title is required.", parent=top)
+                return
+            est = _safe_date_from_iso(est_var.get().strip())
+            due = _safe_date_from_iso(due_var.get().strip())
+            if est is None or due is None:
+                messagebox.showerror("Manager Tasks", "Earliest and Due dates must be valid YYYY-MM-DD.", parent=top)
+                return
+            if due < est:
+                messagebox.showerror("Manager Tasks", "Due date must be on/after earliest date.", parent=top)
+                return
+
+            if mode == "add" or seed is None:
+                task = ManagerTask(task_id=self._new_manager_task_id())
+                self.model.manager_tasks.append(task)
+            else:
+                task = seed
+            task.title = title
+            task.description = desc_var.get().strip()
+            task.earliest_start_date = est.isoformat()
+            task.due_date = due.isoformat()
+            task.recurrence = _normalize_recurrence(rec_var.get())
+            self.autosave()
+            self.refresh_manager_tasks_tree()
+            top.destroy()
+
+        b = ttk.Frame(box); b.grid(row=5, column=0, columnspan=2, sticky="w", padx=6, pady=(12,0))
+        ttk.Button(b, text="Save", command=_save).pack(side="left")
+        ttk.Button(b, text="Cancel", command=top.destroy).pack(side="left", padx=8)
+
+    def add_manager_task(self):
+        self._open_manager_task_popup("add", None)
+
+    def edit_manager_task(self):
+        t = self._selected_manager_task()
+        if t is None:
+            return
+        self._open_manager_task_popup("edit", t)
+
+    def delete_manager_task(self):
+        t = self._selected_manager_task()
+        if t is None:
+            return
+        if not messagebox.askyesno("Delete Task", f"Delete '{t.title}'?"):
+            return
+        self.model.manager_tasks = [x for x in (self.model.manager_tasks or []) if x.task_id != t.task_id]
+        self.autosave()
+        self.refresh_manager_tasks_tree()
+
+    def toggle_manager_task_done(self):
+        t = self._selected_manager_task()
+        if t is None:
+            return
+        t.completed = not bool(t.completed)
+        t.completed_on = today_iso() if t.completed else ""
+        self.autosave()
+        self.refresh_manager_tasks_tree()
+
+    # -------- Employee Performance & Reliability --------
+    def _timeoff_events_all(self) -> List[Dict[str, str]]:
+        out: List[Dict[str, str]] = []
+        all_data = _normalize_weekly_exception_settings(getattr(self.model, "weekly_exception_settings", {}) or {}, self.model)
+        for lbl, bucket in all_data.items():
+            for r in _normalize_time_off_requests(bucket.get("time_off_requests", []), lbl):
+                out.append({
+                    "employee_name": r.employee_name,
+                    "event_type": "time_off_request",
+                    "date": r.label,
+                    "note": (r.note or "").strip() or f"{DAY_FULL.get(r.day, r.day)} {self._format_request_window(r)} ({r.status})",
+                })
+        return out
+
+    def _reliability_summary(self) -> Dict[str, Dict[str, Any]]:
+        names = sorted({e.name for e in (self.model.employees or []) if e.name.strip()}, key=str.lower)
+        out: Dict[str, Dict[str, Any]] = {n: {"call_out": 0, "time_off_request": 0, "extra_shift_pickup": 0, "details": []} for n in names}
+        for ev in getattr(self.model, "reliability_events", []) or []:
+            nm = str(ev.employee_name or "").strip()
+            if not nm:
+                continue
+            out.setdefault(nm, {"call_out": 0, "time_off_request": 0, "extra_shift_pickup": 0, "details": []})
+            if ev.event_type in {"call_out", "extra_shift_pickup"}:
+                out[nm][ev.event_type] += 1
+                out[nm]["details"].append((ev.date, ev.event_type, ev.note or "", ev.related_employee or ""))
+        for r in self._timeoff_events_all():
+            nm = str(r.get("employee_name", "")).strip()
+            if not nm:
+                continue
+            out.setdefault(nm, {"call_out": 0, "time_off_request": 0, "extra_shift_pickup": 0, "details": []})
+            out[nm]["time_off_request"] += 1
+            out[nm]["details"].append((str(r.get("date", "")), "time_off_request", str(r.get("note", "")), ""))
+        for nm in out:
+            out[nm]["details"] = sorted(out[nm]["details"], key=lambda x: (x[0], x[1]))
+        return out
+
+    def _build_performance_tab(self):
+        frm = ttk.Frame(self.tab_perf); frm.pack(fill="both", expand=True, padx=12, pady=12)
+        ttk.Label(frm, text="Employee Performance & Reliability", style="Header.TLabel").pack(anchor="w", pady=(0,4))
+        ttk.Label(frm, text="Summary metrics for manager reviews. Time off counts include all submitted requests. Extra-shift pickup counts come only from explicit call-off replacement records.", style="Hint.TLabel").pack(anchor="w", pady=(0,8))
+
+        ttk.Button(frm, text="Refresh", command=self.refresh_performance_view).pack(anchor="w", pady=(0,8))
+        cols = ("Employee", "Call-Outs", "Time Off Requests", "Extra Shifts Picked Up")
+        self.perf_tree = ttk.Treeview(frm, columns=cols, show="headings", height=10)
+        for c in cols:
+            self.perf_tree.heading(c, text=c)
+            self.perf_tree.column(c, width=220 if c == "Employee" else 170)
+        self.perf_tree.pack(fill="x", expand=False)
+        self.perf_tree.bind("<<TreeviewSelect>>", self._on_perf_select, add="+")
+
+        body = ttk.Frame(frm); body.pack(fill="both", expand=True, pady=(8,0))
+        self.perf_detail_text = tk.Text(body, wrap="word", height=14)
+        ysb = ttk.Scrollbar(body, orient="vertical", command=self.perf_detail_text.yview)
+        self.perf_detail_text.configure(yscrollcommand=ysb.set)
+        self.perf_detail_text.pack(side="left", fill="both", expand=True)
+        ysb.pack(side="right", fill="y")
+        self.refresh_performance_view()
+
+    def refresh_performance_view(self):
+        if not hasattr(self, "perf_tree"):
+            return
+        self._perf_cache = self._reliability_summary()
+        for i in self.perf_tree.get_children():
+            self.perf_tree.delete(i)
+        for nm in sorted(self._perf_cache.keys(), key=str.lower):
+            row = self._perf_cache[nm]
+            self.perf_tree.insert("", "end", iid=nm, values=(nm, row["call_out"], row["time_off_request"], row["extra_shift_pickup"]))
+        self.perf_detail_text.delete("1.0", "end")
+        self.perf_detail_text.insert("end", "Select an employee to see details.\n")
+
+    def _on_perf_select(self, _event=None):
+        if not hasattr(self, "perf_tree"):
+            return
+        sel = self.perf_tree.selection()
+        self.perf_detail_text.delete("1.0", "end")
+        if not sel:
+            self.perf_detail_text.insert("end", "Select an employee to see details.\n")
+            return
+        nm = str(sel[0])
+        row = (getattr(self, "_perf_cache", {}) or {}).get(nm, {})
+        self.perf_detail_text.insert("end", f"{nm}\n\n")
+        self.perf_detail_text.insert("end", f"Call-Outs: {row.get('call_out', 0)}\n")
+        self.perf_detail_text.insert("end", f"Time Off Requests: {row.get('time_off_request', 0)}\n")
+        self.perf_detail_text.insert("end", f"Extra Shifts Picked Up: {row.get('extra_shift_pickup', 0)}\n\n")
+        self.perf_detail_text.insert("end", "Details:\n")
+        details = list(row.get("details", []) or [])
+        if not details:
+            self.perf_detail_text.insert("end", "- none\n")
+            return
+        for dt, typ, note, rel in details:
+            extra = f" | with {rel}" if rel else ""
+            self.perf_detail_text.insert("end", f"- {dt} | {typ}{extra} | {note}\n")
 
     def _build_manager_tab(self):
         frm = ttk.Frame(self.tab_mgr); frm.pack(fill="both", expand=True, padx=10, pady=10)
@@ -12483,6 +13248,8 @@ class SchedulerApp(tk.Tk):
         self.store_addr_var.set(self.model.store_info.store_address)
         self.store_phone_var.set(self.model.store_info.store_phone)
         self.store_mgr_var.set(self.model.store_info.store_manager)
+        st_code = str(getattr(self.model.store_info, "store_state", "") or "").strip().upper()
+        self.store_state_var.set(US_STATE_LABELS.get(st_code, ""))
         self.cstore_open_var.set(_norm_hhmm_or_default(getattr(self.model.store_info, "cstore_open", "00:00"), "00:00"))
         self.cstore_close_var.set(_norm_hhmm_or_default(getattr(self.model.store_info, "cstore_close", "24:00"), "24:00"))
         self.kitchen_open_var.set(_norm_hhmm_or_default(getattr(self.model.store_info, "kitchen_open", "00:00"), "00:00"))
@@ -12504,6 +13271,8 @@ class SchedulerApp(tk.Tk):
         self.refresh_override_tree()
         self.refresh_req_tree()
         self.refresh_history_tree()
+        self.refresh_manager_tasks_tree()
+        self.refresh_performance_view()
         try:
             self._refresh_schedule_analysis()
         except Exception:
@@ -12600,6 +13369,7 @@ def main():
     ensure_dir(rel_path("data"))
     ensure_dir(rel_path("history"))
     ensure_dir(rel_path("exports"))
+    ensure_state_law_seed_files()
     _write_run_log(f"START {APP_VERSION} | AppDir={_app_dir()} | CWD={os.getcwd()}")
     app = SchedulerApp()
     try:
