@@ -114,6 +114,17 @@ TICK_MINUTES = 30
 TICKS_PER_HOUR = 2
 DAY_TICKS = 48  # 24h * 2
 
+# Peak-hours soft-rule scoring defaults (centralized tuning knobs).
+# These are intentionally soft and only influence candidate/final ranking after hard-rule feasibility.
+PEAK_SOFT_CANDIDATE_OVERLAP_PER_HOUR_BONUS = 2.4     # reward assigning coverage time inside configured peak windows
+PEAK_SOFT_CANDIDATE_PRACTICAL_SEGMENT_BONUS = 1.2     # extra bonus when the candidate segment is practical length (>=2h)
+PEAK_SOFT_CANDIDATE_CONTIGUOUS_EXTENSION_BONUS = 2.0  # reward contiguous extension of an existing same-day block into peak time
+PEAK_SOFT_CANDIDATE_SHORT_ISOLATED_PENALTY = 1.0      # slight penalty for short isolated peak placements (<2h)
+
+PEAK_SOFT_FINAL_OVERLAP_PER_HOUR_BONUS = 1.6          # reward total schedule overlap with peak windows
+PEAK_SOFT_FINAL_PRACTICAL_SEGMENT_BONUS = 0.8         # extra reward for practical peak-covering segments (>=2h)
+PEAK_SOFT_FINAL_CONTIGUOUS_BLOCK_BONUS = 0.7          # reward broader contiguous blocks (>=3h) that include peak overlap
+
 DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 AREAS = ["CSTORE", "KITCHEN", "CARWASH"]
 
@@ -642,6 +653,12 @@ class StoreInfo:
     kitchen_close: str = "24:00"
     carwash_open: str = "00:00"
     carwash_close: str = "24:00"
+    # Soft preference windows by area; each area keeps 3 optional (start, end) HH:MM pairs.
+    peak_hours_soft: Dict[str, List[Tuple[str, str]]] = field(default_factory=lambda: {
+        "CSTORE": [("", ""), ("", ""), ("", "")],
+        "KITCHEN": [("", ""), ("", ""), ("", "")],
+        "CARWASH": [("", ""), ("", ""), ("", "")],
+    })
 
 
 def _norm_hhmm_or_default(v: str, default: str) -> str:
@@ -676,6 +693,63 @@ def area_open_close_ticks(model: "DataModel", area: str) -> Tuple[int, int]:
 def is_within_area_hours(model: "DataModel", area: str, start_t: int, end_t: int) -> bool:
     op_t, cl_t = area_open_close_ticks(model, area)
     return int(start_t) >= int(op_t) and int(end_t) <= int(cl_t) and int(end_t) > int(start_t)
+
+
+def _normalize_peak_hours_soft(raw: Any) -> Dict[str, List[Tuple[str, str]]]:
+    out: Dict[str, List[Tuple[str, str]]] = {a: [("", ""), ("", ""), ("", "")] for a in AREAS}
+    if not isinstance(raw, dict):
+        return out
+    for k, windows in raw.items():
+        key = str(k or "").strip().upper().replace("-", "").replace(" ", "")
+        if key in ("CSTORE", "C-STORE"):
+            area = "CSTORE"
+        elif key in ("KITCHEN",):
+            area = "KITCHEN"
+        elif key in ("CARWASH", "CAR WASH"):
+            area = "CARWASH"
+        else:
+            continue
+        cleaned: List[Tuple[str, str]] = []
+        for item in (windows or []):
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                s_raw = str(item[0] or "").strip()
+                e_raw = str(item[1] or "").strip()
+            else:
+                s_raw, e_raw = "", ""
+            s = _norm_hhmm_or_default(s_raw, "") if s_raw else ""
+            e = _norm_hhmm_or_default(e_raw, "") if e_raw else ""
+            cleaned.append((s, e))
+            if len(cleaned) >= 3:
+                break
+        while len(cleaned) < 3:
+            cleaned.append(("", ""))
+        out[area] = cleaned
+    return out
+
+
+def get_area_peak_windows_ticks(store_info: Optional[StoreInfo], area: str) -> List[Tuple[int, int]]:
+    if store_info is None:
+        return []
+    norm = _normalize_peak_hours_soft(getattr(store_info, "peak_hours_soft", {}) or {})
+    out: List[Tuple[int, int]] = []
+    for s, e in norm.get(area, []):
+        if not s or not e:
+            continue
+        try:
+            st = hhmm_to_tick(s)
+            en = hhmm_to_tick(e)
+        except Exception:
+            continue
+        if en > st:
+            out.append((int(st), int(en)))
+    return out
+
+
+def peak_overlap_ticks(store_info: Optional[StoreInfo], area: str, st: int, en: int) -> int:
+    total = 0
+    for p_st, p_en in get_area_peak_windows_ticks(store_info, area):
+        total += max(0, min(int(en), int(p_en)) - max(int(st), int(p_st)))
+    return int(total)
 
 @dataclass
 class Settings:
@@ -1078,6 +1152,10 @@ def load_data(path: str) -> DataModel:
     except Exception:
         store_info_filtered = store_info_raw
     m.store_info = StoreInfo(**store_info_filtered)
+    try:
+        m.store_info.peak_hours_soft = _normalize_peak_hours_soft(getattr(m.store_info, "peak_hours_soft", {}) or {})
+    except Exception:
+        m.store_info.peak_hours_soft = _normalize_peak_hours_soft({})
 
     settings_raw = dict(payload.get("settings", {}) or {})
     try:
@@ -2463,6 +2541,34 @@ def schedule_score(model: DataModel, label: str,
     except Exception:
         pass
 
+    # Store peak hours (soft): reward contiguous practical coverage inside configured rush windows.
+    # This bonus is intentionally additive with candidate-level peak guidance: candidate scoring shapes
+    # local placement choices, while this final score judges the whole schedule's resulting peak utility.
+    try:
+        by_emp_day: Dict[Tuple[str, str], List[Tuple[int, int, str]]] = {}
+        for a in assignments:
+            by_emp_day.setdefault((a.employee_name, a.day), []).append((int(a.start_t), int(a.end_t), str(a.area)))
+        peak_bonus = 0.0
+        for segs in by_emp_day.values():
+            merged = _merge_touching_intervals([(st, en) for (st, en, _area) in segs])
+            for st, en, area in segs:
+                ov = peak_overlap_ticks(getattr(model, "store_info", None), area, st, en)
+                if ov <= 0:
+                    continue
+                seg_h = float(hours_between_ticks(st, en))
+                peak_bonus += (ov / float(TICKS_PER_HOUR)) * PEAK_SOFT_FINAL_OVERLAP_PER_HOUR_BONUS
+                if seg_h >= 2.0 - 1e-9:
+                    peak_bonus += PEAK_SOFT_FINAL_PRACTICAL_SEGMENT_BONUS
+                for mst, men in merged:
+                    if int(mst) <= int(st) and int(en) <= int(men):
+                        merged_h = float(hours_between_ticks(mst, men))
+                        if merged_h >= 3.0 - 1e-9:
+                            peak_bonus += PEAK_SOFT_FINAL_CONTIGUOUS_BLOCK_BONUS
+                        break
+        pen -= peak_bonus
+    except Exception:
+        pass
+
     # Final score
     return float(pen)
 
@@ -2523,6 +2629,7 @@ def schedule_score_breakdown(model: DataModel, label: str,
         "fragmentation_quality_pen": 0.0,
         "micro_shift_quality_pen": 0.0,
         "preferred_length_quality_pen": 0.0,
+        "peak_hours_soft_bonus": 0.0,
     }
 
     # Phase 4 C3: Risk-Aware Optimization (soft resilience buffer)
@@ -2723,6 +2830,32 @@ def schedule_score_breakdown(model: DataModel, label: str,
         out["fragmentation_quality_pen"] += q.get("frag_units", 0.0) * split_weight
         out["micro_shift_quality_pen"] += q.get("short_units", 0.0) * short_weight
         out["preferred_length_quality_pen"] += q.get("pref_len_units", 0.0) * pref_len_weight
+    except Exception:
+        pass
+
+    # Mirror schedule_score() peak bonus for explainability; kept additive by design (see note there).
+    try:
+        by_emp_day: Dict[Tuple[str, str], List[Tuple[int, int, str]]] = {}
+        for a in assignments:
+            by_emp_day.setdefault((a.employee_name, a.day), []).append((int(a.start_t), int(a.end_t), str(a.area)))
+        peak_bonus = 0.0
+        for segs in by_emp_day.values():
+            merged = _merge_touching_intervals([(st, en) for (st, en, _area) in segs])
+            for st, en, area in segs:
+                ov = peak_overlap_ticks(getattr(model, "store_info", None), area, st, en)
+                if ov <= 0:
+                    continue
+                seg_h = float(hours_between_ticks(st, en))
+                peak_bonus += (ov / float(TICKS_PER_HOUR)) * PEAK_SOFT_FINAL_OVERLAP_PER_HOUR_BONUS
+                if seg_h >= 2.0 - 1e-9:
+                    peak_bonus += PEAK_SOFT_FINAL_PRACTICAL_SEGMENT_BONUS
+                for mst, men in merged:
+                    if int(mst) <= int(st) and int(en) <= int(men):
+                        merged_h = float(hours_between_ticks(mst, men))
+                        if merged_h >= 3.0 - 1e-9:
+                            peak_bonus += PEAK_SOFT_FINAL_CONTIGUOUS_BLOCK_BONUS
+                        break
+        out["peak_hours_soft_bonus"] -= peak_bonus
     except Exception:
         pass
 
@@ -3654,6 +3787,26 @@ def generate_schedule(model: DataModel, label: str,
         # participation: if wants hours and currently 0, boost
         if e.wants_hours and emp_hours.get(e.name,0.0) < 1.0:
             score += 2.0
+
+        # Store peak hours (soft): prefer practical contiguous assignments that capture useful peak coverage.
+        try:
+            peak_ticks = peak_overlap_ticks(getattr(model, "store_info", None), area, st, en)
+            if peak_ticks > 0:
+                seg_h = float(hours_between_ticks(st, en))
+                score += (peak_ticks / float(TICKS_PER_HOUR)) * PEAK_SOFT_CANDIDATE_OVERLAP_PER_HOUR_BONUS
+                if seg_h >= 2.0 - 1e-9:
+                    score += PEAK_SOFT_CANDIDATE_PRACTICAL_SEGMENT_BONUS
+                segs = emp_day_segments.get((e.name, day), [])
+                if segs:
+                    merged_existing = _merge_touching_intervals([(int(ast), int(aen)) for (ast, aen, _aa) in segs])
+                    merged_with_new = _merge_touching_intervals([(int(ast), int(aen)) for (ast, aen, _aa) in segs] + [(int(st), int(en))])
+                    if len(merged_with_new) < (len(merged_existing) + 1):
+                        score += PEAK_SOFT_CANDIDATE_CONTIGUOUS_EXTENSION_BONUS
+                    elif seg_h < 2.0 - 1e-9:
+                        score -= PEAK_SOFT_CANDIDATE_SHORT_ISOLATED_PENALTY
+        except Exception as ex:
+            _log_once('peak_hours_scoring', f"[solver] peak-hours soft scoring failed: {ex}")
+
         # Phase 4 C4: workforce utilization optimizer (soft)
         if enable_util:
             try:
@@ -7262,6 +7415,11 @@ class SchedulerApp(tk.Tk):
         self.carwash_open_var = tk.StringVar(value="00:00")
         self.carwash_close_var = tk.StringVar(value="24:00")
 
+        self.peak_soft_vars: Dict[str, List[Tuple[tk.StringVar, tk.StringVar]]] = {
+            area: [(tk.StringVar(value=""), tk.StringVar(value="")) for _ in range(3)]
+            for area in AREAS
+        }
+
         r=0
         ttk.Label(box, text="Store Name:").grid(row=r, column=0, sticky="w", padx=10, pady=6)
         ttk.Entry(box, textvariable=self.store_name_var, width=44).grid(row=r, column=1, sticky="w", padx=10, pady=6)
@@ -7292,6 +7450,30 @@ class SchedulerApp(tk.Tk):
             ttk.Combobox(hours, textvariable=open_var, values=TIME_CHOICES, state="readonly", width=8).grid(row=rr, column=1, padx=8, pady=4, sticky="w")
             ttk.Combobox(hours, textvariable=close_var, values=TIME_CHOICES, state="readonly", width=8).grid(row=rr, column=2, padx=8, pady=4, sticky="w")
 
+        r += 1
+        peak = ttk.LabelFrame(box, text="Peak Hours (Soft Rules)")
+        peak.grid(row=r, column=0, columnspan=4, sticky="ew", padx=10, pady=8)
+        headers = ["Area", "P1 Start", "P1 End", "P2 Start", "P2 End", "P3 Start", "P3 End"]
+        for cc, hdr in enumerate(headers):
+            ttk.Label(peak, text=hdr).grid(row=0, column=cc, padx=8, pady=4, sticky="w")
+        peak_rows = [
+            ("CSTORE", "C-Store"),
+            ("KITCHEN", "Kitchen"),
+            ("CARWASH", "Carwash"),
+        ]
+        for rr, (area, lbl) in enumerate(peak_rows, start=1):
+            ttk.Label(peak, text=lbl).grid(row=rr, column=0, padx=8, pady=4, sticky="w")
+            for idx, (st_var, en_var) in enumerate(self.peak_soft_vars[area]):
+                ttk.Combobox(peak, textvariable=st_var, values=[""] + TIME_CHOICES, state="readonly", width=8).grid(row=rr, column=1 + (idx*2), padx=8, pady=4, sticky="w")
+                ttk.Combobox(peak, textvariable=en_var, values=[""] + TIME_CHOICES, state="readonly", width=8).grid(row=rr, column=2 + (idx*2), padx=8, pady=4, sticky="w")
+
+        ttk.Label(
+            peak,
+            text="Manager note: Peak Hours are soft preferences for beneficial overstaffing. They encourage extending practical shifts into later demand windows and never override hard rules.",
+            wraplength=900,
+            style="SubHeader.TLabel",
+        ).grid(row=len(peak_rows)+1, column=0, columnspan=7, padx=8, pady=(6,4), sticky="w")
+
         if getattr(self, "brand_img_store", None) is not None:
             ttk.Label(right, image=self.brand_img_store).pack(anchor="ne")
 
@@ -7303,11 +7485,40 @@ class SchedulerApp(tk.Tk):
             ("KITCHEN", self.kitchen_open_var.get(), self.kitchen_close_var.get()),
             ("CARWASH", self.carwash_open_var.get(), self.carwash_close_var.get()),
         ]
+        area_hours: Dict[str, Tuple[int, int]] = {}
         for area, op, cl in checks:
             op_t = hhmm_to_tick(op); cl_t = hhmm_to_tick(cl)
             if cl_t <= op_t:
                 messagebox.showerror("Store", f"{area} close time must be after open time.")
                 return
+            area_hours[area] = (int(op_t), int(cl_t))
+
+        peak_hours_soft: Dict[str, List[Tuple[str, str]]] = {}
+        area_labels = {"CSTORE": "C-Store", "KITCHEN": "Kitchen", "CARWASH": "Carwash"}
+        for area in AREAS:
+            windows: List[Tuple[str, str]] = []
+            for idx, (st_var, en_var) in enumerate(self.peak_soft_vars.get(area, []), start=1):
+                st = str(st_var.get() or "").strip()
+                en = str(en_var.get() or "").strip()
+                if bool(st) ^ bool(en):
+                    messagebox.showerror("Store", f"{area_labels.get(area, area)} Peak {idx}: start and end are both required when one is set.")
+                    return
+                if not st and not en:
+                    windows.append(("", ""))
+                    continue
+                st_t = hhmm_to_tick(st)
+                en_t = hhmm_to_tick(en)
+                if en_t <= st_t:
+                    messagebox.showerror("Store", f"{area_labels.get(area, area)} Peak {idx}: end time must be after start time.")
+                    return
+                op_t, cl_t = area_hours.get(area, (0, DAY_TICKS))
+                if st_t < op_t or en_t > cl_t:
+                    messagebox.showerror("Store", f"{area_labels.get(area, area)} Peak {idx} must be within Hours of Operation: {tick_to_hhmm(op_t)}–{tick_to_hhmm(cl_t)}")
+                    return
+                windows.append((tick_to_hhmm(st_t), tick_to_hhmm(en_t)))
+            while len(windows) < 3:
+                windows.append(("", ""))
+            peak_hours_soft[area] = windows[:3]
 
         self.model.store_info = StoreInfo(
             store_name=self.store_name_var.get().strip(),
@@ -7320,6 +7531,7 @@ class SchedulerApp(tk.Tk):
             kitchen_close=self.kitchen_close_var.get().strip() or "24:00",
             carwash_open=self.carwash_open_var.get().strip() or "00:00",
             carwash_close=self.carwash_close_var.get().strip() or "24:00",
+            peak_hours_soft=peak_hours_soft,
         )
         self.autosave()
         messagebox.showinfo("Store", "Saved.")
@@ -10817,6 +11029,15 @@ class SchedulerApp(tk.Tk):
         self.kitchen_close_var.set(_norm_hhmm_or_default(getattr(self.model.store_info, "kitchen_close", "24:00"), "24:00"))
         self.carwash_open_var.set(_norm_hhmm_or_default(getattr(self.model.store_info, "carwash_open", "00:00"), "00:00"))
         self.carwash_close_var.set(_norm_hhmm_or_default(getattr(self.model.store_info, "carwash_close", "24:00"), "24:00"))
+        peak_soft = _normalize_peak_hours_soft(getattr(self.model.store_info, "peak_hours_soft", {}) or {})
+        self.model.store_info.peak_hours_soft = peak_soft
+        for area in AREAS:
+            vars_for_area = self.peak_soft_vars.get(area, [])
+            windows = peak_soft.get(area, [("", ""), ("", ""), ("", "")])
+            for idx in range(min(3, len(vars_for_area))):
+                st, en = windows[idx] if idx < len(windows) else ("", "")
+                vars_for_area[idx][0].set(st or "")
+                vars_for_area[idx][1].set(en or "")
 
         self.refresh_emp_tree()
         self.refresh_override_dropdowns()
