@@ -125,7 +125,20 @@ PEAK_SOFT_FINAL_OVERLAP_PER_HOUR_BONUS = 1.6          # reward total schedule ov
 PEAK_SOFT_FINAL_PRACTICAL_SEGMENT_BONUS = 0.8         # extra reward for practical peak-covering segments (>=2h)
 PEAK_SOFT_FINAL_CONTIGUOUS_BLOCK_BONUS = 0.7          # reward broader contiguous blocks (>=3h) that include peak overlap
 
+# Employee soft-availability candidate scoring (small magnitude, soft-only preference).
+SOFT_AVAILABILITY_MATCH_BONUS = 1.5
+SOFT_AVAILABILITY_MISS_PENALTY = 2.5
+
 DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+DAY_FULL = {
+    "Sun": "Sunday",
+    "Mon": "Monday",
+    "Tue": "Tuesday",
+    "Wed": "Wednesday",
+    "Thu": "Thursday",
+    "Fri": "Friday",
+    "Sat": "Saturday",
+}
 AREAS = ["CSTORE", "KITCHEN", "CARWASH"]
 
 def tick_to_hhmm(t: int) -> str:
@@ -596,8 +609,18 @@ class Employee:
     max_consecutive_days: int = 6
     weekend_preference: str = "Neutral"         # Prefer / Avoid / Neutral
 
+    # Legacy single availability field is kept for backward compatibility.
+    # Current semantics: hard_availability = absolute; soft_availability = preference.
     availability: Dict[str, DayRules] = field(default_factory=dict)
+    hard_availability: Dict[str, DayRules] = field(default_factory=dict)
+    soft_availability: Dict[str, DayRules] = field(default_factory=dict)
+
+    # Canonical recurring fixed schedule payload (one shift/day max) + status.
+    # Status: "none" | "active" | "paused"
+    fixed_schedule_status: str = "none"
     fixed_schedule: List[FixedShift] = field(default_factory=list)
+
+    # Legacy compatibility payload retained for reading old saves.
     recurring_locked_schedule: List[FixedShift] = field(default_factory=list)
 
 @dataclass
@@ -861,6 +884,58 @@ class DataModel:
 def default_day_rules() -> Dict[str, DayRules]:
     return {d: DayRules(False, 0, DAY_TICKS, []) for d in DAYS}
 
+
+def _normalize_fixed_schedule_status(v: Any) -> str:
+    s = str(v or "none").strip().lower()
+    if s in {"active", "paused", "none"}:
+        return s
+    return "none"
+
+
+def _normalize_fixed_schedule_entries(entries: List[FixedShift]) -> List[FixedShift]:
+    """Normalize fixed schedule payload to one valid shift per day."""
+    by_day: Dict[str, List[FixedShift]] = {d: [] for d in DAYS}
+    for fs in entries or []:
+        try:
+            day = str(getattr(fs, "day", "") or "").strip()
+            area = str(getattr(fs, "area", "") or "").strip().upper()
+            st = int(getattr(fs, "start_t", 0))
+            en = int(getattr(fs, "end_t", 0))
+        except Exception:
+            continue
+        if day not in DAYS or area not in AREAS:
+            continue
+        if en <= st:
+            continue
+        by_day[day].append(FixedShift(day=day, start_t=st, end_t=en, area=area, locked=True))
+
+    out: List[FixedShift] = []
+    for d in DAYS:
+        day_items = sorted(by_day[d], key=lambda x: (int(x.start_t), int(x.end_t), str(x.area)))
+        if day_items:
+            out.append(day_items[0])
+    return out
+
+
+def employee_hard_availability(e: Employee) -> Dict[str, DayRules]:
+    av = getattr(e, "hard_availability", None)
+    if isinstance(av, dict) and av:
+        return av
+    av2 = getattr(e, "availability", None)
+    if isinstance(av2, dict) and av2:
+        return av2
+    return default_day_rules()
+
+
+def employee_soft_availability(e: Employee) -> Dict[str, DayRules]:
+    av = getattr(e, "soft_availability", None)
+    if isinstance(av, dict) and av:
+        return av
+    av2 = getattr(e, "availability", None)
+    if isinstance(av2, dict) and av2:
+        return av2
+    return default_day_rules()
+
 def default_requirements() -> List[RequirementBlock]:
     # Default blocks: 05:00–23:00 in 30-minute increments, CSTORE=2, others=0
     out: List[RequirementBlock] = []
@@ -894,6 +969,10 @@ def des_dayrules(d: dict) -> DayRules:
     )
 
 def ser_employee(e: Employee) -> dict:
+    hard_av = employee_hard_availability(e)
+    soft_av = employee_soft_availability(e)
+    fixed_norm = _normalize_fixed_schedule_entries(list(getattr(e, "fixed_schedule", []) or []))
+    fixed_status = _normalize_fixed_schedule_status(getattr(e, "fixed_schedule_status", "none"))
     return {
         "name": e.name,
         "phone": e.phone,
@@ -914,18 +993,28 @@ def ser_employee(e: Employee) -> dict:
         "avoid_clopens": bool(e.avoid_clopens),
         "max_consecutive_days": int(e.max_consecutive_days),
         "weekend_preference": str(e.weekend_preference),
-        "availability": {d: ser_dayrules(e.availability.get(d, DayRules())) for d in DAYS},
-        "fixed_schedule": [asdict(fs) for fs in e.fixed_schedule],
-        "recurring_locked_schedule": [asdict(fs) for fs in getattr(e, "recurring_locked_schedule", [])],
+        # Legacy + explicit hard/soft availability payloads.
+        "availability": {d: ser_dayrules(hard_av.get(d, DayRules())) for d in DAYS},
+        "hard_availability": {d: ser_dayrules(hard_av.get(d, DayRules())) for d in DAYS},
+        "soft_availability": {d: ser_dayrules(soft_av.get(d, DayRules())) for d in DAYS},
+        # Canonical fixed schedule payload + status.
+        "fixed_schedule_status": fixed_status,
+        "fixed_schedule": [asdict(fs) for fs in fixed_norm],
+        # Legacy compatibility write-through: expose active fixed entries as recurring_locked_schedule.
+        "recurring_locked_schedule": [asdict(fs) for fs in fixed_norm] if fixed_status == "active" else [],
     }
 
 def des_employee(d: dict) -> Employee:
     av_raw = d.get("availability", {})
-    av = {day: des_dayrules(av_raw.get(day, {})) for day in DAYS}
-    fs = []
+    hard_av_raw = d.get("hard_availability", av_raw)
+    soft_av_raw = d.get("soft_availability", av_raw)
+    hard_av = {day: des_dayrules((hard_av_raw or {}).get(day, {})) for day in DAYS}
+    soft_av = {day: des_dayrules((soft_av_raw or {}).get(day, {})) for day in DAYS}
+
+    fs_raw: List[FixedShift] = []
     for x in d.get("fixed_schedule", []):
         try:
-            fs.append(FixedShift(
+            fs_raw.append(FixedShift(
                 day=x.get("day","Sun"),
                 start_t=int(x.get("start_t",0)),
                 end_t=int(x.get("end_t",0)),
@@ -936,11 +1025,11 @@ def des_employee(d: dict) -> Employee:
             pass
 
     recurring_raw = d.get("recurring_locked_schedule", None)
-    rls: List[FixedShift] = []
+    rls_raw: List[FixedShift] = []
     if isinstance(recurring_raw, list):
         for x in recurring_raw:
             try:
-                rls.append(FixedShift(
+                rls_raw.append(FixedShift(
                     day=x.get("day","Sun"),
                     start_t=int(x.get("start_t",0)),
                     end_t=int(x.get("end_t",0)),
@@ -949,11 +1038,29 @@ def des_employee(d: dict) -> Employee:
                 ))
             except Exception:
                 pass
+    # Compatibility mapping behavior:
+    # - New payload (explicit status) => treat fixed_schedule as canonical payload.
+    # - Legacy payload => migrate recurring_locked + fixed.locked=True as ACTIVE fixed schedule.
+    # - Legacy fixed.locked=False does not migrate into the new fixed hard-rule system.
+    has_new_fixed_shape = ("fixed_schedule_status" in d) or ("hard_availability" in d) or ("soft_availability" in d)
+    if has_new_fixed_shape:
+        fixed_status = _normalize_fixed_schedule_status(d.get("fixed_schedule_status", "none"))
+        fixed_payload = _normalize_fixed_schedule_entries(fs_raw)
     else:
-        for x in fs:
+        legacy_active: List[FixedShift] = []
+        for x in rls_raw:
+            legacy_active.append(FixedShift(day=x.day, start_t=x.start_t, end_t=x.end_t, area=x.area, locked=True))
+        for x in fs_raw:
             if bool(getattr(x, "locked", False)):
-                rls.append(FixedShift(day=x.day, start_t=x.start_t, end_t=x.end_t, area=x.area, locked=True))
-        fs = [x for x in fs if not bool(getattr(x, "locked", False))]
+                legacy_active.append(FixedShift(day=x.day, start_t=x.start_t, end_t=x.end_t, area=x.area, locked=True))
+        fixed_payload = _normalize_fixed_schedule_entries(legacy_active)
+        fixed_status = "active" if fixed_payload else "none"
+
+    # If status says none, payload should be empty; if status active/paused and payload empty, normalize to none.
+    if fixed_status == "none":
+        fixed_payload = []
+    elif not fixed_payload:
+        fixed_status = "none"
 
     et = str(d.get("employee_type", "Crew Member"))
     if not et.strip():
@@ -1017,9 +1124,12 @@ def des_employee(d: dict) -> Employee:
         avoid_clopens=bool(d.get("avoid_clopens", True)),
         max_consecutive_days=int(d.get("max_consecutive_days", 6)),
         weekend_preference=str(d.get("weekend_preference", "Neutral")),
-        availability=av,
-        fixed_schedule=fs,
-        recurring_locked_schedule=rls,
+        availability=hard_av,
+        hard_availability=hard_av,
+        soft_availability=soft_av,
+        fixed_schedule_status=fixed_status,
+        fixed_schedule=fixed_payload,
+        recurring_locked_schedule=[FixedShift(day=x.day, start_t=x.start_t, end_t=x.end_t, area=x.area, locked=True) for x in fixed_payload] if fixed_status == "active" else [],
     )
 
 def ser_override(o: WeeklyOverride) -> dict:
@@ -1765,7 +1875,7 @@ def is_employee_available(model: DataModel, e: Employee, label: str, day: str, s
         return False
     if not is_within_area_hours(model, area, start_t, end_t):
         return False
-    dr = e.availability.get(day)
+    dr = employee_hard_availability(e).get(day)
     if dr is None:
         return False
     if not dr.is_available(start_t, end_t):
@@ -1798,6 +1908,37 @@ def is_employee_available(model: DataModel, e: Employee, label: str, day: str, s
         if end_t > latest:
             return False
     return True
+
+
+def fixed_shift_compliance_ok(model: DataModel, e: Employee, label: str, day: str, start_t: int, end_t: int, area: str,
+                              existing_assignments: Optional[List[Assignment]] = None) -> Tuple[bool, str]:
+    """Compliance checks for active fixed anchors.
+
+    Active fixed shifts override employee-level availability/area/preferences,
+    but must still respect store hours and legal/minor restrictions.
+    """
+    if area not in AREAS:
+        return False, "Area must be CSTORE, KITCHEN, or CARWASH."
+    if day not in DAYS:
+        return False, "Day must be Sun, Mon, Tue, Wed, Thu, Fri, or Sat."
+    if int(end_t) <= int(start_t):
+        return False, "End must be after start."
+    if not is_within_area_hours(model, area, int(start_t), int(end_t)):
+        op_t, cl_t = area_open_close_ticks(model, area)
+        return False, f"Shift must be within Hours of Operation for {area}: {tick_to_hhmm(op_t)}–{tick_to_hhmm(cl_t)}"
+
+    if model.nd_rules.enforce and e.minor_type == "MINOR_14_15":
+        ws = week_sun_from_label(label) or datetime.date.today()
+        ddate = day_date(ws, day)
+        summer = is_summer_for_minor_14_15(ddate)
+        earliest = hhmm_to_tick("07:00")
+        latest = hhmm_to_tick("21:00") if summer else hhmm_to_tick("19:00")
+        if int(start_t) < earliest or int(end_t) > latest:
+            return False, "Shift violates ND minor allowed working window."
+        if not nd_minor_hours_feasible(model, e, day, int(start_t), int(end_t), list(existing_assignments or [])):
+            return False, "Shift violates ND minor daily/weekly hour limits."
+
+    return True, ""
 
 def apply_clopen_from(model: DataModel, e: Employee, a: Assignment,
                       clopen_min_start: Dict[Tuple[str,str], int]):
@@ -2183,21 +2324,27 @@ def evaluate_schedule_hard_rules(model: DataModel, label: str, assignments: List
 
         for idx, a in ordered:
             prov = assignment_provenance(a)
-            is_override = prov in {ASSIGNMENT_SOURCE_FIXED_LOCKED, ASSIGNMENT_SOURCE_MANUAL}
+            # Only active fixed anchors bypass employee-level constraints.
+            # Manual overrides should not inherit fixed-schedule bypass scope.
+            is_override = (prov == ASSIGNMENT_SOURCE_FIXED_LOCKED)
 
             if e.work_status != "Active":
                 violations.append(HardRuleViolation(code="active-status", message="employee is not Active", employee_name=emp_name, day=a.day, assignment_source=prov, assignment_index=idx, is_override_allowed=is_override))
-            if a.area not in e.areas_allowed:
+            if (not is_override) and a.area not in e.areas_allowed:
                 violations.append(HardRuleViolation(code="allowed-area", message=f"area={a.area} not in employee allowed list", employee_name=emp_name, day=a.day, assignment_source=prov, assignment_index=idx, is_override_allowed=is_override))
-            if not is_employee_available(model, e, label, a.day, int(a.start_t), int(a.end_t), a.area, clopen_min_start):
+            if is_override:
+                _ok, _msg = fixed_shift_compliance_ok(model, e, label, a.day, int(a.start_t), int(a.end_t), a.area, running)
+                if not _ok:
+                    violations.append(HardRuleViolation(code="fixed-override-compliance", message=_msg, employee_name=emp_name, day=a.day, assignment_source=prov, assignment_index=idx, is_override_allowed=False))
+            elif not is_employee_available(model, e, label, a.day, int(a.start_t), int(a.end_t), a.area, clopen_min_start):
                 violations.append(HardRuleViolation(code="availability-window", message=f"{tick_to_hhmm(a.start_t)}-{tick_to_hhmm(a.end_t)} violates availability/override/minor-time rules", employee_name=emp_name, day=a.day, assignment_source=prov, assignment_index=idx, is_override_allowed=is_override))
             if any(overlaps(a, prev) for prev in running if prev.employee_name == emp_name and prev.day == a.day):
                 violations.append(HardRuleViolation(code="overlap", message=f"overlap at {tick_to_hhmm(a.start_t)}-{tick_to_hhmm(a.end_t)}", employee_name=emp_name, day=a.day, assignment_source=prov, assignment_index=idx, is_override_allowed=is_override))
 
             trial = running + [a]
-            if not respects_daily_shift_limits(trial, e, a.day):
+            if (not is_override) and not respects_daily_shift_limits(trial, e, a.day):
                 violations.append(HardRuleViolation(code="daily-shift-limits", message="split/max-shifts/max-shift-length violated", employee_name=emp_name, day=a.day, assignment_source=prov, assignment_index=idx, is_override_allowed=is_override))
-            if not respects_max_consecutive_days(trial, e, a.day):
+            if (not is_override) and not respects_max_consecutive_days(trial, e, a.day):
                 violations.append(HardRuleViolation(code="max-consecutive-days", message="max consecutive day limit violated", employee_name=emp_name, day=a.day, assignment_source=prov, assignment_index=idx, is_override_allowed=is_override))
 
             h = hours_between_ticks(int(a.start_t), int(a.end_t))
@@ -2219,14 +2366,14 @@ def evaluate_schedule_hard_rules(model: DataModel, label: str, assignments: List
                     if x.employee_name == emp_name and x.day == day and not (int(en) <= int(x.start_t) or int(st) >= int(x.end_t))
                 ]
                 block_src, block_override = _derived_provenance(block_parts)
-                if min_h > 0.0 and block_h + 1e-9 < min_h:
+                if (not block_override) and min_h > 0.0 and block_h + 1e-9 < min_h:
                     violations.append(HardRuleViolation(code="min-hours-per-shift", message=f"block {tick_to_hhmm(st)}-{tick_to_hhmm(en)} ({block_h:.1f}h) < min {min_h:.1f}h", employee_name=emp_name, day=day, assignment_source=block_src, is_override_allowed=block_override))
-                if block_h - mx_h > 1e-9:
+                if (not block_override) and block_h - mx_h > 1e-9:
                     violations.append(HardRuleViolation(code="max-hours-per-shift", message=f"block {tick_to_hhmm(st)}-{tick_to_hhmm(en)} ({block_h:.1f}h) > max {mx_h:.1f}h", employee_name=emp_name, day=day, assignment_source=block_src, is_override_allowed=block_override))
 
         max_weekly = float(getattr(e, "max_weekly_hours", 0.0) or 0.0)
-        if max_weekly > 0.0 and (weekly_hours - max_weekly) > 1e-9:
-            weekly_src, weekly_override = _derived_provenance(running)
+        weekly_src, weekly_override = _derived_provenance(running)
+        if (not weekly_override) and max_weekly > 0.0 and (weekly_hours - max_weekly) > 1e-9:
             violations.append(HardRuleViolation(code="employee-max-weekly-hours", message=f"scheduled={weekly_hours:.1f} max={max_weekly:.1f}", employee_name=emp_name, assignment_source=weekly_src, is_override_allowed=weekly_override))
 
         # Best-effort participation floor: warning-only signal (does not block legality).
@@ -2917,7 +3064,10 @@ def build_locked_and_prefer_from_fixed(model: DataModel, label: str) -> Tuple[Li
     for e in model.employees:
         if e.work_status != "Active":
             continue
-        for fs in getattr(e, "recurring_locked_schedule", []) or []:
+        status = _normalize_fixed_schedule_status(getattr(e, "fixed_schedule_status", "none"))
+        if status != "active":
+            continue
+        for fs in _normalize_fixed_schedule_entries(list(getattr(e, "fixed_schedule", []) or [])):
             if fs.day not in DAYS or fs.area not in AREAS:
                 continue
             key = (fs.day, fs.area, int(fs.start_t), int(fs.end_t), e.name)
@@ -2925,17 +3075,6 @@ def build_locked_and_prefer_from_fixed(model: DataModel, label: str) -> Tuple[Li
                 continue
             seen_locked.add(key)
             locked.append(Assignment(fs.day, fs.area, fs.start_t, fs.end_t, e.name, locked=True, source=ASSIGNMENT_SOURCE_FIXED_LOCKED))
-        for fs in e.fixed_schedule:
-            if fs.day not in DAYS or fs.area not in AREAS:
-                continue
-            if fs.locked:
-                key = (fs.day, fs.area, int(fs.start_t), int(fs.end_t), e.name)
-                if key in seen_locked:
-                    continue
-                seen_locked.add(key)
-            a = Assignment(fs.day, fs.area, fs.start_t, fs.end_t, e.name, locked=fs.locked,
-                           source=ASSIGNMENT_SOURCE_FIXED_LOCKED if fs.locked else ASSIGNMENT_SOURCE_FIXED_UNLOCKED)
-            (locked if fs.locked else prefer).append(a)
     return locked, prefer
 
 def build_locked_seed_state(model: DataModel,
@@ -3688,6 +3827,14 @@ def generate_schedule(model: DataModel, label: str,
             for ex in assignments:
                 if overlaps(ex, a):
                     return False
+        else:
+            if assignment_provenance(a) == ASSIGNMENT_SOURCE_FIXED_LOCKED:
+                ok_fixed, _msg_fixed = fixed_shift_compliance_ok(model, e, label, a.day, a.start_t, a.end_t, a.area, assignments)
+                if not ok_fixed:
+                    return False
+                for ex in assignments:
+                    if overlaps(ex, a):
+                        return False
 
         h = hours_between_ticks(a.start_t, a.end_t)
         if (not locked_ok) and enforce_weekly_cap and max_weekly_cap > 0.0 and (total_labor_hours + h) - max_weekly_cap > 1e-9:
@@ -3781,6 +3928,16 @@ def generate_schedule(model: DataModel, label: str,
             score -= 2.5
         if day in weekend_set and e.weekend_preference=="Prefer":
             score += 1.2
+        # Soft recurring availability preference (not a hard gate).
+        try:
+            soft_dr = employee_soft_availability(e).get(day)
+            if soft_dr is not None:
+                if soft_dr.is_available(int(st), int(en)):
+                    score += SOFT_AVAILABILITY_MATCH_BONUS
+                else:
+                    score -= SOFT_AVAILABILITY_MISS_PENALTY
+        except Exception:
+            pass
         # balance: help those under target min
         gap = max(0.0, e.target_min_hours - emp_hours.get(e.name,0.0))
         score += min(5.0, gap) * 0.8
@@ -6647,27 +6804,113 @@ def simple_input(parent, title: str, prompt: str, default: str="") -> Optional[s
     parent.wait_window(win)
     return out["v"]
 
+class FixedScheduleEditorDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, model: "DataModel", initial_entries: List[FixedShift], minor_type: str, label_hint: str):
+        super().__init__(parent)
+        self.model = model
+        self.result: Optional[List[FixedShift]] = None
+        self.title(label_hint)
+        self.transient(parent)
+        self.grab_set()
+        self.geometry("1320x420")
+
+        norm = _normalize_fixed_schedule_entries(list(initial_entries or []))
+        by_day: Dict[str, FixedShift] = {x.day: x for x in norm}
+
+        self.area_vars: Dict[str, tk.StringVar] = {}
+        self.start_vars: Dict[str, tk.StringVar] = {}
+        self.end_vars: Dict[str, tk.StringVar] = {}
+        self.minor_type = str(minor_type or "ADULT")
+
+        frm = ttk.Frame(self, padding=(12, 12, 12, 12))
+        frm.pack(fill="both", expand=True)
+
+        cols = ttk.Frame(frm)
+        cols.pack(fill="x", expand=False)
+
+        for i, day in enumerate(DAYS):
+            col = ttk.LabelFrame(cols, text=DAY_FULL.get(day, day), padding=(8, 8, 8, 8))
+            col.grid(row=0, column=i, sticky="n", padx=4, pady=4)
+            fs = by_day.get(day)
+            av = tk.StringVar(value=(fs.area if fs else ""))
+            sv = tk.StringVar(value=(tick_to_hhmm(fs.start_t) if fs else ""))
+            ev = tk.StringVar(value=(tick_to_hhmm(fs.end_t) if fs else ""))
+            self.area_vars[day] = av
+            self.start_vars[day] = sv
+            self.end_vars[day] = ev
+
+            ttk.Label(col, text="Area").pack(anchor="w")
+            ttk.Combobox(col, textvariable=av, values=[""] + AREAS, state="readonly", width=11).pack(anchor="w", pady=(0, 6))
+            row = ttk.Frame(col)
+            row.pack(anchor="w")
+            ttk.Label(row, text="Start").grid(row=0, column=0, sticky="w")
+            ttk.Label(row, text="End").grid(row=0, column=1, sticky="w", padx=(6,0))
+            ttk.Combobox(row, textvariable=sv, values=[""] + TIME_CHOICES, state="readonly", width=8).grid(row=1, column=0, sticky="w")
+            ttk.Combobox(row, textvariable=ev, values=[""] + TIME_CHOICES, state="readonly", width=8).grid(row=1, column=1, sticky="w", padx=(6,0))
+            ttk.Button(col, text="Clear Day", command=lambda d=day: self._clear_day(d)).pack(anchor="w", pady=(8,0))
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(10,0))
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(btns, text="Save Schedule", command=self._save).pack(side="right", padx=8)
+
+    def _clear_day(self, day: str):
+        self.area_vars[day].set("")
+        self.start_vars[day].set("")
+        self.end_vars[day].set("")
+
+    def _save(self):
+        out: List[FixedShift] = []
+        for day in DAYS:
+            area = self.area_vars[day].get().strip().upper()
+            st = self.start_vars[day].get().strip()
+            en = self.end_vars[day].get().strip()
+            if (not area) and (not st) and (not en):
+                continue
+            if not area:
+                messagebox.showerror("Fixed Schedule", f"{DAY_FULL.get(day, day)}: Area is required when times are set.")
+                return
+            if (not st) or (not en):
+                messagebox.showerror("Fixed Schedule", f"{DAY_FULL.get(day, day)}: Start and End must both be set.")
+                return
+            stt = hhmm_to_tick(st)
+            ent = hhmm_to_tick(en)
+            if ent <= stt:
+                messagebox.showerror("Fixed Schedule", f"{DAY_FULL.get(day, day)}: Overnight shifts are not allowed.")
+                return
+            probe = Employee(name="_probe_", minor_type=self.minor_type)
+            ok, msg = fixed_shift_compliance_ok(self.model, probe, "Week starting 2000-01-02", day, stt, ent, area, [])
+            if not ok:
+                messagebox.showerror("Fixed Schedule", f"{DAY_FULL.get(day, day)}: {msg}")
+                return
+            out.append(FixedShift(day=day, start_t=stt, end_t=ent, area=area, locked=True))
+
+        self.result = _normalize_fixed_schedule_entries(out)
+        self.destroy()
+
+
 class EmployeeDialog(tk.Toplevel):
     def __init__(self, parent: "SchedulerApp", employee: Optional[Employee]):
         super().__init__(parent)
         self.parent = parent
         self.result: Optional[Employee] = None
         self.title("Employee")
-        # Open large / full-size for easier data entry
-        try:
-            self.state("zoomed")
-        except Exception:
-            try:
-                parent.update_idletasks()
-                w = max(1020, int(parent.winfo_width()))
-                h = max(760, int(parent.winfo_height()))
-                self.geometry(f"{w}x{h}")
-            except Exception:
-                self.geometry("1020x760")
         self.transient(parent)
         self.grab_set()
 
-        # Scrollable content (both vertical + horizontal) so Save buttons never disappear
+        # 90% of parent, centered in parent.
+        try:
+            parent.update_idletasks()
+            pw, ph = int(parent.winfo_width()), int(parent.winfo_height())
+            px, py = int(parent.winfo_rootx()), int(parent.winfo_rooty())
+            w = max(980, int(pw * 0.90))
+            h = max(700, int(ph * 0.90))
+            x = px + max(0, (pw - w) // 2)
+            y = py + max(0, (ph - h) // 2)
+            self.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            self.geometry("1100x760")
+
         outer = ttk.Frame(self); outer.pack(fill="both", expand=True)
         canvas = tk.Canvas(outer, highlightthickness=0)
         vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
@@ -6676,423 +6919,318 @@ class EmployeeDialog(tk.Toplevel):
         vsb.pack(side="right", fill="y")
         hsb.pack(side="bottom", fill="x")
         canvas.pack(side="left", fill="both", expand=True)
-
         frm = ttk.Frame(canvas, padding=(12,12,12,12))
-        win_id = canvas.create_window((0,0), window=frm, anchor="nw")
+        _win_id = canvas.create_window((0,0), window=frm, anchor="nw")
+        frm.bind("<Configure>", lambda _e=None: canvas.configure(scrollregion=canvas.bbox("all")))
 
-        def _on_frame_config(_e=None):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-        frm.bind("<Configure>", _on_frame_config)
-
-        # Mouse wheel scrolling
         def _on_mousewheel(e):
             try:
                 canvas.yview_scroll(int(-1*(e.delta/120)), "units")
                 return "break"
             except Exception:
                 return None
-
         canvas.bind("<MouseWheel>", _on_mousewheel)
 
-        # Vars
-        self.name_var = tk.StringVar(value=employee.name if employee else "")
-        self.phone_var = tk.StringVar(value=employee.phone if employee else "")
-        self.status_var = tk.StringVar(value=employee.work_status if employee else "Active")
-        self.wants_var = tk.BooleanVar(value=(employee.wants_hours if employee else True))
+        emp = employee
+        # Hard-rule vars
+        self.name_var = tk.StringVar(value=(emp.name if emp else ""))
+        self.phone_var = tk.StringVar(value=(emp.phone if emp else ""))
+        self.status_var = tk.StringVar(value=(emp.work_status if emp else ""))
+        self.wants_var = tk.BooleanVar(value=(emp.wants_hours if emp else False))
+        self.emp_type_var = tk.StringVar(value=(getattr(emp, "employee_type", "") if emp else ""))
+        self.split_ok_var = tk.StringVar(value=("Yes" if getattr(emp, "split_shifts_ok", True) else "No") if emp else "")
+        self.double_ok_var = tk.BooleanVar(value=(bool(getattr(emp, "double_shifts_ok", False)) if emp else False))
+        self.min_shift_var = tk.StringVar(value=(str(float(getattr(emp, "min_hours_per_shift", 1.0))) if emp else ""))
+        self.max_shift_var = tk.StringVar(value=(str(float(getattr(emp, "max_hours_per_shift", 8.0))) if emp else ""))
+        self.max_shifts_day_var = tk.StringVar(value=(str(int(getattr(emp, "max_shifts_per_day", 1))) if emp else ""))
+        self.max_weekly_var = tk.StringVar(value=(str(emp.max_weekly_hours) if emp else ""))
+        self.hard_min_weekly_var = tk.StringVar(value=(str(float(getattr(emp, "hard_min_weekly_hours", 0.0))) if emp else ""))
+        self.minor_var = tk.StringVar(value=(emp.minor_type if emp else ""))
 
-        self.emp_type_var = tk.StringVar(value=(getattr(employee, "employee_type", "Crew Member") if employee else "Crew Member"))
-        self.split_ok_var = tk.StringVar(value=("Yes" if getattr(employee, "split_shifts_ok", True) else "No") if employee else "Yes")
-        self.double_ok_var = tk.BooleanVar(value=(getattr(employee, "double_shifts_ok", False) if employee else False))
-        self.min_shift_var = tk.StringVar(value=str(float(getattr(employee, "min_hours_per_shift", 1.0)) if employee else 1.0))
-        # Default max shift depends on type if adding a new employee
-        default_max = float(getattr(employee, "max_hours_per_shift", 8.0)) if employee else None
-        if default_max is None:
-            default_max = 8.0
-        self.max_shift_var = tk.StringVar(value=str(default_max))
-        self.max_shifts_day_var = tk.StringVar(value=str(int(getattr(employee, "max_shifts_per_day", 1)) if employee else 1))
+        self.area_vars = {a: tk.BooleanVar(value=(a in (emp.areas_allowed if emp else []))) for a in AREAS}
 
-        self.max_weekly_var = tk.StringVar(value=str(employee.max_weekly_hours if employee else 30))
-        self.target_min_var = tk.StringVar(value=str(employee.target_min_hours if employee else 0))
-        self.hard_min_weekly_var = tk.StringVar(value=str(float(getattr(employee, "hard_min_weekly_hours", 0.0)) if employee else 0))
-        self.minor_var = tk.StringVar(value=employee.minor_type if employee else "ADULT")
+        # Soft-rule vars
+        self.pref_area_vars = {a: tk.BooleanVar(value=(a in (emp.preferred_areas if emp else []))) for a in AREAS}
+        self.avoid_clopen_var = tk.BooleanVar(value=(emp.avoid_clopens if emp else False))
+        self.max_consec_var = tk.StringVar(value=(str(emp.max_consecutive_days) if emp else ""))
+        self.weekend_pref_var = tk.StringVar(value=(emp.weekend_preference if emp else ""))
+        self.target_min_var = tk.StringVar(value=(str(emp.target_min_hours) if emp else ""))
 
-        self.avoid_clopen_var = tk.BooleanVar(value=(employee.avoid_clopens if employee else True))
-        self.max_consec_var = tk.StringVar(value=str(employee.max_consecutive_days if employee else 6))
-        self.weekend_pref_var = tk.StringVar(value=(employee.weekend_preference if employee else "Neutral"))
+        hard_av = employee_hard_availability(emp) if emp else default_day_rules()
+        soft_av = employee_soft_availability(emp) if emp else default_day_rules()
 
-        self.area_vars = {a: tk.BooleanVar(value=(a in (employee.areas_allowed if employee else ["CSTORE"]))) for a in AREAS}
-        self.pref_area_vars = {a: tk.BooleanVar(value=(a in (employee.preferred_areas if employee else []))) for a in AREAS}
-
-        # availability
-        emp_av = employee.availability if employee else default_day_rules()
-        self.unavail = {d: tk.BooleanVar(value=emp_av[d].unavailable_day) for d in DAYS}
-        self.earliest = {d: tk.StringVar(value=tick_to_hhmm(emp_av[d].earliest_start)) for d in DAYS}
-        self.latest = {d: tk.StringVar(value=tick_to_hhmm(emp_av[d].latest_end)) for d in DAYS}
-
-        self.b1s = {d: tk.StringVar(value="") for d in DAYS}
-        self.b1e = {d: tk.StringVar(value="") for d in DAYS}
-        self.b2s = {d: tk.StringVar(value="") for d in DAYS}
-        self.b2e = {d: tk.StringVar(value="") for d in DAYS}
-        if employee:
+        def _mk_av_vars(src: Dict[str, DayRules], blank_when_new: bool = False):
+            unavail = {d: tk.BooleanVar(value=src[d].unavailable_day) for d in DAYS}
+            earliest = {d: tk.StringVar(value=("" if blank_when_new else tick_to_hhmm(src[d].earliest_start))) for d in DAYS}
+            latest = {d: tk.StringVar(value=("" if blank_when_new else tick_to_hhmm(src[d].latest_end))) for d in DAYS}
+            b1s = {d: tk.StringVar(value="") for d in DAYS}
+            b1e = {d: tk.StringVar(value="") for d in DAYS}
+            b2s = {d: tk.StringVar(value="") for d in DAYS}
+            b2e = {d: tk.StringVar(value="") for d in DAYS}
             for d in DAYS:
-                br = employee.availability[d].blocked_ranges
+                br = list(src[d].blocked_ranges)
                 if len(br) >= 1:
-                    self.b1s[d].set(tick_to_hhmm(br[0][0])); self.b1e[d].set(tick_to_hhmm(br[0][1]))
+                    b1s[d].set(tick_to_hhmm(br[0][0])); b1e[d].set(tick_to_hhmm(br[0][1]))
                 if len(br) >= 2:
-                    self.b2s[d].set(tick_to_hhmm(br[1][0])); self.b2e[d].set(tick_to_hhmm(br[1][1]))
+                    b2s[d].set(tick_to_hhmm(br[1][0])); b2e[d].set(tick_to_hhmm(br[1][1]))
+            return unavail, earliest, latest, b1s, b1e, b2s, b2e
 
-        # Fixed schedule list
-        self.fixed: List[FixedShift] = list(employee.fixed_schedule) if employee else []
-        self.recurring_locked: List[FixedShift] = list(getattr(employee, "recurring_locked_schedule", [])) if employee else []
+        (self.h_unavail, self.h_earliest, self.h_latest, self.h_b1s, self.h_b1e, self.h_b2s, self.h_b2e) = _mk_av_vars(hard_av, blank_when_new=(emp is None))
+        (self.s_unavail, self.s_earliest, self.s_latest, self.s_b1s, self.s_b1e, self.s_b2s, self.s_b2e) = _mk_av_vars(soft_av, blank_when_new=(emp is None))
 
-        # Layout
-        basics = ttk.LabelFrame(frm, text="Hard Rules (Must Follow)")
-        basics.pack(fill="x", pady=(0,10))
+        self.fixed_schedule_status = _normalize_fixed_schedule_status(getattr(emp, "fixed_schedule_status", "none")) if emp else "none"
+        self.fixed_schedule_entries = _normalize_fixed_schedule_entries(list(getattr(emp, "fixed_schedule", []) or [])) if emp else []
+
+        hard_box = ttk.LabelFrame(frm, text="Hard Rules (Must Follow)")
+        hard_box.pack(fill="x", pady=(0,10))
+
         r=0
-        ttk.Label(basics, text="Name:").grid(row=r, column=0, sticky="w", padx=8, pady=6)
-        ttk.Entry(basics, textvariable=self.name_var, width=24).grid(row=r, column=1, sticky="w", padx=8, pady=6)
-        ttk.Label(basics, text="Phone:").grid(row=r, column=2, sticky="w", padx=8, pady=6)
-        ttk.Entry(basics, textvariable=self.phone_var, width=16).grid(row=r, column=3, sticky="w", padx=8, pady=6)
-        ttk.Label(basics, text="Status:").grid(row=r, column=4, sticky="w", padx=8, pady=6)
-        ttk.Combobox(basics, textvariable=self.status_var, values=["Active","On Leave","Inactive"], state="readonly", width=12)\
-            .grid(row=r, column=5, sticky="w", padx=8, pady=6)
+        ttk.Label(hard_box, text="Name:").grid(row=r, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(hard_box, textvariable=self.name_var, width=22).grid(row=r, column=1, sticky="w", padx=8, pady=6)
+        ttk.Label(hard_box, text="Phone:").grid(row=r, column=2, sticky="w", padx=8, pady=6)
+        ttk.Entry(hard_box, textvariable=self.phone_var, width=16).grid(row=r, column=3, sticky="w", padx=8, pady=6)
+        ttk.Label(hard_box, text="Status:").grid(row=r, column=4, sticky="w", padx=8, pady=6)
+        ttk.Combobox(hard_box, textvariable=self.status_var, values=["", "Active","On Leave","Inactive"], state="readonly", width=12).grid(row=r, column=5, sticky="w", padx=8, pady=6)
+        ttk.Label(hard_box, text="Employee type:").grid(row=r, column=6, sticky="w", padx=8, pady=6)
+        ttk.Combobox(hard_box, textvariable=self.emp_type_var, values=["", "Store Manager", "Manager in training", "Assistant Manager", "Kitchen Manager", "Senior Crew Member", "Crew Member"], state="readonly", width=18).grid(row=r, column=7, sticky="w", padx=8, pady=6)
 
-        ttk.Label(basics, text="Employee type:").grid(row=r, column=6, sticky="w", padx=8, pady=6)
-        type_vals = ["Store Manager", "Manager in training", "Assistant Manager", "Kitchen Manager", "Senior Crew Member", "Crew Member"]
-        type_cb = ttk.Combobox(basics, textvariable=self.emp_type_var, values=type_vals, state="readonly", width=18)
-        type_cb.grid(row=r, column=7, sticky="w", padx=8, pady=6)
+        r += 1
+        ttk.Checkbutton(hard_box, text="Wants hours (opt-in)", variable=self.wants_var).grid(row=r, column=0, columnspan=2, sticky="w", padx=8, pady=6)
+        ttk.Label(hard_box, text="Split shifts ok:").grid(row=r, column=2, sticky="w", padx=8, pady=6)
+        ttk.Radiobutton(hard_box, text="Yes", value="Yes", variable=self.split_ok_var).grid(row=r, column=3, sticky="w", padx=(8,2), pady=6)
+        ttk.Radiobutton(hard_box, text="No", value="No", variable=self.split_ok_var).grid(row=r, column=4, sticky="w", padx=(2,8), pady=6)
+        ttk.Label(hard_box, text="Max weekly hours:").grid(row=r, column=5, sticky="w", padx=8, pady=6)
+        ttk.Entry(hard_box, textvariable=self.max_weekly_var, width=8).grid(row=r, column=6, sticky="w", padx=8, pady=6)
+        ttk.Label(hard_box, text="Hard min weekly hrs:").grid(row=r, column=7, sticky="w", padx=8, pady=6)
+        ttk.Entry(hard_box, textvariable=self.hard_min_weekly_var, width=8).grid(row=r, column=8, sticky="w", padx=8, pady=6)
 
-        r+=1
-        ttk.Checkbutton(basics, text="Wants hours (opt-in)", variable=self.wants_var).grid(row=r, column=0, columnspan=2, sticky="w", padx=8, pady=6)
-        ttk.Label(basics, text="Split shifts ok:").grid(row=r, column=2, sticky="w", padx=8, pady=6)
-        ttk.Radiobutton(basics, text="Yes", value="Yes", variable=self.split_ok_var).grid(row=r, column=3, sticky="w", padx=(8,2), pady=6)
-        ttk.Radiobutton(basics, text="No", value="No", variable=self.split_ok_var).grid(row=r, column=4, sticky="w", padx=(2,8), pady=6)
-        ttk.Label(basics, text="Max weekly hours:").grid(row=r, column=5, sticky="w", padx=8, pady=6)
-        ttk.Entry(basics, textvariable=self.max_weekly_var, width=8).grid(row=r, column=6, sticky="w", padx=8, pady=6)
-        ttk.Label(basics, text="Hard min weekly hrs:").grid(row=r, column=7, sticky="w", padx=8, pady=6)
-        ttk.Entry(basics, textvariable=self.hard_min_weekly_var, width=6).grid(row=r, column=8, sticky="w", padx=8, pady=6)
+        r += 1
+        ttk.Label(hard_box, text="Minor type:").grid(row=r, column=0, sticky="w", padx=8, pady=6)
+        ttk.Combobox(hard_box, textvariable=self.minor_var, values=[""] + MINOR_TYPES, state="readonly", width=14).grid(row=r, column=1, sticky="w", padx=8, pady=6)
+        ttk.Checkbutton(hard_box, text="Double shifts ok (>8h)", variable=self.double_ok_var).grid(row=r, column=2, sticky="w", padx=8, pady=6)
+        ttk.Label(hard_box, text="Min hrs/shift:").grid(row=r, column=3, sticky="w", padx=8, pady=6)
+        ttk.Entry(hard_box, textvariable=self.min_shift_var, width=6).grid(row=r, column=4, sticky="w", padx=8, pady=6)
+        ttk.Label(hard_box, text="Max hrs/shift:").grid(row=r, column=5, sticky="w", padx=8, pady=6)
+        ttk.Entry(hard_box, textvariable=self.max_shift_var, width=6).grid(row=r, column=6, sticky="w", padx=8, pady=6)
+        ttk.Label(hard_box, text="Max shifts/day:").grid(row=r, column=7, sticky="w", padx=8, pady=6)
+        ttk.Entry(hard_box, textvariable=self.max_shifts_day_var, width=6).grid(row=r, column=8, sticky="w", padx=8, pady=6)
 
-        r+=1
-        ttk.Label(basics, text="Minor type:").grid(row=r, column=0, sticky="w", padx=8, pady=6)
-        ttk.Combobox(basics, textvariable=self.minor_var, values=MINOR_TYPES, state="readonly", width=14)\
-            .grid(row=r, column=1, sticky="w", padx=8, pady=6)
-        ttk.Checkbutton(basics, text="Double shifts ok (>8h)", variable=self.double_ok_var).grid(row=r, column=2, sticky="w", padx=8, pady=6)
-        ttk.Label(basics, text="Min hrs/shift:").grid(row=r, column=3, sticky="w", padx=8, pady=6)
-        ttk.Entry(basics, textvariable=self.min_shift_var, width=6).grid(row=r, column=4, sticky="w", padx=8, pady=6)
-        ttk.Label(basics, text="Max hrs/shift:").grid(row=r, column=5, sticky="w", padx=8, pady=6)
-        ttk.Entry(basics, textvariable=self.max_shift_var, width=6).grid(row=r, column=6, sticky="w", padx=8, pady=6)
-        ttk.Label(basics, text="Max shifts/day:").grid(row=r, column=7, sticky="w", padx=8, pady=6)
-        ttk.Entry(basics, textvariable=self.max_shifts_day_var, width=6).grid(row=r, column=8, sticky="w", padx=8, pady=6)
+        r += 1
+        area_row = ttk.Frame(hard_box)
+        area_row.grid(row=r, column=0, columnspan=9, sticky="w", padx=8, pady=(4,8))
+        ttk.Label(area_row, text="Areas allowed (hard):").pack(side="left")
+        for a in AREAS:
+            ttk.Checkbutton(area_row, text=a, variable=self.area_vars[a]).pack(side="left", padx=(10,0))
 
-        areas = ttk.LabelFrame(frm, text="Areas allowed (hard)")
-        areas.pack(fill="x", pady=(0,10))
+        hard_av_box = ttk.LabelFrame(frm, text="Hard Recurring Availability (Absolute • 30-minute increments)")
+        hard_av_box.pack(fill="x", pady=(0,10))
+        self._build_availability_grid(hard_av_box, self.h_unavail, self.h_earliest, self.h_latest, self.h_b1s, self.h_b1e, self.h_b2s, self.h_b2e)
+
+        fixed_box = ttk.LabelFrame(frm, text="Fixed Schedule (Hard Recurring Preassignment)")
+        fixed_box.pack(fill="x", pady=(0,10))
+        b = ttk.Frame(fixed_box); b.pack(fill="x", padx=8, pady=(6,4))
+        ttk.Button(b, text="Create Fixed Schedule", command=self._create_fixed_schedule).pack(side="left")
+        ttk.Button(b, text="Modify Fixed Schedule", command=self._modify_fixed_schedule).pack(side="left", padx=6)
+        ttk.Button(b, text="Pause Fixed Schedule", command=self._pause_fixed_schedule).pack(side="left", padx=6)
+        ttk.Button(b, text="Remove Fixed Schedule", command=self._remove_fixed_schedule).pack(side="left", padx=6)
+        self.fixed_status_lbl = ttk.Label(b, text="Status: None")
+        self.fixed_status_lbl.pack(side="right")
+
+        self.fixed_summary = ttk.Frame(fixed_box)
+        self.fixed_summary.pack(fill="x", padx=8, pady=(2,8))
+        self.fixed_summary_labels: Dict[str, ttk.Label] = {}
+        for i, day in enumerate(DAYS):
+            col = ttk.LabelFrame(self.fixed_summary, text=DAY_FULL.get(day, day), padding=(6,4,6,4))
+            col.grid(row=0, column=i, sticky="nsew", padx=3, pady=3)
+            lbl = ttk.Label(col, text="", width=14, justify="left")
+            lbl.pack(anchor="nw")
+            self.fixed_summary_labels[day] = lbl
+        for i in range(len(DAYS)):
+            self.fixed_summary.grid_columnconfigure(i, weight=1)
+        self._refresh_fixed_summary()
+
+        ttk.Separator(frm, orient="horizontal").pack(fill="x", pady=(6,6))
+        callout = ttk.LabelFrame(frm, text="Important", padding=(10,6,10,6))
+        callout.pack(fill="x", pady=(0,8))
+        ttk.Label(callout, text="Everything below is Employee Preference / Quality of Life (Soft). The scheduler will try to honor these preferences but may violate them when needed to produce a workable schedule.", wraplength=980).pack(anchor="w")
+
+        soft_box = ttk.LabelFrame(frm, text="Employee Preference / Quality of Life (Soft)")
+        soft_box.pack(fill="x", pady=(0,10))
+        ttk.Label(soft_box, text="Preferred areas:").grid(row=0, column=0, sticky="w", padx=10, pady=6)
         for i,a in enumerate(AREAS):
-            ttk.Checkbutton(areas, text=f"{a} allowed", variable=self.area_vars[a]).grid(row=0, column=i, sticky="w", padx=10, pady=6)
+            ttk.Checkbutton(soft_box, text=f"{a}", variable=self.pref_area_vars[a]).grid(row=0, column=i+1, sticky="w", padx=10, pady=6)
+        ttk.Checkbutton(soft_box, text="Avoid clopens", variable=self.avoid_clopen_var).grid(row=1, column=0, sticky="w", padx=10, pady=6)
+        ttk.Label(soft_box, text="Max consecutive days:").grid(row=1, column=1, sticky="w", padx=10, pady=6)
+        ttk.Entry(soft_box, textvariable=self.max_consec_var, width=6).grid(row=1, column=2, sticky="w", padx=10, pady=6)
+        ttk.Label(soft_box, text="Weekend preference:").grid(row=1, column=3, sticky="w", padx=10, pady=6)
+        ttk.Combobox(soft_box, textvariable=self.weekend_pref_var, values=["", "Prefer", "Avoid", "Neutral"], state="readonly", width=10).grid(row=1, column=4, sticky="w", padx=10, pady=6)
+        ttk.Label(soft_box, text="Target min hours (optional):").grid(row=1, column=5, sticky="w", padx=10, pady=6)
+        ttk.Entry(soft_box, textvariable=self.target_min_var, width=8).grid(row=1, column=6, sticky="w", padx=10, pady=6)
 
-        prefs = ttk.LabelFrame(frm, text="Preferences (soft)")
-        prefs.pack(fill="x", pady=(0,10))
-        ttk.Label(prefs, text="Preferred areas:").grid(row=0, column=0, sticky="w", padx=10, pady=6)
-        for i,a in enumerate(AREAS):
-            ttk.Checkbutton(prefs, text=f"{a}", variable=self.pref_area_vars[a]).grid(row=0, column=i+1, sticky="w", padx=10, pady=6)
-        ttk.Checkbutton(prefs, text="Avoid clopens", variable=self.avoid_clopen_var).grid(row=1, column=0, sticky="w", padx=10, pady=6)
-        ttk.Label(prefs, text="Max consecutive days:").grid(row=1, column=1, sticky="w", padx=10, pady=6)
-        ttk.Entry(prefs, textvariable=self.max_consec_var, width=6).grid(row=1, column=2, sticky="w", padx=10, pady=6)
-        ttk.Label(prefs, text="Weekend preference:").grid(row=1, column=3, sticky="w", padx=10, pady=6)
-        ttk.Combobox(prefs, textvariable=self.weekend_pref_var, values=["Prefer","Neutral","Avoid"], state="readonly", width=10)\
-            .grid(row=1, column=4, sticky="w", padx=10, pady=6)
-        ttk.Label(prefs, text="Target min hours (optional):").grid(row=1, column=5, sticky="w", padx=10, pady=6)
-        ttk.Entry(prefs, textvariable=self.target_min_var, width=8).grid(row=1, column=6, sticky="w", padx=10, pady=6)
-
-        av = ttk.LabelFrame(frm, text="Weekly recurring availability (30-minute increments)")
-        av.pack(fill="both", expand=True, pady=(0,10))
-        ttk.Label(av, text="Earliest/Latest = your general allowed window. Blocked times = times you CANNOT work even within the allowed window.", wraplength=900)\
-            .grid(row=0, column=0, columnspan=8, sticky="w", padx=6, pady=(4,8))
-        headers = ["Day","Off all day","Earliest start (OK)","Latest end (OK)","Blocked start #1 (NO)","Blocked end #1 (NO)","Blocked start #2 (NO)","Blocked end #2 (NO)"]
-        for c,h in enumerate(headers):
-            ttk.Label(av, text=h).grid(row=1, column=c, sticky="w", padx=6, pady=4)
-
-        for rr, d in enumerate(DAYS, start=2):
-            ttk.Label(av, text=d).grid(row=rr, column=0, sticky="w", padx=6, pady=4)
-            ttk.Checkbutton(av, variable=self.unavail[d]).grid(row=rr, column=1, sticky="w", padx=6, pady=4)
-            ttk.Combobox(av, textvariable=self.earliest[d], values=TIME_CHOICES, width=8, state="readonly").grid(row=rr, column=2, sticky="w", padx=6, pady=4)
-            ttk.Combobox(av, textvariable=self.latest[d], values=TIME_CHOICES, width=8, state="readonly").grid(row=rr, column=3, sticky="w", padx=6, pady=4)
-            ttk.Combobox(av, textvariable=self.b1s[d], values=[""]+TIME_CHOICES, width=8, state="readonly").grid(row=rr, column=4, sticky="w", padx=6, pady=4)
-            ttk.Combobox(av, textvariable=self.b1e[d], values=[""]+TIME_CHOICES, width=8, state="readonly").grid(row=rr, column=5, sticky="w", padx=6, pady=4)
-            ttk.Combobox(av, textvariable=self.b2s[d], values=[""]+TIME_CHOICES, width=8, state="readonly").grid(row=rr, column=6, sticky="w", padx=6, pady=4)
-            ttk.Combobox(av, textvariable=self.b2e[d], values=[""]+TIME_CHOICES, width=8, state="readonly").grid(row=rr, column=7, sticky="w", padx=6, pady=4)
-
-        fs = ttk.LabelFrame(frm, text="Fixed Schedule (recurring)")
-        fs.pack(fill="x", pady=(0,10))
-        cols = ("Day","Area","Start","End","Locked")
-        self.fs_tree = ttk.Treeview(fs, columns=cols, show="headings", height=6)
-        for c in cols:
-            self.fs_tree.heading(c, text=c)
-            self.fs_tree.column(c, width=120 if c!="Locked" else 80)
-        self.fs_tree.pack(fill="x", padx=8, pady=8)
-
-        btnrow = ttk.Frame(fs); btnrow.pack(fill="x", padx=8, pady=(0,8))
-        ttk.Button(btnrow, text="Add Fixed Shift", command=self._add_fixed).pack(side="left")
-        ttk.Button(btnrow, text="Delete Selected", command=self._del_fixed).pack(side="left", padx=8)
-
-        rls = ttk.LabelFrame(frm, text="Locked Recurring Schedule (hard preassigned weekly shifts)")
-        rls.pack(fill="x", pady=(0,10))
-        rls_cols = ("Day","Area","Start","End")
-        self.rls_tree = ttk.Treeview(rls, columns=rls_cols, show="headings", height=5)
-        for c in rls_cols:
-            self.rls_tree.heading(c, text=c)
-            self.rls_tree.column(c, width=130)
-        self.rls_tree.pack(fill="x", padx=8, pady=8)
-        rls_btn = ttk.Frame(rls); rls_btn.pack(fill="x", padx=8, pady=(0,8))
-        ttk.Button(rls_btn, text="Add Locked Recurring Shift", command=self._add_recurring_locked).pack(side="left")
-        ttk.Button(rls_btn, text="Delete Selected", command=self._del_recurring_locked).pack(side="left", padx=8)
-
-        self._refresh_fixed_tree()
-        self._refresh_recurring_locked_tree()
+        soft_av_box = ttk.LabelFrame(frm, text="Preferred Recurring Availability (Soft • 30-minute increments)")
+        soft_av_box.pack(fill="x", pady=(0,10))
+        self._build_availability_grid(soft_av_box, self.s_unavail, self.s_earliest, self.s_latest, self.s_b1s, self.s_b1e, self.s_b2s, self.s_b2e)
 
         bottom = ttk.Frame(frm); bottom.pack(fill="x")
         ttk.Button(bottom, text="Cancel", command=self.destroy).pack(side="right")
         ttk.Button(bottom, text="Save Employee", command=self._save).pack(side="right", padx=8)
 
-        # Type defaults (max shift hours)
-        def default_max_for_type(t: str) -> float:
-            tt = (t or "").strip().lower()
-            if tt in ["store manager", "assistant manager", "kitchen manager"]:
-                return 16.0
-            if tt in ["senior crew member", "manager in training"]:
-                return 12.0
-            return 8.0
+    def _build_availability_grid(self, parent, unavail, earliest, latest, b1s, b1e, b2s, b2e):
+        time_values = [""] + TIME_CHOICES
+        headers = ["Day","Off all day","Earliest start (OK)","Latest end (OK)","Blocked start #1 (NO)","Blocked end #1 (NO)","Blocked start #2 (NO)","Blocked end #2 (NO)"]
+        for c,h in enumerate(headers):
+            ttk.Label(parent, text=h).grid(row=0, column=c, sticky="w", padx=6, pady=4)
+        for rr, d in enumerate(DAYS, start=1):
+            ttk.Label(parent, text=d).grid(row=rr, column=0, sticky="w", padx=6, pady=4)
+            ttk.Checkbutton(parent, variable=unavail[d]).grid(row=rr, column=1, sticky="w", padx=6, pady=4)
+            ttk.Combobox(parent, textvariable=earliest[d], values=time_values, width=8, state="readonly").grid(row=rr, column=2, sticky="w", padx=6, pady=4)
+            ttk.Combobox(parent, textvariable=latest[d], values=time_values, width=8, state="readonly").grid(row=rr, column=3, sticky="w", padx=6, pady=4)
+            ttk.Combobox(parent, textvariable=b1s[d], values=time_values, width=8, state="readonly").grid(row=rr, column=4, sticky="w", padx=6, pady=4)
+            ttk.Combobox(parent, textvariable=b1e[d], values=time_values, width=8, state="readonly").grid(row=rr, column=5, sticky="w", padx=6, pady=4)
+            ttk.Combobox(parent, textvariable=b2s[d], values=time_values, width=8, state="readonly").grid(row=rr, column=6, sticky="w", padx=6, pady=4)
+            ttk.Combobox(parent, textvariable=b2e[d], values=time_values, width=8, state="readonly").grid(row=rr, column=7, sticky="w", padx=6, pady=4)
 
-        def on_type_change(_evt=None):
-            # Only auto-adjust max shift if user hasn't typed something custom.
+    def _fixed_status_display(self) -> str:
+        s = _normalize_fixed_schedule_status(self.fixed_schedule_status)
+        return "Active" if s == "active" else ("Paused" if s == "paused" else "None")
+
+    def _refresh_fixed_summary(self):
+        self.fixed_schedule_entries = _normalize_fixed_schedule_entries(self.fixed_schedule_entries)
+        self.fixed_status_lbl.configure(text=f"Status: {self._fixed_status_display()}")
+        by = {x.day: x for x in self.fixed_schedule_entries}
+        for d in DAYS:
+            fs = by.get(d)
+            if fs is None:
+                self.fixed_summary_labels[d].configure(text="")
+            else:
+                self.fixed_summary_labels[d].configure(text=f"{fs.area}\\n{tick_to_ampm(fs.start_t)}-{tick_to_ampm(fs.end_t)}")
+
+    def _create_fixed_schedule(self):
+        d = FixedScheduleEditorDialog(self, self.parent.model, [], self.minor_var.get(), "Create Fixed Schedule")
+        self.wait_window(d)
+        if d.result is not None:
+            self.fixed_schedule_entries = list(d.result)
+            self.fixed_schedule_status = "active" if self.fixed_schedule_entries else "none"
+            self._refresh_fixed_summary()
+
+    def _modify_fixed_schedule(self):
+        d = FixedScheduleEditorDialog(self, self.parent.model, list(self.fixed_schedule_entries), self.minor_var.get(), "Modify Fixed Schedule")
+        self.wait_window(d)
+        if d.result is not None:
+            self.fixed_schedule_entries = list(d.result)
+            if not self.fixed_schedule_entries:
+                self.fixed_schedule_status = "none"
+            elif self.fixed_schedule_status == "none":
+                self.fixed_schedule_status = "active"
+            self._refresh_fixed_summary()
+
+    def _pause_fixed_schedule(self):
+        if not self.fixed_schedule_entries:
+            self.fixed_schedule_status = "none"
+        else:
+            self.fixed_schedule_status = "paused"
+        self._refresh_fixed_summary()
+
+    def _remove_fixed_schedule(self):
+        self.fixed_schedule_entries = []
+        self.fixed_schedule_status = "none"
+        self._refresh_fixed_summary()
+
+    def _collect_dayrules(self, unavail, earliest, latest, b1s, b1e, b2s, b2e) -> Dict[str, DayRules]:
+        def _parse_or_default(v: str, default_tick: int) -> int:
+            sv = str(v or "").strip()
+            if not sv:
+                return int(default_tick)
             try:
-                cur = float(self.max_shift_var.get().strip())
+                return int(hhmm_to_tick(sv))
             except Exception:
-                cur = None
-            new_def = default_max_for_type(self.emp_type_var.get())
-            if cur is None or (abs(cur-8.0)<1e-6 or abs(cur-12.0)<1e-6 or abs(cur-16.0)<1e-6):
-                self.max_shift_var.set(str(new_def))
+                return int(default_tick)
 
-        type_cb.bind("<<ComboboxSelected>>", on_type_change)
-
-    def _refresh_fixed_tree(self):
-        for i in self.fs_tree.get_children():
-            self.fs_tree.delete(i)
-        for fs in self.fixed:
-            self.fs_tree.insert("", "end", values=(fs.day, fs.area, tick_to_hhmm(fs.start_t), tick_to_hhmm(fs.end_t), "Yes" if fs.locked else "No"))
-
-    def _refresh_recurring_locked_tree(self):
-        for i in self.rls_tree.get_children():
-            self.rls_tree.delete(i)
-        for fs in self.recurring_locked:
-            self.rls_tree.insert("", "end", values=(fs.day, fs.area, tick_to_hhmm(fs.start_t), tick_to_hhmm(fs.end_t)))
-
-    def _validate_recurring_locked_shift(self, day: str, area: str, stt: int, ent: int) -> Tuple[bool, str]:
-        if day not in DAYS:
-            return False, "Day must be Sun, Mon, Tue, Wed, Thu, Fri, or Sat."
-        if area not in AREAS:
-            return False, "Area must be CSTORE, KITCHEN, or CARWASH."
-        if ent <= stt:
-            return False, "End must be after start."
-        if not is_within_area_hours(self.parent.model, area, stt, ent):
-            op_t, cl_t = area_open_close_ticks(self.parent.model, area)
-            return False, f"Shift must be within Hours of Operation for {area}: {tick_to_hhmm(op_t)}–{tick_to_hhmm(cl_t)}"
-        mt = str(self.minor_var.get() or "ADULT")
-        if mt == "MINOR_14_15":
-            earliest = hhmm_to_tick("07:00")
-            latest_conservative = hhmm_to_tick("19:00")
-            if stt < earliest or ent > latest_conservative:
-                return False, "For MINOR_14_15, locked recurring shifts must stay within 07:00–19:00 (conservative safety bound)."
-        dr = None
-        try:
-            dr = DayRules(
-                unavailable_day=bool(self.unavail[day].get()),
-                earliest_start=hhmm_to_tick(self.earliest[day].get()),
-                latest_end=hhmm_to_tick(self.latest[day].get()),
-                blocked_ranges=[]
-            )
-            for sv, ev in [(self.b1s[day], self.b1e[day]), (self.b2s[day], self.b2e[day])]:
+        av: Dict[str, DayRules] = {}
+        for d in DAYS:
+            un = bool(unavail[d].get())
+            es = _parse_or_default(earliest[d].get(), 0)
+            le = _parse_or_default(latest[d].get(), DAY_TICKS)
+            br: List[Tuple[int, int]] = []
+            for sv, ev in [(b1s[d], b1e[d]), (b2s[d], b2e[d])]:
                 s = str(sv.get() or "").strip(); e = str(ev.get() or "").strip()
                 if s and e:
                     a = hhmm_to_tick(s); b = hhmm_to_tick(e)
                     if b > a:
-                        dr.blocked_ranges.append((a, b))
-        except Exception:
-            dr = None
-        if dr is not None and not dr.is_available(stt, ent):
-            return False, "Locked recurring shift must fit this employee's recurring availability for that day."
-        return True, ""
-
-    def _add_fixed(self):
-        day = simple_input(self, "Fixed Shift", "Day (Sun..Sat):", "Mon")
-        if day is None: return
-        day = day.strip()
-        if day not in DAYS:
-            messagebox.showerror("Fixed Shift", "Day must be Sun, Mon, Tue, Wed, Thu, Fri, or Sat.")
-            return
-        area = simple_input(self, "Fixed Shift", "Area (CSTORE/KITCHEN/CARWASH):", "CSTORE")
-        if area is None: return
-        area = area.strip().upper()
-        if area not in AREAS:
-            messagebox.showerror("Fixed Shift", "Area must be CSTORE, KITCHEN, or CARWASH.")
-            return
-        st = simple_input(self, "Fixed Shift", "Start time (HH:MM):", "09:00")
-        if st is None: return
-        en = simple_input(self, "Fixed Shift", "End time (HH:MM):", "17:00")
-        if en is None: return
-        stt = hhmm_to_tick(st); ent = hhmm_to_tick(en)
-        if ent <= stt:
-            messagebox.showerror("Fixed Shift", "End must be after start.")
-            return
-        locked = simple_input(self, "Fixed Shift", "Locked? (yes/no):", "no")
-        if locked is None: return
-        is_locked = str(locked).strip().lower().startswith("y")
-        if is_locked:
-            ok, msg = self._validate_recurring_locked_shift(day, area, stt, ent)
-            if not ok:
-                messagebox.showerror("Fixed Shift", msg)
-                return
-            self.recurring_locked.append(FixedShift(day=day, start_t=stt, end_t=ent, area=area, locked=True))
-            self._refresh_recurring_locked_tree()
-        else:
-            self.fixed.append(FixedShift(day, stt, ent, area, is_locked))
-            self._refresh_fixed_tree()
-
-    def _del_fixed(self):
-        sel = self.fs_tree.selection()
-        if not sel:
-            return
-        idx = self.fs_tree.index(sel[0])
-        if 0 <= idx < len(self.fixed):
-            del self.fixed[idx]
-        self._refresh_fixed_tree()
-
-    def _add_recurring_locked(self):
-        day = simple_input(self, "Locked Recurring Shift", "Day (Sun..Sat):", "Mon")
-        if day is None:
-            return
-        day = day.strip()
-        area = simple_input(self, "Locked Recurring Shift", "Area (CSTORE/KITCHEN/CARWASH):", "CSTORE")
-        if area is None:
-            return
-        area = area.strip().upper()
-        st = simple_input(self, "Locked Recurring Shift", "Start time (HH:MM):", "09:00")
-        if st is None:
-            return
-        en = simple_input(self, "Locked Recurring Shift", "End time (HH:MM):", "17:00")
-        if en is None:
-            return
-        stt = hhmm_to_tick(st); ent = hhmm_to_tick(en)
-        ok, msg = self._validate_recurring_locked_shift(day, area, stt, ent)
-        if not ok:
-            messagebox.showerror("Locked Recurring Shift", msg)
-            return
-        self.recurring_locked.append(FixedShift(day=day, start_t=stt, end_t=ent, area=area, locked=True))
-        self._refresh_recurring_locked_tree()
-
-    def _del_recurring_locked(self):
-        sel = self.rls_tree.selection()
-        if not sel:
-            return
-        idx = self.rls_tree.index(sel[0])
-        if 0 <= idx < len(self.recurring_locked):
-            del self.recurring_locked[idx]
-        self._refresh_recurring_locked_tree()
+                        br.append((a, b))
+            av[d] = DayRules(unavailable_day=un, earliest_start=es, latest_end=le, blocked_ranges=br)
+        return av
 
     def _save(self):
         name = self.name_var.get().strip()
         if not name:
             messagebox.showerror("Employee", "Name is required.")
             return
-        areas = [a for a,v in self.area_vars.items() if v.get()]
+
+        areas = [a for a, v in self.area_vars.items() if v.get()]
         if not areas:
             messagebox.showerror("Employee", "Select at least one allowed area.")
             return
-        pref = [a for a,v in self.pref_area_vars.items() if v.get()]
-        try:
-            max_week = float(self.max_weekly_var.get().strip())
-        except Exception:
-            max_week = 30.0
-        try:
-            hard_min_week = float(self.hard_min_weekly_var.get().strip())
-        except Exception:
-            hard_min_week = 0.0
-        try:
-            targ = float(self.target_min_var.get().strip())
-        except Exception:
-            targ = 0.0
-        try:
-            max_consec = int(self.max_consec_var.get().strip())
-        except Exception:
-            max_consec = 6
-        if max_consec < 1:
-            max_consec = 1
+        pref = [a for a, v in self.pref_area_vars.items() if v.get()]
 
-        av: Dict[str, DayRules] = {}
-        for d in DAYS:
-            un = self.unavail[d].get()
-            es = hhmm_to_tick(self.earliest[d].get())
-            le = hhmm_to_tick(self.latest[d].get())
-            br: List[Tuple[int,int]] = []
-            def add_block(sv, ev):
-                s = sv.get().strip(); e = ev.get().strip()
-                if not s or not e:
-                    return
-                a = hhmm_to_tick(s); b = hhmm_to_tick(e)
-                if b>a:
-                    br.append((a,b))
-            add_block(self.b1s[d], self.b1e[d])
-            add_block(self.b2s[d], self.b2e[d])
-            av[d] = DayRules(un, es, le, br)
+        def _f(v: str, default: float) -> float:
+            try: return float(str(v).strip())
+            except Exception: return float(default)
 
-        try:
-            min_shift = float(self.min_shift_var.get().strip())
-        except Exception:
-            min_shift = 1.0
-        try:
-            max_shift = float(self.max_shift_var.get().strip())
-        except Exception:
-            max_shift = 8.0
-        try:
-            max_shifts_day = int(self.max_shifts_day_var.get().strip())
-        except Exception:
-            max_shifts_day = 1
-        # simple sanity clamps
-        if min_shift < 0.5:
-            min_shift = 0.5
-        if max_shift < min_shift:
-            max_shift = min_shift
-        if max_shifts_day < 1:
-            max_shifts_day = 1
+        def _i(v: str, default: int) -> int:
+            try: return int(str(v).strip())
+            except Exception: return int(default)
 
-        for fs in self.recurring_locked:
-            ok, msg = self._validate_recurring_locked_shift(fs.day, fs.area, int(fs.start_t), int(fs.end_t))
+        max_week = _f(self.max_weekly_var.get(), 30.0)
+        hard_min_week = max(0.0, _f(self.hard_min_weekly_var.get(), 0.0))
+        targ = _f(self.target_min_var.get(), 0.0)
+        max_consec = max(1, _i(self.max_consec_var.get(), 6))
+        min_shift = max(0.5, _f(self.min_shift_var.get(), 1.0))
+        max_shift = max(min_shift, _f(self.max_shift_var.get(), 8.0))
+        max_shifts_day = max(1, _i(self.max_shifts_day_var.get(), 1))
+
+        hard_av = self._collect_dayrules(self.h_unavail, self.h_earliest, self.h_latest, self.h_b1s, self.h_b1e, self.h_b2s, self.h_b2e)
+        soft_av = self._collect_dayrules(self.s_unavail, self.s_earliest, self.s_latest, self.s_b1s, self.s_b1e, self.s_b2s, self.s_b2e)
+
+        status = _normalize_fixed_schedule_status(self.fixed_schedule_status)
+        fixed_entries = _normalize_fixed_schedule_entries(self.fixed_schedule_entries)
+        if status == "none":
+            fixed_entries = []
+        elif not fixed_entries:
+            status = "none"
+        for fs in fixed_entries:
+            probe = Employee(name=name, minor_type=(self.minor_var.get().strip() or "ADULT"))
+            ok, msg = fixed_shift_compliance_ok(self.parent.model, probe, self.parent.current_label, fs.day, int(fs.start_t), int(fs.end_t), fs.area, [])
             if not ok:
-                messagebox.showerror("Employee", f"Invalid locked recurring shift ({fs.day} {fs.area} {tick_to_hhmm(fs.start_t)}-{tick_to_hhmm(fs.end_t)}): {msg}")
+                messagebox.showerror("Employee", f"Fixed schedule invalid ({fs.day} {fs.area} {tick_to_hhmm(fs.start_t)}-{tick_to_hhmm(fs.end_t)}): {msg}")
                 return
 
         self.result = Employee(
             name=name,
             phone=self.phone_var.get().strip(),
-            work_status=self.status_var.get(),
-            wants_hours=self.wants_var.get(),
-            employee_type=self.emp_type_var.get(),
-            split_shifts_ok=(self.split_ok_var.get().strip().lower().startswith("y")),
+            work_status=(self.status_var.get().strip() or "Active"),
+            wants_hours=bool(self.wants_var.get()),
+            employee_type=(self.emp_type_var.get().strip() or "Crew Member"),
+            split_shifts_ok=(self.split_ok_var.get().strip().lower().startswith("y") if self.split_ok_var.get().strip() else True),
             double_shifts_ok=bool(self.double_ok_var.get()),
             min_hours_per_shift=min_shift,
             max_hours_per_shift=max_shift,
             max_shifts_per_day=max_shifts_day,
             max_weekly_hours=max_week,
             target_min_hours=targ,
-            hard_min_weekly_hours=max(0.0, hard_min_week),
-            minor_type=self.minor_var.get(),
+            hard_min_weekly_hours=hard_min_week,
+            minor_type=(self.minor_var.get().strip() or "ADULT"),
             areas_allowed=areas,
             preferred_areas=pref,
-            avoid_clopens=self.avoid_clopen_var.get(),
+            avoid_clopens=bool(self.avoid_clopen_var.get()),
             max_consecutive_days=max_consec,
-            weekend_preference=self.weekend_pref_var.get(),
-            availability=av,
-            fixed_schedule=list(self.fixed),
-            recurring_locked_schedule=list(self.recurring_locked),
+            weekend_preference=(self.weekend_pref_var.get().strip() or "Neutral"),
+            availability=hard_av,
+            hard_availability=hard_av,
+            soft_availability=soft_av,
+            fixed_schedule_status=status,
+            fixed_schedule=fixed_entries,
+            recurring_locked_schedule=[FixedShift(day=x.day, start_t=x.start_t, end_t=x.end_t, area=x.area, locked=True) for x in fixed_entries] if status == "active" else [],
         )
         self.destroy()
 
@@ -7590,7 +7728,7 @@ class SchedulerApp(tk.Tk):
                 "Yes" if e.avoid_clopens else "No",
                 e.max_consecutive_days,
                 e.weekend_preference,
-                len(e.fixed_schedule) + len(getattr(e, "recurring_locked_schedule", []) or []),
+                len(_normalize_fixed_schedule_entries(list(getattr(e, "fixed_schedule", []) or []))),
             ))
 
     def add_employee(self):
