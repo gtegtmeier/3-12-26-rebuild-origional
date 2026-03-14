@@ -140,6 +140,11 @@ DAY_FULL = {
     "Sat": "Saturday",
 }
 AREAS = ["CSTORE", "KITCHEN", "CARWASH"]
+AREA_PRIORITY_TEXT = {
+    "CSTORE": "C-Store (Primary / Master Staffing)",
+    "KITCHEN": "Kitchen (Secondary)",
+    "CARWASH": "Carwash (Tertiary)",
+}
 
 def tick_to_hhmm(t: int) -> str:
     t = max(0, min(DAY_TICKS, int(t)))
@@ -893,6 +898,7 @@ class ManagerGoals:
     # --- Milestone 6: Scoring weights (soft penalties) ---
     # Higher weight = stronger preference to avoid.
     w_under_preferred_coverage: float = 5.0      # per 30-min deficit tick
+    w_over_max_soft_ceiling: float = 80.0        # per 30-min tick over Max (soft ceiling, stronger than preferred)
     w_over_preferred_cap: float = 20.0           # per hour over preferred cap
     w_participation_miss: float = 250.0          # per eligible employee missing >=1hr
     w_split_shifts: float = 30.0                 # per extra shift in a day
@@ -2224,7 +2230,7 @@ def build_requirement_maps(reqs: List[RequirementBlock], goals: Optional[Any] = 
     Returns:
       min_req[(day, area, tick)] = hard minimum headcount
       pref_req[(day, area, tick)] = preferred (soft) target headcount
-      max_req[(day, area, tick)] = hard maximum headcount (cap)
+      max_req[(day, area, tick)] = preferred soft ceiling headcount
     Overlaps are combined conservatively:
       - min / preferred: take max
       - max: take min (tightest cap)
@@ -2657,7 +2663,7 @@ def evaluate_schedule_hard_rules(model: DataModel, label: str, assignments: List
         cov = int(coverage.get(k, 0))
         if cov > int(cap):
             day, area, tick = k
-            violations.append(HardRuleViolation(code="max-staffing-cap", message=f"area={area} tick={tick_to_hhmm(int(tick))} scheduled={cov} max={int(cap)}", day=day, assignment_source=ASSIGNMENT_SOURCE_ENGINE))
+            violations.append(HardRuleViolation(code="max-staffing-soft-ceiling", severity="warning", message=f"area={area} tick={tick_to_hhmm(int(tick))} scheduled={cov} max={int(cap)}", day=day, assignment_source=ASSIGNMENT_SOURCE_ENGINE))
 
     total_hours = float(sum(hours_between_ticks(int(a.start_t), int(a.end_t)) for a in assignments))
     locked_override_hours = float(sum(
@@ -2742,7 +2748,9 @@ def schedule_score(model: DataModel, label: str,
 
     # Hard-ish penalties (very high)
     pen += int(min_short) * 1000.0
-    pen += int(max_viol) * 5000.0
+    # Max is a soft ceiling (firmer than preferred), not a hard impossibility barrier.
+    w_over_max_soft_ceiling = float(getattr(goals, "w_over_max_soft_ceiling", 80.0) or 80.0)
+    pen += int(max_viol) * w_over_max_soft_ceiling
 
     # Soft: preferred coverage shortfall
     pen += int(pref_short) * w_under_pref_cov
@@ -3500,10 +3508,7 @@ def improve_weak_areas(model: DataModel,
         return False
 
     def _tick_max_blocked(cov: Dict[Tuple[str,str,int], int], day: str, area: str, st: int, en: int) -> bool:
-        for tt in range(int(st), int(en)):
-            k = (day, area, int(tt))
-            if int(cov.get(k, 0)) >= int(max_req.get(k, 10**9)):
-                return True
+        # Max is a soft ceiling, not a feasibility blocker.
         return False
 
     active_emps = [e for e in model.employees if getattr(e, "work_status", "Active") == "Active"]
@@ -4071,9 +4076,8 @@ def generate_schedule(model: DataModel, label: str,
             yield (day, area, int(t))
 
     def _violates_max(day: str, area: str, st: int, en: int, cov: Dict[Tuple[str,str,int], int]) -> bool:
-        for k in _tick_keys_in(day, area, st, en):
-            if cov.get(k, 0) >= max_req.get(k, 10**9):
-                return True
+        # Max staffing is modeled as a soft ceiling: we score/diagnose overages,
+        # but we do not hard-block feasibility here.
         return False
 
     def add_assignment(a: Assignment, locked_ok: bool, cov: Dict[Tuple[str,str,int], int], enforce_weekly_cap: bool = True) -> bool:
@@ -4089,8 +4093,6 @@ def generate_schedule(model: DataModel, label: str,
             if (not bool(getattr(e, "wants_hours", True))):
                 return False
             if not is_employee_available(model, e, label, a.day, a.start_t, a.end_t, a.area, clopen_min_start):
-                return False
-            if _violates_max(a.day, a.area, a.start_t, a.end_t, cov):
                 return False
             if not respects_daily_shift_limits(assignments, e, a.day, extra=(a.start_t, a.end_t)):
                 return False
@@ -4625,15 +4627,11 @@ def generate_schedule(model: DataModel, label: str,
                     if en > DAY_TICKS:
                         continue
                     need_ticks = 0
-                    ok = True
                     for tt in range(st, en):
                         k = (day, area, tt)
-                        if coverage.get(k, 0) >= max_req.get(k, 10**9):
-                            ok = False
-                            break
                         if coverage.get(k, 0) < min_req.get(k, 0):
                             need_ticks += 1
-                    if not ok or need_ticks < 2:
+                    if need_ticks < 2:
                         continue
                     stats["attempts"] += 1
                     if open_or_extend_master_envelope(day, area, st, en,
@@ -5121,15 +5119,11 @@ def generate_schedule(model: DataModel, label: str,
                     if en > DAY_TICKS:
                         continue
                     need_ticks = 0
-                    ok = True
                     for tt in range(st, en):
                         k = (day, area, tt)
-                        if coverage.get(k,0) >= max_req.get(k, 10**9):
-                            ok = False
-                            break
                         if coverage.get(k,0) < min_req.get(k,0):
                             need_ticks += 1
-                    if not ok or need_ticks < 2:
+                    if need_ticks < 2:
                         continue
                     if add_best_segment(day, area, st, en, locked_ok=False, enforce_weekly_cap=True):
                         progress_cap = True
@@ -5154,14 +5148,11 @@ def generate_schedule(model: DataModel, label: str,
                 if en > DAY_TICKS:
                     continue
                 need_ticks = 0
-                ok = True
                 for tt in range(st,en):
                     k=(day,area,tt)
-                    if coverage.get(k,0) >= max_req.get(k, 10**9):
-                        ok=False; break
                     if coverage.get(k,0) < pref_req.get(k,0):
                         need_ticks += 1
-                if not ok or need_ticks < 2:
+                if need_ticks < 2:
                     continue
                 if add_best_segment(day, area, st, en):
                     progress = True
@@ -5254,14 +5245,12 @@ def generate_schedule(model: DataModel, label: str,
             for area in AREAS:
                 for t in range(0, DAY_TICKS - 1, 2):
                     k = (day, area, t)
-                    if int(coverage.get(k, 0)) >= int(max_req.get(k, 10**9)):
-                        continue
                     st = int(t); en = int(t) + 2
                     _ = add_best_segment(day, area, st, en, locked_ok=False, enforce_weekly_cap=True)
 
     min_short, pref_short, max_viol = compute_requirement_shortfalls(min_req, pref_req, max_req, coverage)
     if max_viol > 0:
-        warnings.append("Max staffing cap violated by locked shifts or configuration; review Staffing Requirements Max values.")
+        warnings.append("Max staffing soft ceiling exceeded in some blocks; review Staffing Requirements Max values if this overage is undesirable.")
 # Local search improvement (swap/move)
     # Scrutiny level controls effort (restarts + iterations).
     scr = str(getattr(model.settings, "solver_scrutiny_level", "Balanced") or "Balanced")
@@ -5364,11 +5353,6 @@ def generate_schedule(model: DataModel, label: str,
             return False
         if any(a.employee_name==emp.name and a.day==day and not (en<=a.start_t or st>=a.end_t) for a in assigns):
             return False
-        cov = count_coverage_per_tick(assigns)
-        for t in range(int(st), int(en)):
-            k = (day, area, int(t))
-            if cov.get(k, 0) >= max_req.get(k, 10**9):
-                return False
         h = hours_between_ticks(st,en)
         max_weekly_cap = float(getattr(model.manager_goals, 'maximum_weekly_cap', 0.0) or 0.0)
         if max_weekly_cap > 0.0:
@@ -5708,9 +5692,6 @@ def generate_schedule(model: DataModel, label: str,
                         if not _candidate_is_hard_valid(cand, assignments):
                             block_counts["blocked_by_hard_rules"] += 1
                             continue
-                        if any(cov.get((day, area, tt), 0) >= max_req2.get((day, area, tt), 10**9) for tt in range(st, en)):
-                            block_counts["blocked_by_max_staffing"] += 1
-                            continue
                         need_sc = _candidate_need_score(day, area, st, en, cov)
                         tie_break = -seg_ticks
                         if best is None or (need_sc, tie_break) > (best[0], best[1]):
@@ -5891,7 +5872,7 @@ def generate_schedule(model: DataModel, label: str,
                 bad_a = working[idx]
                 if is_engine_managed_source(assignment_provenance(bad_a)):
                     # (1) Trim edges conservatively to salvage partial coverage when allowed.
-                    if target.code in {"availability-window", "max-hours-per-shift", "max-staffing-cap"}:
+                    if target.code in {"availability-window", "max-hours-per-shift", "max-staffing-soft-ceiling"}:
                         variants: List[List[Assignment]] = []
                         if int(bad_a.end_t) - int(bad_a.start_t) > 1:
                             left = Assignment(bad_a.day, bad_a.area, int(bad_a.start_t)+1, int(bad_a.end_t), bad_a.employee_name, locked=False, source=bad_a.source)
@@ -5922,7 +5903,7 @@ def generate_schedule(model: DataModel, label: str,
                                 break
 
                     # (3) Split/drop offending fragment for availability-style violations.
-                    if (not changed) and target.code in {"availability-window", "max-staffing-cap"}:
+                    if (not changed) and target.code in {"availability-window", "max-staffing-soft-ceiling"}:
                         segs = []
                         if int(bad_a.end_t) - int(bad_a.start_t) >= 3:
                             mid = int((int(bad_a.start_t) + int(bad_a.end_t)) // 2)
@@ -5978,7 +5959,7 @@ def generate_schedule(model: DataModel, label: str,
                 top = ", ".join(f"{k}:{v}" for k, v in sorted(forced.items(), key=lambda kv: (-kv[1], kv[0]))[:4])
                 warnings.append(f"Legality cleanup was forced primarily by: {top}.")
     override_only = [v for v in final_structured_violations if v.is_override_allowed]
-    override_cap_conflicts = [v for v in override_only if v.code in {"maximum-weekly-labor-cap", "max-staffing-cap", "employee-max-weekly-hours"}]
+    override_cap_conflicts = [v for v in override_only if v.code in {"maximum-weekly-labor-cap", "max-staffing-soft-ceiling", "employee-max-weekly-hours"}]
     if engine_hard:
         warnings.append(f"INFEASIBLE: scenario invalid after final hard validation ({len(engine_hard)} engine hard violations remain).")
     if override_only:
@@ -8419,114 +8400,281 @@ class SchedulerApp(tk.Tk):
         self.autosave()
 
     # -------- Requirements tab --------
+    def _area_priority_label(self, area: str) -> str:
+        return AREA_PRIORITY_TEXT.get(str(area or '').strip().upper(), str(area or '').strip())
+
+    def _selected_days_long_names(self) -> List[str]:
+        out: List[str] = []
+        for d in DAYS:
+            if bool(self.day_vars.get(d, tk.BooleanVar(value=False)).get()):
+                out.append(DAY_FULL.get(d, d))
+        return out
+
+    def _refresh_copy_target_summary(self):
+        if not hasattr(self, 'copy_targets_var'):
+            return
+        days = self._selected_days_long_names()
+        if days:
+            self.copy_targets_var.set(', '.join(days))
+        else:
+            self.copy_targets_var.set('No target days selected')
+
+    def _on_req_day_toggle(self):
+        self._refresh_copy_target_summary()
+        if hasattr(self, 'req_timeline_day_var') and (self.req_timeline_day_var.get() not in DAYS):
+            self.req_timeline_day_var.set('Sun')
+        self.refresh_req_timeline()
+
+    def _select_days(self, mode: str):
+        m = str(mode or '').strip().lower()
+        for d in DAYS:
+            val = False
+            if m == 'all':
+                val = True
+            elif m == 'none':
+                val = False
+            elif m == 'weekdays':
+                val = d in {'Mon', 'Tue', 'Wed', 'Thu', 'Fri'}
+            elif m == 'weekends':
+                val = d in {'Sun', 'Sat'}
+            try:
+                self.day_vars[d].set(bool(val))
+            except Exception:
+                pass
+        self._on_req_day_toggle()
+
+    def _build_req_timeline_section(self, parent):
+        box = ttk.LabelFrame(parent, text='Visual Daily Timeline / Block View (Read Only)')
+        box.pack(fill='both', expand=True, pady=(0,8))
+        ttk.Label(
+            box,
+            text='Read-only visual map of staffing blocks by day and area. This view helps with time-block planning and does not directly edit solver inputs.',
+            foreground='#555',
+            wraplength=1200,
+            justify='left',
+        ).pack(anchor='w', padx=8, pady=(6,6))
+
+        top = ttk.Frame(box)
+        top.pack(fill='x', padx=8, pady=(0,6))
+        ttk.Label(top, text='View Day:').pack(side='left')
+        self.req_timeline_day_var = tk.StringVar(value='Sun')
+        ttk.Combobox(top, textvariable=self.req_timeline_day_var, values=DAYS, state='readonly', width=10).pack(side='left', padx=(6,10))
+        ttk.Button(top, text='Refresh Timeline', command=self.refresh_req_timeline).pack(side='left')
+        ttk.Label(top, text='Area priority: C-Store (Primary) → Kitchen (Secondary) → Carwash (Tertiary)', foreground='#555').pack(side='left', padx=(12,0))
+
+        self.req_timeline_canvas = tk.Canvas(box, height=240, background='#ffffff', highlightthickness=1, highlightbackground='#d9d9d9')
+        self.req_timeline_canvas.pack(fill='x', padx=8, pady=(0,8))
+        self.req_timeline_day_var.trace_add('write', lambda *_args: self.refresh_req_timeline())
+
+    def refresh_req_timeline(self):
+        if not hasattr(self, 'req_timeline_canvas'):
+            return
+        c = self.req_timeline_canvas
+        c.delete('all')
+        try:
+            c.update_idletasks()
+        except Exception:
+            pass
+        w = max(700, int(c.winfo_width() or 700))
+        h = max(220, int(c.winfo_height() or 220))
+        left = 130
+        right = 16
+        top = 20
+        row_h = 58
+        axis_w = max(200, w - left - right)
+
+        day = str(getattr(self, 'req_timeline_day_var', tk.StringVar(value='Sun')).get() or 'Sun')
+        if day not in DAYS:
+            day = 'Sun'
+
+        for hr in range(0, 25, 2):
+            t = int((hr / 24.0) * axis_w)
+            x = left + t
+            c.create_line(x, top - 5, x, top + row_h * len(AREAS), fill='#eeeeee')
+            c.create_text(x, top - 10, text=f'{hr:02d}:00', fill='#666', font=('Segoe UI', 8), anchor='s')
+
+        color_by_area = {
+            'CSTORE': '#4e79a7',
+            'KITCHEN': '#f28e2b',
+            'CARWASH': '#76b7b2',
+        }
+        area_rows: Dict[str, List[RequirementBlock]] = {a: [] for a in AREAS}
+        for r in sorted(self.model.requirements, key=lambda x: (AREAS.index(x.area) if x.area in AREAS else 99, x.start_t, x.end_t)):
+            if r.day == day and r.area in AREAS and int(r.end_t) > int(r.start_t):
+                area_rows[r.area].append(r)
+
+        for idx, area in enumerate(AREAS):
+            y0 = top + idx * row_h
+            y1 = y0 + 38
+            c.create_text(8, y0 + 19, text=self._area_priority_label(area), anchor='w', font=('Segoe UI', 9, 'bold'))
+            c.create_rectangle(left, y0, left + axis_w, y1, outline='#d8d8d8')
+            for r in area_rows.get(area, []):
+                x0 = left + int((max(0, int(r.start_t)) / float(DAY_TICKS)) * axis_w)
+                x1 = left + int((min(DAY_TICKS, int(r.end_t)) / float(DAY_TICKS)) * axis_w)
+                if x1 <= x0:
+                    x1 = x0 + 1
+                c.create_rectangle(x0, y0 + 4, x1, y1 - 4, fill=color_by_area.get(area, '#999999'), outline='')
+                label = f"{tick_to_hhmm(int(r.start_t))}-{tick_to_hhmm(int(r.end_t))}  m/p/M {int(r.min_count)}/{int(r.preferred_count)}/{int(r.max_count)}"
+                if (x1 - x0) >= 120:
+                    c.create_text(x0 + 4, (y0 + y1) // 2, text=label, anchor='w', fill='white', font=('Segoe UI', 8, 'bold'))
+
+        c.create_text(left, top + row_h * len(AREAS) + 8, text=f'Day: {DAY_FULL.get(day, day)} | This timeline is read-only and derived from canonical requirement rows.', anchor='nw', fill='#555', font=('Segoe UI', 8))
+
     def _build_reqs_tab(self):
-        frm = ttk.Frame(self.tab_reqs); frm.pack(fill="both", expand=True, padx=12, pady=12)
-        ttk.Label(frm, text="Requirements are per 30-minute block. Use bulk apply to speed up.", style="SubHeader.TLabel")            .pack(anchor="w", pady=(0,8))
+        frm = ttk.Frame(self.tab_reqs); frm.pack(fill='both', expand=True, padx=12, pady=12)
 
-        controls = ttk.LabelFrame(frm, text="Bulk Apply / Copy")
-        controls.pack(fill="x", pady=(0,10))
+        expl = ttk.LabelFrame(frm, text='Staffing Requirements Drive the Engine')
+        expl.pack(fill='x', pady=(0,10))
+        ttk.Label(
+            expl,
+            text=(
+                'Staffing Requirements define exactly where, when, and how many employees the engine uses when building the schedule. '                'For each time block and department, set Min (Required), Preferred (Target), and Max Allowed. '                'Min is hard-required, Preferred is a target, and Max is a soft ceiling the engine tries not to exceed.'
+            ),
+            wraplength=1300,
+            justify='left',
+            foreground='#333'
+        ).pack(anchor='w', padx=10, pady=8)
+        ttk.Label(
+            expl,
+            text='Department staffing hierarchy: C-Store (Primary / Master Staffing) → Kitchen (Secondary) → Carwash (Tertiary).',
+            foreground='#555',
+        ).pack(anchor='w', padx=10, pady=(0,8))
 
-        self.req_area_var = tk.StringVar(value="CSTORE")
-        self.req_start_var = tk.StringVar(value="05:00")
-        self.req_end_var = tk.StringVar(value="23:00")
-        self.req_min_var = tk.StringVar(value="2")
-        self.req_pref_var = tk.StringVar(value="2")
-        self.req_max_var = tk.StringVar(value="2")
+        # Section 1: pattern builder
+        builder = ttk.LabelFrame(frm, text='Staffing Pattern Builder')
+        builder.pack(fill='x', pady=(0,10))
 
-        ttk.Label(controls, text="Area:").grid(row=0, column=0, padx=8, pady=6, sticky="w")
-        ttk.Combobox(controls, textvariable=self.req_area_var, values=AREAS, state="readonly", width=10).grid(row=0, column=1, padx=8, pady=6, sticky="w")
-        ttk.Label(controls, text="Start:").grid(row=0, column=2, padx=8, pady=6, sticky="w")
-        ttk.Combobox(controls, textvariable=self.req_start_var, values=TIME_CHOICES, state="readonly", width=8).grid(row=0, column=3, padx=8, pady=6, sticky="w")
-        ttk.Label(controls, text="End:").grid(row=0, column=4, padx=8, pady=6, sticky="w")
-        ttk.Combobox(controls, textvariable=self.req_end_var, values=TIME_CHOICES, state="readonly", width=8).grid(row=0, column=5, padx=8, pady=6, sticky="w")
-        ttk.Label(controls, text="Min (Hard):").grid(row=0, column=6, padx=8, pady=6, sticky="w")
-        ttk.Combobox(controls, textvariable=self.req_min_var, values=[str(i) for i in range(0,21)], state="readonly", width=6).grid(row=0, column=7, padx=8, pady=6, sticky="w")
-        ttk.Label(controls, text="Preferred:").grid(row=0, column=8, padx=8, pady=6, sticky="w")
-        ttk.Combobox(controls, textvariable=self.req_pref_var, values=[str(i) for i in range(0,21)], state="readonly", width=6).grid(row=0, column=9, padx=8, pady=6, sticky="w")
-        ttk.Label(controls, text="Max (Hard):").grid(row=0, column=10, padx=8, pady=6, sticky="w")
-        ttk.Combobox(controls, textvariable=self.req_max_var, values=[str(i) for i in range(0,21)], state="readonly", width=6).grid(row=0, column=11, padx=8, pady=6, sticky="w")
+        self.req_area_var = tk.StringVar(value='CSTORE')
+        self.req_start_var = tk.StringVar(value='05:00')
+        self.req_end_var = tk.StringVar(value='23:00')
+        self.req_min_var = tk.StringVar(value='2')
+        self.req_pref_var = tk.StringVar(value='2')
+        self.req_max_var = tk.StringVar(value='2')
+        self.req_area_hint_var = tk.StringVar(value=self._area_priority_label('CSTORE'))
 
-        self.day_vars = {d: tk.BooleanVar(value=(d in ["Mon","Tue","Wed","Thu","Fri"])) for d in DAYS}
-        for i,d in enumerate(DAYS):
-            ttk.Checkbutton(controls, text=d, variable=self.day_vars[d]).grid(row=1, column=i, padx=6, pady=4, sticky="w")
+        ttk.Label(builder, text='Area:').grid(row=0, column=0, padx=8, pady=6, sticky='w')
+        area_combo = ttk.Combobox(builder, textvariable=self.req_area_var, values=AREAS, state='readonly', width=12)
+        area_combo.grid(row=0, column=1, padx=8, pady=6, sticky='w')
+        ttk.Label(builder, textvariable=self.req_area_hint_var, foreground='#555').grid(row=0, column=2, columnspan=3, padx=8, pady=6, sticky='w')
+        area_combo.bind('<<ComboboxSelected>>', lambda _e: self.req_area_hint_var.set(self._area_priority_label(self.req_area_var.get())))
 
-        ttk.Button(controls, text="Select Weekdays", command=lambda: self._select_days("weekdays")).grid(row=2, column=0, padx=8, pady=6, sticky="w")
-        ttk.Button(controls, text="Select Weekends", command=lambda: self._select_days("weekends")).grid(row=2, column=1, padx=8, pady=6, sticky="w")
-        ttk.Button(controls, text="Select All", command=lambda: self._select_days("all")).grid(row=2, column=2, padx=8, pady=6, sticky="w")
-        ttk.Button(controls, text="Clear", command=lambda: self._select_days("none")).grid(row=2, column=3, padx=8, pady=6, sticky="w")
+        ttk.Label(builder, text='Start:').grid(row=1, column=0, padx=8, pady=6, sticky='w')
+        ttk.Combobox(builder, textvariable=self.req_start_var, values=TIME_CHOICES, state='readonly', width=8).grid(row=1, column=1, padx=8, pady=6, sticky='w')
+        ttk.Label(builder, text='End:').grid(row=1, column=2, padx=8, pady=6, sticky='w')
+        ttk.Combobox(builder, textvariable=self.req_end_var, values=TIME_CHOICES, state='readonly', width=8).grid(row=1, column=3, padx=8, pady=6, sticky='w')
 
-        ttk.Button(controls, text="Apply Range to Selected Days", command=self.apply_req_range).grid(row=0, column=12, rowspan=2, padx=10, pady=6, sticky="ns")
+        ttk.Label(builder, text='Min (Required):').grid(row=1, column=4, padx=8, pady=6, sticky='w')
+        ttk.Combobox(builder, textvariable=self.req_min_var, values=[str(i) for i in range(0,21)], state='readonly', width=6).grid(row=1, column=5, padx=8, pady=6, sticky='w')
+        ttk.Label(builder, text='Preferred (Target):').grid(row=1, column=6, padx=8, pady=6, sticky='w')
+        ttk.Combobox(builder, textvariable=self.req_pref_var, values=[str(i) for i in range(0,21)], state='readonly', width=6).grid(row=1, column=7, padx=8, pady=6, sticky='w')
+        ttk.Label(builder, text='Max Allowed:').grid(row=1, column=8, padx=8, pady=6, sticky='w')
+        ttk.Combobox(builder, textvariable=self.req_max_var, values=[str(i) for i in range(0,21)], state='readonly', width=6).grid(row=1, column=9, padx=8, pady=6, sticky='w')
 
-        self.copy_day_var = tk.StringVar(value="Mon")
-        ttk.Label(controls, text="Copy day:").grid(row=2, column=4, padx=8, pady=6, sticky="e")
-        ttk.Combobox(controls, textvariable=self.copy_day_var, values=DAYS, state="readonly", width=6).grid(row=2, column=5, padx=8, pady=6, sticky="w")
-        ttk.Button(controls, text="Copy → Paste to Selected Days", command=self.copy_paste_day).grid(row=2, column=6, columnspan=3, padx=10, pady=6, sticky="w")
+        ttk.Label(builder, text='Days:').grid(row=2, column=0, padx=8, pady=(2,6), sticky='w')
+        self.day_vars = {d: tk.BooleanVar(value=(d in ['Mon','Tue','Wed','Thu','Fri'])) for d in DAYS}
+        for i, d in enumerate(DAYS):
+            ttk.Checkbutton(builder, text=DAY_FULL.get(d, d), variable=self.day_vars[d], command=self._on_req_day_toggle).grid(row=2, column=1+i, padx=4, pady=(2,6), sticky='w')
 
-        cols = ("Day","Area","Start","End","Min","Preferred","Max")
-        req_wrap = ttk.Panedwindow(frm, orient="vertical"); req_wrap.pack(fill="both", expand=True)
-        raw_box = ttk.LabelFrame(req_wrap, text="Raw Requirement Rows")
-        eff_box = ttk.LabelFrame(req_wrap, text="Effective Solver Rules (Normalized Preview)")
+        quick = ttk.Frame(builder)
+        quick.grid(row=3, column=0, columnspan=8, sticky='w', padx=8, pady=(0,8))
+        ttk.Button(quick, text='Weekdays', command=lambda: self._select_days('weekdays')).pack(side='left', padx=(0,6))
+        ttk.Button(quick, text='Weekends', command=lambda: self._select_days('weekends')).pack(side='left', padx=(0,6))
+        ttk.Button(quick, text='All', command=lambda: self._select_days('all')).pack(side='left', padx=(0,6))
+        ttk.Button(quick, text='Clear', command=lambda: self._select_days('none')).pack(side='left', padx=(0,6))
+
+        ttk.Button(builder, text='Apply Pattern', command=self.apply_req_range).grid(row=3, column=8, columnspan=2, padx=8, pady=(0,8), sticky='e')
+
+        # Section 2: copy day template
+        copy_box = ttk.LabelFrame(frm, text='Copy Day Template')
+        copy_box.pack(fill='x', pady=(0,10))
+        self.copy_day_var = tk.StringVar(value='Mon')
+        self.copy_targets_var = tk.StringVar(value='No target days selected')
+        ttk.Label(copy_box, text='Source Day:').grid(row=0, column=0, padx=8, pady=6, sticky='w')
+        ttk.Combobox(copy_box, textvariable=self.copy_day_var, values=DAYS, state='readonly', width=10).grid(row=0, column=1, padx=8, pady=6, sticky='w')
+        ttk.Label(copy_box, text='Target Days (from selected days above):').grid(row=0, column=2, padx=8, pady=6, sticky='w')
+        ttk.Label(copy_box, textvariable=self.copy_targets_var, foreground='#555').grid(row=0, column=3, padx=8, pady=6, sticky='w')
+        ttk.Button(copy_box, text='Copy Pattern to Selected Days', command=self.copy_paste_day).grid(row=0, column=4, padx=8, pady=6, sticky='e')
+
+        # Section 3: visual timeline (read-only)
+        self._build_req_timeline_section(frm)
+
+        # Section 4 + 5: advanced rows and solver interpretation
+        cols = ('Day','Area','Start','End','Min','Preferred','Max')
+        req_wrap = ttk.Panedwindow(frm, orient='vertical'); req_wrap.pack(fill='both', expand=True)
+        raw_box = ttk.LabelFrame(req_wrap, text='Detailed Requirement Rows (Advanced)')
+        eff_box = ttk.LabelFrame(req_wrap, text='Solver Interpretation (Read Only)')
         req_wrap.add(raw_box, weight=3)
         req_wrap.add(eff_box, weight=2)
-        raw_wrap = ttk.Frame(raw_box); raw_wrap.pack(fill="both", expand=True)
-        self.req_tree = ttk.Treeview(raw_wrap, columns=cols, show="headings", height=12)
+
+        ttk.Label(raw_box, text='Use these rows for fine adjustments and exact requirement inspection.', foreground='#555').pack(anchor='w', padx=8, pady=(6,2))
+        raw_wrap = ttk.Frame(raw_box); raw_wrap.pack(fill='both', expand=True)
+        self.req_tree = ttk.Treeview(raw_wrap, columns=cols, show='headings', height=12)
         for c in cols:
             self.req_tree.heading(c, text=c)
             self.req_tree.column(c, width=180, stretch=True)
-        req_tree_ysb = ttk.Scrollbar(raw_wrap, orient="vertical", command=self.req_tree.yview)
-        req_tree_xsb = ttk.Scrollbar(raw_wrap, orient="horizontal", command=self.req_tree.xview)
+        req_tree_ysb = ttk.Scrollbar(raw_wrap, orient='vertical', command=self.req_tree.yview)
+        req_tree_xsb = ttk.Scrollbar(raw_wrap, orient='horizontal', command=self.req_tree.xview)
         self.req_tree.configure(yscrollcommand=req_tree_ysb.set, xscrollcommand=req_tree_xsb.set)
-        self.req_tree.grid(row=0, column=0, sticky="nsew")
-        req_tree_ysb.grid(row=0, column=1, sticky="ns")
-        req_tree_xsb.grid(row=1, column=0, sticky="ew")
+        self.req_tree.grid(row=0, column=0, sticky='nsew')
+        req_tree_ysb.grid(row=0, column=1, sticky='ns')
+        req_tree_xsb.grid(row=1, column=0, sticky='ew')
         raw_wrap.grid_rowconfigure(0, weight=1)
         raw_wrap.grid_columnconfigure(0, weight=1)
 
-        self.req_effective_tree = ttk.Treeview(eff_box, columns=cols, show="headings", height=8)
+        ttk.Label(eff_box, text='This normalized preview shows how the engine interprets entered staffing rules.', foreground='#555').grid(row=0, column=0, sticky='w', padx=8, pady=(6,2))
+        self.req_effective_tree = ttk.Treeview(eff_box, columns=cols, show='headings', height=8)
         for c in cols:
             self.req_effective_tree.heading(c, text=c)
             self.req_effective_tree.column(c, width=170, stretch=True)
-        eff_ysb = ttk.Scrollbar(eff_box, orient="vertical", command=self.req_effective_tree.yview)
+        eff_ysb = ttk.Scrollbar(eff_box, orient='vertical', command=self.req_effective_tree.yview)
         self.req_effective_tree.configure(yscrollcommand=eff_ysb.set)
-        self.req_effective_tree.grid(row=0, column=0, sticky="nsew")
-        eff_ysb.grid(row=0, column=1, sticky="ns")
-        eff_box.grid_rowconfigure(0, weight=1)
+        self.req_effective_tree.grid(row=1, column=0, sticky='nsew')
+        eff_ysb.grid(row=1, column=1, sticky='ns')
+        eff_box.grid_rowconfigure(1, weight=1)
         eff_box.grid_columnconfigure(0, weight=1)
 
-        bottom = ttk.Frame(frm); bottom.pack(fill="x", pady=(8,0))
-        ttk.Button(bottom, text="Edit Selected Count", command=self.edit_req_selected).pack(side="left")
-        ttk.Button(bottom, text="Delete Selected", command=self.delete_req_selected).pack(side="left", padx=8)
-        ttk.Button(bottom, text="Split Selected", command=self.split_req_selected).pack(side="left", padx=8)
-        ttk.Button(bottom, text="Merge Adjacent", command=self.merge_adjacent_requirements).pack(side="left", padx=8)
-        ttk.Button(bottom, text="Reset to Defaults", command=self.reset_requirements).pack(side="left", padx=8)
+        bottom = ttk.Frame(frm); bottom.pack(fill='x', pady=(8,0))
+        ttk.Button(bottom, text='Edit Selected Count', command=self.edit_req_selected).pack(side='left')
+        ttk.Button(bottom, text='Delete Selected', command=self.delete_req_selected).pack(side='left', padx=8)
+        ttk.Button(bottom, text='Split Selected', command=self.split_req_selected).pack(side='left', padx=8)
+        ttk.Button(bottom, text='Merge Adjacent', command=self.merge_adjacent_requirements).pack(side='left', padx=8)
+        ttk.Button(bottom, text='Reset to Defaults', command=self.reset_requirements).pack(side='left', padx=8)
+
+        self._refresh_copy_target_summary()
 
     def apply_req_range(self):
-        area = str(self.req_area_var.get() or "").strip()
+        area = str(self.req_area_var.get() or '').strip()
         if area not in AREAS:
-            messagebox.showerror("Apply", "Select a valid area.")
+            messagebox.showerror('Apply Pattern', 'Select a valid area.')
             return
         st = hhmm_to_tick(self.req_start_var.get())
         en = hhmm_to_tick(self.req_end_var.get())
         if en <= st:
-            messagebox.showerror("Apply", "End must be after start.")
+            messagebox.showerror('Apply Pattern', 'End must be after start.')
             return
 
         try:
-            mn = max(0, int(str(self.req_min_var.get()).strip()))
-            pr = max(mn, int(str(self.req_pref_var.get()).strip()))
-            mx = max(pr, int(str(self.req_max_var.get()).strip()))
+            mn = int(str(self.req_min_var.get()).strip())
+            pr = int(str(self.req_pref_var.get()).strip())
+            mx = int(str(self.req_max_var.get()).strip())
         except Exception:
-            messagebox.showerror("Apply", "Min / Preferred / Max must be whole numbers.")
+            messagebox.showerror('Apply Pattern', 'Min / Preferred / Max must be whole numbers.')
+            return
+        if mn < 0 or pr < 0 or mx < 0:
+            messagebox.showerror('Apply Pattern', 'Min / Preferred / Max must be 0 or higher.')
+            return
+        if not (mn <= pr <= mx):
+            messagebox.showerror('Apply Pattern', 'Invalid staffing values. Ensure Min <= Preferred <= Max.')
             return
 
         if not is_within_area_hours(self.model, area, st, en):
             op_t, cl_t = area_open_close_ticks(self.model, area)
-            messagebox.showerror("Apply", f"{area} requirement range must be within Hours of Operation: {tick_to_hhmm(op_t)}–{tick_to_hhmm(cl_t)}")
+            messagebox.showerror('Apply Pattern', f"{self._area_priority_label(area)} requirement range must be within Hours of Operation: {tick_to_hhmm(op_t)}–{tick_to_hhmm(cl_t)}")
             return
 
         sel_days = [d for d in DAYS if self.day_vars[d].get()]
         if not sel_days:
-            messagebox.showerror("Apply", "Select at least one day.")
+            messagebox.showerror('Apply Pattern', 'Select at least one target day.')
             return
 
         changed = 0
@@ -8534,7 +8682,7 @@ class SchedulerApp(tk.Tk):
             t = st
             while t < en:
                 t2 = t + 1
-                r = next((x for x in self.model.requirements if x.day==d and x.area==area and x.start_t==t and x.end_t==t2), None)
+                r = next((x for x in self.model.requirements if x.day == d and x.area == area and x.start_t == t and x.end_t == t2), None)
                 if r is None:
                     self.model.requirements.append(RequirementBlock(d, area, t, t2, mn, pr, mx))
                 else:
@@ -8545,21 +8693,21 @@ class SchedulerApp(tk.Tk):
                 t = t2
         self.refresh_req_tree()
         self.autosave()
-        messagebox.showinfo("Apply", f"Applied {changed} blocks: {area} {tick_to_hhmm(st)}–{tick_to_hhmm(en)} min={mn}, preferred={pr}, max={mx} across {len(sel_days)} day(s).")
+        messagebox.showinfo('Apply Pattern', f"Applied {changed} blocks for {self._area_priority_label(area)} {tick_to_hhmm(st)}–{tick_to_hhmm(en)} with Min/Preferred/Max={mn}/{pr}/{mx} across {len(sel_days)} day(s).")
 
     def copy_paste_day(self):
         src = self.copy_day_var.get()
         tgt_days = [d for d in DAYS if self.day_vars[d].get()]
         if not tgt_days:
-            messagebox.showerror("Copy/Paste", "Select target days with checkboxes.")
+            messagebox.showerror('Copy Day Template', 'Select target days in Staffing Pattern Builder first.')
             return
-        src_map = {(r.area,r.start_t,r.end_t): (r.min_count, r.preferred_count, r.max_count) for r in self.model.requirements if r.day==src and is_within_area_hours(self.model, r.area, r.start_t, r.end_t)}
+        src_map = {(r.area, r.start_t, r.end_t): (r.min_count, r.preferred_count, r.max_count) for r in self.model.requirements if r.day == src and is_within_area_hours(self.model, r.area, r.start_t, r.end_t)}
         pasted = 0
         for d in tgt_days:
             if d == src:
                 continue
-            for (area,st,en), (mn,pr,mx) in src_map.items():
-                r = next((x for x in self.model.requirements if x.day==d and x.area==area and x.start_t==st and x.end_t==en), None)
+            for (area, st, en), (mn, pr, mx) in src_map.items():
+                r = next((x for x in self.model.requirements if x.day == d and x.area == area and x.start_t == st and x.end_t == en), None)
                 if r is None:
                     self.model.requirements.append(RequirementBlock(d, area, st, en, int(mn), int(pr), int(mx)))
                 else:
@@ -8567,7 +8715,7 @@ class SchedulerApp(tk.Tk):
                 pasted += 1
         self.refresh_req_tree()
         self.autosave()
-        messagebox.showinfo("Copy/Paste", f"Pasted {pasted} blocks from {src} to {len(tgt_days)- (1 if src in tgt_days else 0)} day(s).")
+        messagebox.showinfo('Copy Day Template', f'Copied {src} pattern into {len(tgt_days) - (1 if src in tgt_days else 0)} selected day(s). Updated/created {pasted} blocks.')
 
     def edit_req_selected(self):
         sel = self.req_tree.selection()
@@ -8582,21 +8730,28 @@ class SchedulerApp(tk.Tk):
         new_pr = simple_input(self, "Edit Requirement", f"Preferred headcount for {day} {area} {st}-{en}:", default=str(pr))
         if new_pr is None:
             return
-        new_mx = simple_input(self, "Edit Requirement", f"Max (hard) headcount for {day} {area} {st}-{en}:", default=str(mx))
+        new_mx = simple_input(self, "Edit Requirement", f"Max (soft ceiling) headcount for {day} {area} {st}-{en}:", default=str(mx))
         if new_mx is None:
             return
         try:
-            mn_i = max(0, int(str(new_mn).strip()))
-            pr_i = max(mn_i, int(str(new_pr).strip()))
-            mx_i = max(pr_i, int(str(new_mx).strip()))
+            mn_i = int(str(new_mn).strip())
+            pr_i = int(str(new_pr).strip())
+            mx_i = int(str(new_mx).strip())
         except Exception:
+            messagebox.showerror("Edit", "Min / Preferred / Max must be whole numbers.")
+            return
+        if mn_i < 0 or pr_i < 0 or mx_i < 0:
+            messagebox.showerror("Edit", "Min / Preferred / Max must be 0 or higher.")
+            return
+        if not (mn_i <= pr_i <= mx_i):
+            messagebox.showerror("Edit", "Invalid staffing values. Ensure Min <= Preferred <= Max.")
             return
         stt = hhmm_to_tick(st); ent = hhmm_to_tick(en)
         if not is_within_area_hours(self.model, area, stt, ent):
             op_t, cl_t = area_open_close_ticks(self.model, area)
             messagebox.showerror("Edit", f"{area} requirement range must be within Hours of Operation: {tick_to_hhmm(op_t)}–{tick_to_hhmm(cl_t)}")
             return
-        r = next((x for x in self.model.requirements if x.day==day and x.area==area and x.start_t==stt and x.end_t==ent), None)
+        r = next((x for x in self.model.requirements if x.day == day and x.area == area and x.start_t == stt and x.end_t == ent), None)
         if r:
             r.min_count = mn_i
             r.preferred_count = pr_i
@@ -8613,7 +8768,7 @@ class SchedulerApp(tk.Tk):
         day, area, st, en = vals[0], vals[1], vals[2], vals[3]
         stt = hhmm_to_tick(st); ent = hhmm_to_tick(en)
         before = len(self.model.requirements)
-        self.model.requirements = [x for x in self.model.requirements if not (x.day==day and x.area==area and x.start_t==stt and x.end_t==ent)]
+        self.model.requirements = [x for x in self.model.requirements if not (x.day == day and x.area == area and x.start_t == stt and x.end_t == ent)]
         if len(self.model.requirements) == before:
             return
         self.refresh_req_tree(); self.autosave()
@@ -8636,7 +8791,7 @@ class SchedulerApp(tk.Tk):
         if mt <= stt or mt >= ent:
             messagebox.showerror("Split", "Split time must be inside the selected range.")
             return
-        r = next((x for x in self.model.requirements if x.day==day and x.area==area and x.start_t==stt and x.end_t==ent), None)
+        r = next((x for x in self.model.requirements if x.day == day and x.area == area and x.start_t == stt and x.end_t == ent), None)
         if r is None:
             return
         self.model.requirements.remove(r)
@@ -8704,7 +8859,8 @@ class SchedulerApp(tk.Tk):
                             else:
                                 break
                         self.req_effective_tree.insert("", "end", values=(day, area, tick_to_hhmm(st), tick_to_hhmm(t), mn, pr, mx))
-
+        self._refresh_copy_target_summary()
+        self.refresh_req_timeline()
     # -------- Generate tab --------
     def _build_generate_tab(self):
         frm = ttk.Frame(self.tab_gen); frm.pack(fill="both", expand=True, padx=12, pady=12)
