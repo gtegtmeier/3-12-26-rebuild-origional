@@ -1876,6 +1876,57 @@ def daily_shift_blocks(assigns: List[Assignment], emp_name: str, day: str, extra
         intervals.append(extra)
     return _merge_touching_intervals(intervals)
 
+def derive_master_envelopes(assigns: List[Assignment]) -> Dict[Tuple[str, str], List[Tuple[int, int]]]:
+    """Read-only derived payroll envelopes per employee/day from flat area segments."""
+    by_emp_day: Dict[Tuple[str, str], List[Tuple[int, int]]] = {}
+    for a in assigns or []:
+        by_emp_day.setdefault((a.employee_name, a.day), []).append((int(a.start_t), int(a.end_t)))
+    out: Dict[Tuple[str, str], List[Tuple[int, int]]] = {}
+    for k, intervals in by_emp_day.items():
+        out[k] = _merge_touching_intervals(intervals)
+    return out
+
+def can_place_segment_within_envelope(emp_name: str,
+                                      day: str,
+                                      st: int,
+                                      en: int,
+                                      envelopes_by_emp_day: Dict[Tuple[str, str], List[Tuple[int, int]]]) -> bool:
+    """True when [st,en] sits wholly inside an existing derived envelope for emp/day."""
+    for bst, ben in envelopes_by_emp_day.get((emp_name, day), []):
+        if int(st) >= int(bst) and int(en) <= int(ben):
+            return True
+    return False
+
+def validate_master_envelope_consistency(assigns: List[Assignment],
+                                         *,
+                                         tol_hours: float = 1e-9) -> Dict[str, Any]:
+    """Sanity diagnostics: payroll hours parity and overlap integrity in derived envelopes."""
+    envelopes = derive_master_envelopes(assigns)
+    raw_hours = float(sum(hours_between_ticks(int(a.start_t), int(a.end_t)) for a in (assigns or [])))
+
+    # Envelope hours count each covered tick once per employee/day.
+    envelope_hours = 0.0
+    overlap_ticks = 0
+    seen_emp_day_ticks: Dict[Tuple[str, str], Set[int]] = {}
+    for a in assigns or []:
+        key = (a.employee_name, a.day)
+        occ = seen_emp_day_ticks.setdefault(key, set())
+        for tt in range(int(a.start_t), int(a.end_t)):
+            if tt in occ:
+                overlap_ticks += 1
+            occ.add(tt)
+    for (_emp_day, blocks) in envelopes.items():
+        for st, en in blocks:
+            envelope_hours += hours_between_ticks(int(st), int(en))
+
+    return {
+        "raw_assignment_hours": float(raw_hours),
+        "derived_envelope_hours": float(envelope_hours),
+        "hours_parity_ok": bool(abs(raw_hours - envelope_hours) <= float(tol_hours) or overlap_ticks > 0),
+        "overlap_ticks_detected": int(overlap_ticks),
+        "envelope_count": int(sum(len(v) for v in envelopes.values())),
+    }
+
 def _practical_shift_target_hours(e: Optional[Employee], learned_patterns: Optional[Dict[str, Any]] = None) -> float:
     """Soft practical target for contiguous shift length.
 
@@ -2753,6 +2804,24 @@ def build_locked_and_prefer_from_fixed(model: DataModel, label: str) -> Tuple[Li
                            source=ASSIGNMENT_SOURCE_FIXED_LOCKED if fs.locked else ASSIGNMENT_SOURCE_FIXED_UNLOCKED)
             (locked if fs.locked else prefer).append(a)
     return locked, prefer
+
+def build_locked_seed_state(model: DataModel,
+                            label: str,
+                            locked: List[Assignment]) -> Dict[str, Any]:
+    """Build read-only locked seed diagnostics/state for phased constructive solving."""
+    coverage = count_coverage_per_tick(locked)
+    envelopes = derive_master_envelopes(locked)
+    by_area_hours: Dict[str, float] = {a: 0.0 for a in AREAS}
+    for a in locked:
+        by_area_hours[a.area] = by_area_hours.get(a.area, 0.0) + hours_between_ticks(int(a.start_t), int(a.end_t))
+    return {
+        "locked_count": int(len(locked)),
+        "locked_hours": float(sum(hours_between_ticks(int(a.start_t), int(a.end_t)) for a in locked)),
+        "locked_hours_by_area": by_area_hours,
+        "locked_coverage": coverage,
+        "locked_envelopes": envelopes,
+        "label": str(label or ""),
+    }
 
 def _schedule_total_penalty(model: DataModel, label: str, assignments: List[Assignment], filled: int, total_slots: int, prev_tick_map: Optional[Dict[Tuple[str,str,int], str]] = None) -> float:
     try:
@@ -3855,60 +3924,142 @@ def generate_schedule(model: DataModel, label: str,
                 return add_assignment(Assignment(day, area, st, en, e.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE), locked_ok=locked_ok, cov=coverage, enforce_weekly_cap=enforce_weekly_cap)
         return False
 
-    # ---- Greedy fill: HARD mins first ----
-    # We place contiguous segments of at least 1 hour (2 ticks) to avoid post-prune collapse.
-    def _tick_sort_key(k):
-        day, area, t = k
-        return (DAYS.index(day), AREAS.index(area), t)
+    envelopes_by_emp_day: Dict[Tuple[str, str], List[Tuple[int, int]]] = derive_master_envelopes(assignments)
 
-    # Iterate until no progress
-    progress = True
-    while progress:
-        progress = False
-        # collect deficits
-        deficit_keys = [k for k,mn in min_req.items() if coverage.get(k,0) < mn]
-        if enable_risk and w_risk > 0.0 and tick_scarcity:
-            # Fill the scarcest coverage ticks first (fewer feasible employees => higher risk)
-            deficit_keys.sort(key=lambda k: (tick_scarcity.get(k, 10**9), k[0], k[1], k[2]))
-        else:
-            deficit_keys.sort(key=_tick_sort_key)
-        for (day, area, t) in deficit_keys[:8000]:
-            if coverage.get((day,area,t),0) >= min_req.get((day,area,t),0):
+    def recompute_uncovered_maps_incremental() -> Dict[str, Dict[Tuple[str, str, int], int]]:
+        out: Dict[str, Dict[Tuple[str, str, int], int]] = {a: {} for a in AREAS}
+        for (day, area, tick), mn in min_req.items():
+            if int(mn) <= 0:
                 continue
-            # choose a segment starting at t
-            st = t
-            # ensure we can make at least 1 hour: try start at t-1 if that helps contiguous 1h inside needs
-            if st > 0 and coverage.get((day,area,st),0) < min_req.get((day,area,st),0) and coverage.get((day,area,st-1),0) < min_req.get((day,area,st-1),0):
-                st = st-1
-            # lengths to try (ticks): 2=1h, 4=2h, 6=3h, 8=4h
-            for L in (8,6,4,2):
-                en = st + L
-                if en > DAY_TICKS:
+            remain = int(mn) - int(coverage.get((day, area, tick), 0))
+            if remain > 0:
+                out.setdefault(area, {})[(day, area, tick)] = int(remain)
+        return out
+
+    def open_or_extend_master_envelope(day: str,
+                                       area: str,
+                                       st: int,
+                                       en: int,
+                                       *,
+                                       only_within_existing: bool = False,
+                                       enforce_weekly_cap: bool = True,
+                                       prefer_underutilized: bool = False) -> bool:
+        nonlocal current_avg_active_wants, envelopes_by_emp_day
+        pool = [e for e in model.employees if e.work_status == "Active" and bool(getattr(e, "wants_hours", True)) and area in e.areas_allowed]
+        if prefer_underutilized:
+            pool.sort(key=lambda e: float(emp_hours.get(e.name, 0.0) or 0.0))
+        else:
+            if enable_util and w_low_hours > 0.0 and active_wants_names:
+                current_avg_active_wants = sum(float(emp_hours.get(nm, 0.0) or 0.0) for nm in active_wants_names) / float(len(active_wants_names))
+            else:
+                current_avg_active_wants = 0.0
+            pool.sort(key=lambda e: candidate_score(e, day, area, st, en), reverse=True)
+
+        for e in pool[:50]:
+            within = can_place_segment_within_envelope(e.name, day, st, en, envelopes_by_emp_day)
+            if only_within_existing and not within:
+                continue
+            if feasible_segment(e, day, area, st, en):
+                if add_assignment(Assignment(day, area, st, en, e.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE), locked_ok=False, cov=coverage, enforce_weekly_cap=enforce_weekly_cap):
+                    envelopes_by_emp_day = derive_master_envelopes(assignments)
+                    return True
+        return False
+
+    def phase_fill_area_min(area: str,
+                            *,
+                            lengths: Tuple[int, ...],
+                            only_within_existing: bool,
+                            enforce_weekly_cap: bool,
+                            prefer_underutilized: bool = False,
+                            max_keys: int = 8000) -> Dict[str, int]:
+        stats = {"attempts": 0, "adds": 0}
+        progressed = True
+        while progressed:
+            progressed = False
+            deficit_keys = [k for k, mn in min_req.items() if k[1] == area and coverage.get(k, 0) < mn]
+            deficit_keys.sort(key=lambda k: (DAYS.index(k[0]), int(k[2])))
+            for (day, _area, t) in deficit_keys[:max_keys]:
+                if coverage.get((day, area, t), 0) >= min_req.get((day, area, t), 0):
                     continue
-                # require that at least 2 ticks in this window still need min coverage (avoid pointless segments)
-                need_ticks = 0
-                ok = True
-                for tt in range(st, en):
-                    k = (day, area, tt)
-                    if coverage.get(k,0) >= max_req.get(k, 10**9):
-                        ok = False
-                        break
-                    if coverage.get(k,0) < min_req.get(k,0):
-                        need_ticks += 1
-                if not ok or need_ticks < 2:
-                    continue
-                # Preferred Weekly Cap is soft: avoid exceeding it if possible during preferred-fill.
-                seg_h = (en - st) / 2.0
-                if preferred_weekly_cap > 0.0 and (total_labor_hours + seg_h) - preferred_weekly_cap > 1e-9:
-                    over = (total_labor_hours + seg_h) - preferred_weekly_cap
-                    # Only allow small, high-value overshoots (segment mostly fills preferred deficits).
-                    if over > 0.5 or need_ticks < ((en - st) - 1):
+                st = int(t)
+                if st > 0 and coverage.get((day, area, st), 0) < min_req.get((day, area, st), 0) and coverage.get((day, area, st - 1), 0) < min_req.get((day, area, st - 1), 0):
+                    st -= 1
+                for L in lengths:
+                    en = st + int(L)
+                    if en > DAY_TICKS:
                         continue
-                if add_best_segment(day, area, st, en):
-                    progress = True
+                    need_ticks = 0
+                    ok = True
+                    for tt in range(st, en):
+                        k = (day, area, tt)
+                        if coverage.get(k, 0) >= max_req.get(k, 10**9):
+                            ok = False
+                            break
+                        if coverage.get(k, 0) < min_req.get(k, 0):
+                            need_ticks += 1
+                    if not ok or need_ticks < 2:
+                        continue
+                    stats["attempts"] += 1
+                    if open_or_extend_master_envelope(day, area, st, en,
+                                                      only_within_existing=only_within_existing,
+                                                      enforce_weekly_cap=enforce_weekly_cap,
+                                                      prefer_underutilized=prefer_underutilized):
+                        progressed = True
+                        stats["adds"] += 1
+                        break
+                if progressed:
                     break
-            if progress:
-                break
+        return stats
+
+    def phase_backfill_cstore_from_pool(*,
+                                        only_within_existing: bool,
+                                        enforce_weekly_cap: bool,
+                                        max_keys: int = 6000) -> Dict[str, int]:
+        return phase_fill_area_min(
+            "CSTORE",
+            lengths=(6, 4, 2),
+            only_within_existing=only_within_existing,
+            enforce_weekly_cap=enforce_weekly_cap,
+            prefer_underutilized=True,
+            max_keys=max_keys,
+        )
+
+    # ---- Phase runner: master-envelope hierarchy ----
+    phase_diagnostics: Dict[str, Dict[str, Any]] = {}
+
+    phase_diagnostics["phase0_seed_locked"] = {
+        "seed": build_locked_seed_state(model, label, [a for a in assignments if assignment_provenance(a) == ASSIGNMENT_SOURCE_FIXED_LOCKED]),
+        "envelope_consistency": validate_master_envelope_consistency(assignments),
+    }
+
+    phase_diagnostics["phase1_cstore_primary"] = phase_fill_area_min(
+        "CSTORE",
+        lengths=(8, 6, 4, 2),
+        only_within_existing=False,
+        enforce_weekly_cap=True,
+    )
+    phase_diagnostics["phase2_kitchen"] = phase_fill_area_min(
+        "KITCHEN",
+        lengths=(6, 4, 2),
+        only_within_existing=False,
+        enforce_weekly_cap=True,
+    )
+    phase_diagnostics["phase3_cstore_backfill_after_kitchen"] = phase_backfill_cstore_from_pool(
+        only_within_existing=False,
+        enforce_weekly_cap=True,
+    )
+    phase_diagnostics["phase4_carwash"] = phase_fill_area_min(
+        "CARWASH",
+        lengths=(6, 4, 2),
+        only_within_existing=False,
+        enforce_weekly_cap=True,
+    )
+    phase_diagnostics["phase5_cstore_backfill_after_carwash"] = phase_backfill_cstore_from_pool(
+        only_within_existing=False,
+        enforce_weekly_cap=True,
+    )
+
+    uncovered_min_by_area = recompute_uncovered_maps_incremental()
 
 
     # If Maximum Weekly Labor Cap is enabled, enforce it during MIN fill.
@@ -3921,7 +4072,7 @@ def generate_schedule(model: DataModel, label: str,
         while progress_cap:
             progress_cap = False
             deficit_keys = [k for k,mn in min_req.items() if coverage.get(k,0) < mn]
-            deficit_keys.sort(key=_tick_sort_key)
+            deficit_keys.sort(key=lambda k: (DAYS.index(k[0]), AREAS.index(k[1]), int(k[2])))
             for (day, area, t) in deficit_keys[:8000]:
                 if coverage.get((day,area,t),0) >= min_req.get((day,area,t),0):
                     continue
@@ -3955,7 +4106,7 @@ def generate_schedule(model: DataModel, label: str,
     while progress:
         progress = False
         pref_def_keys = [k for k,pr in pref_req.items() if coverage.get(k,0) < pr]
-        pref_def_keys.sort(key=_tick_sort_key)
+        pref_def_keys.sort(key=lambda k: (DAYS.index(k[0]), AREAS.index(k[1]), int(k[2])))
         for (day, area, t) in pref_def_keys[:8000]:
             if coverage.get((day,area,t),0) >= pref_req.get((day,area,t),0):
                 continue
@@ -4050,6 +4201,11 @@ def generate_schedule(model: DataModel, label: str,
     constructive_checkpoint_violations = _engine_hard_violations(assignments)
     if constructive_checkpoint_violations:
         warnings.append(f"Constructive checkpoint found {len(constructive_checkpoint_violations)} hard-rule issue(s); final legalization will repair or reject.")
+    if 'phase_diagnostics' in locals():
+        phase_diagnostics["phase6_targeted_final_repair"] = {
+            "constructive_checkpoint_engine_hard": int(len(constructive_checkpoint_violations)),
+            "envelope_consistency": validate_master_envelope_consistency(assignments),
+        }
 
     # Compute shortfalls for reporting/scoring
     min_short, pref_short, max_viol = compute_requirement_shortfalls(min_req, pref_req, max_req, coverage)
@@ -4778,6 +4934,13 @@ def generate_schedule(model: DataModel, label: str,
         warnings.append(f"Override diagnostics: {len(override_only)} override assignment rule warning(s) retained by manager authority.")
     for v in final_structured_violations:
         warnings.append(f"FINAL HARD VALIDATION: {_viol_to_text(v)}")
+    if 'phase_diagnostics' in locals():
+        phase_diagnostics["phase7_final_legality"] = {
+            "final_total_violations": int(len(final_structured_violations)),
+            "final_engine_hard_violations": int(len(engine_hard)),
+            "override_only_violations": int(len(override_only)),
+            "repair_stats": dict(repair_stats),
+        }
 
     # Explainability diagnostics: retain legacy text list and add normalized structured factors.
     limiting_structured: List[Dict[str, Any]] = []
@@ -4874,6 +5037,10 @@ def generate_schedule(model: DataModel, label: str,
     "final_hard_validation_violations": list(final_structured_violations),
     "hard_rule_violations": list(final_structured_violations),
     "hard_rule_violation_count": int(len(final_structured_violations)),
+
+    "phase_diagnostics": dict(phase_diagnostics) if 'phase_diagnostics' in locals() else {},
+    "uncovered_min_by_area": {k: int(len(v)) for k, v in (uncovered_min_by_area.items() if 'uncovered_min_by_area' in locals() else [])},
+    "master_envelope_consistency": validate_master_envelope_consistency(assignments),
 
     "limiting_factors": list(limiting),
     "limiting_factors_structured": list(limiting_structured),
