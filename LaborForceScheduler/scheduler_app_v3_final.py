@@ -2070,9 +2070,20 @@ def evaluate_schedule_hard_rules(model: DataModel, label: str, assignments: List
             violations.append(HardRuleViolation(code="max-staffing-cap", message=f"area={area} tick={tick_to_hhmm(int(tick))} scheduled={cov} max={int(cap)}", day=day, assignment_source=ASSIGNMENT_SOURCE_ENGINE))
 
     total_hours = float(sum(hours_between_ticks(int(a.start_t), int(a.end_t)) for a in assignments))
+    locked_override_hours = float(sum(
+        hours_between_ticks(int(a.start_t), int(a.end_t))
+        for a in assignments
+        if assignment_provenance(a) in {ASSIGNMENT_SOURCE_FIXED_LOCKED, ASSIGNMENT_SOURCE_MANUAL}
+    ))
     max_weekly_cap = float(getattr(model.manager_goals, 'maximum_weekly_cap', 0.0) or 0.0)
     if max_weekly_cap > 0.0 and (total_hours - max_weekly_cap) > 1e-9:
-        violations.append(HardRuleViolation(code="maximum-weekly-labor-cap", message=f"scheduled={total_hours:.1f} cap={max_weekly_cap:.1f}", assignment_source=ASSIGNMENT_SOURCE_ENGINE))
+        override_cap = locked_override_hours - max_weekly_cap > 1e-9
+        violations.append(HardRuleViolation(
+            code="maximum-weekly-labor-cap",
+            message=f"scheduled={total_hours:.1f} cap={max_weekly_cap:.1f}",
+            assignment_source=ASSIGNMENT_SOURCE_FIXED_LOCKED if override_cap else ASSIGNMENT_SOURCE_ENGINE,
+            is_override_allowed=bool(override_cap),
+        ))
 
     labor_floor = float(getattr(model.manager_goals, 'minimum_weekly_floor', 0.0) or 0.0)
     if labor_floor > 0.0 and total_hours + 1e-9 < labor_floor:
@@ -2683,7 +2694,7 @@ def build_locked_and_prefer_from_fixed(model: DataModel, label: str) -> Tuple[Li
                     continue
                 seen_locked.add(key)
             a = Assignment(fs.day, fs.area, fs.start_t, fs.end_t, e.name, locked=fs.locked,
-                           source=ASSIGNMENT_SOURCE_FIXED_LOCKED if fs.locked else ASSIGNMENT_SOURCE_FIXED_LOCKED)
+                           source=ASSIGNMENT_SOURCE_FIXED_LOCKED if fs.locked else ASSIGNMENT_SOURCE_ENGINE)
             (locked if fs.locked else prefer).append(a)
     return locked, prefer
 
@@ -3285,10 +3296,23 @@ def generate_schedule_multi_scenario(model: DataModel, label: str, prev_tick_map
             diag = dict(diag or {})
             diag["scenario_name"] = spec.get("name", "Scenario")
             diag["scenario_score_penalty"] = float(score_pen)
-            row = {"name": spec.get("name", "Scenario"), "penalty": float(score_pen), "hours": float(total_hours), "warnings": int(len(warnings or [])), "filled": int(filled), "total_slots": int(total_slots)}
+            engine_hard = int((diag or {}).get("engine_hard_violations", 0) or 0)
+            infeasible_warn = int(sum(1 for w in (warnings or []) if "INFEASIBLE" in str(w)))
+            row = {
+                "name": spec.get("name", "Scenario"),
+                "penalty": float(score_pen),
+                "hours": float(total_hours),
+                "warnings": int(len(warnings or [])),
+                "filled": int(filled),
+                "total_slots": int(total_slots),
+                "engine_hard_violations": int(engine_hard),
+                "infeasible_warning_count": int(infeasible_warn),
+                "valid": bool(engine_hard == 0),
+            }
             scenario_rows.append(row)
-            if best is None or row["penalty"] < best[0]:
-                best = (row["penalty"], (assigns, emp_hours, total_hours, warnings, filled, total_slots, iters_done, restarts_done, diag))
+            compare_key = (int(engine_hard), int(infeasible_warn), float(row["penalty"]))
+            if best is None or compare_key < best[0]:
+                best = (compare_key, (assigns, emp_hours, total_hours, warnings, filled, total_slots, iters_done, restarts_done, diag))
         except Exception as ex:
             scenario_rows.append({"name": spec.get("name", "Scenario"), "penalty": 1e9, "hours": 0.0, "warnings": 1, "filled": 0, "total_slots": 0, "error": str(ex)})
     if best is None:
@@ -3820,32 +3844,6 @@ def generate_schedule(model: DataModel, label: str,
             if progress:
                 break
 
-    # Participation repair (>=1 shift >=1 hour) when feasible:
-    for e in model.employees:
-        if e.work_status!="Active" or not e.wants_hours:
-            continue
-        if emp_hours.get(e.name,0.0) >= 1.0:
-            continue
-        placed = False
-        # try to place in preferred-need first, then anywhere under max
-        candidate_ticks = [k for k,pr in pref_req.items() if k[1] in e.areas_allowed and coverage.get(k,0) < pr]
-        if not candidate_ticks:
-            candidate_ticks = [k for k,mx in max_req.items() if k[1] in e.areas_allowed and coverage.get(k,0) < mx]
-        candidate_ticks.sort(key=_tick_sort_key)
-        for (day, area, t) in candidate_ticks[:3000]:
-            st = max(0, t-1)
-            en = st + 2
-            if en > DAY_TICKS:
-                continue
-            # attempt fixed employee
-            if feasible_segment(e, day, area, st, en):
-                if add_assignment(Assignment(day, area, st, en, e.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE), locked_ok=False, cov=coverage):
-                    placed = True
-                    break
-        if not placed:
-            # infeasible for this employee; leave for warnings/score
-            pass
-
     # Phase 8C: targeted short-shift growth pass (soft quality; hard rules still enforced).
     # Attempt to extend <3h single-block days by adding adjacent 1h/2h segments for the same employee.
     emp_by_name = {e.name: e for e in model.employees}
@@ -4194,31 +4192,36 @@ def generate_schedule(model: DataModel, label: str,
 
     assignments = best[1]
 
-    # Enforce minimum contiguous shift length (hard rule on final schedule).
-    # Note: requirements are often in 30-min blocks, so enforcing this during greedy fill
-    # would block building longer shifts. Instead we prune short final shift blocks.
+    # Constructive min-shift guard: short engine-created blocks should be rare.
+    # Keep a defensive cleanup fallback for residual engine-only artifacts after local search mutations.
     def prune_short_shift_blocks(assigns: List[Assignment]) -> List[Assignment]:
         keep = list(assigns)
-        removed_any = False
+        removed_engine_short = 0
         for e in model.employees:
-            min_h = float(getattr(e, "min_hours_per_shift", 1.0))
+            min_h = float(getattr(e, "min_hours_per_shift", 1.0) or 0.0)
             if min_h <= 0.5:
                 continue
             for day in DAYS:
                 blocks = daily_shift_blocks(keep, e.name, day)
-                for st,en in blocks:
-                    if hours_between_ticks(st,en) + 1e-9 < min_h:
-                        # remove all assignments inside this short block
-                        before = len(keep)
-                        keep = [a for a in keep if not (a.employee_name==e.name and a.day==day and a.start_t>=st and a.end_t<=en)]
-                        if len(keep) != before:
-                            removed_any = True
-        if removed_any:
-            warnings.append("Removed shift blocks shorter than minimum hours-per-shift rule.")
+                for st, en in blocks:
+                    if hours_between_ticks(st, en) + 1e-9 >= min_h:
+                        continue
+                    block_as = [a for a in keep if a.employee_name == e.name and a.day == day and a.start_t >= st and a.end_t <= en]
+                    if not block_as:
+                        continue
+                    # preserve manager authority: never auto-delete override-authored blocks
+                    if any(assignment_provenance(a) in {ASSIGNMENT_SOURCE_FIXED_LOCKED, ASSIGNMENT_SOURCE_MANUAL} for a in block_as):
+                        continue
+                    before = len(keep)
+                    keep = [a for a in keep if a not in block_as]
+                    removed_engine_short += max(0, before - len(keep))
+        if removed_engine_short > 0:
+            warnings.append(f"Defensive cleanup: removed {removed_engine_short} engine-created assignment(s) in short blocks.")
         return keep
 
     assignments = prune_short_shift_blocks(assignments)
-    # Recompute coverage after pruning and report MIN coverage status
+
+    # recompute requirement status after quality passes
     coverage = count_coverage_per_tick(assignments)
     min_req2, pref_req2, max_req2 = build_requirement_maps(model.requirements, goals=getattr(model,'manager_goals',None), store_info=getattr(model, "store_info", None))
     min_short2, pref_short2, max_viol2 = compute_requirement_shortfalls(min_req2, pref_req2, max_req2, coverage)
@@ -4233,150 +4236,164 @@ def generate_schedule(model: DataModel, label: str,
     # compute employee hours
     emp_hours = {e.name: 0.0 for e in model.employees}
     for a in assignments:
-        emp_hours[a.employee_name] += hours_between_ticks(a.start_t,a.end_t)
+        emp_hours[a.employee_name] += hours_between_ticks(a.start_t, a.end_t)
 
-
-    # ---- Milestone 4: Minimum Participation Repair ("if feasible") ----
-    # For eligible employees (Active + opted-in + at least one 1-hour availability window this week),
-    # ensure they receive >= 1 hour scheduled, if feasible without violating hard constraints
-    # (staffing Max, legal/availability rules, per-employee max hours, and Maximum Weekly Labor Cap).
     eligible_map, not_eligible_map = compute_weekly_eligibility(model, label)
     participation_missed: Dict[str, str] = {}
-    total_labor_hours_now: float = float(sum(emp_hours.values()))
-    one_hour_ticks = 2  # 30-min ticks => 1 hour
+    participation_details: Dict[str, Any] = {}
 
-    def _overlaps_existing(emp_name: str, day: str, st: int, en: int) -> bool:
-        for ex in assignments:
-            if ex.employee_name == emp_name and ex.day == day and not (en <= ex.start_t or st >= ex.end_t):
+    def _has_real_demand(day: str, area: str, st: int, en: int) -> bool:
+        return all((int(min_req2.get((day, area, tt), 0)) > 0) or (int(pref_req2.get((day, area, tt), 0)) > 0) for tt in range(st, en))
+
+    def _is_attached_or_extendable(emp_name: str, day: str, area: str, st: int, en: int, cov: Dict[Tuple[str,str,int], int]) -> bool:
+        # extend employee's own existing block on this day, OR attach to an already-open demand-backed coverage block.
+        same_day = [a for a in assignments if a.employee_name == emp_name and a.day == day]
+        for ex in same_day:
+            if (int(en) == int(ex.start_t)) or (int(st) == int(ex.end_t)):
                 return True
-        return False
-
-    def _violates_max2(day: str, area: str, st: int, en: int) -> bool:
+        # allow first block only when connected to existing live coverage in this demand window
         for tt in range(st, en):
-            k = (day, area, tt)
-            if coverage.get(k, 0) >= max_req2.get(k, 10**9):
+            if cov.get((day, area, tt), 0) > 0:
+                return True
+            if tt > 0 and cov.get((day, area, tt - 1), 0) > 0:
+                return True
+            if tt + 1 < DAY_TICKS and cov.get((day, area, tt + 1), 0) > 0:
                 return True
         return False
 
-    def _segment_need_score(day: str, area: str, st: int, en: int) -> int:
-        # Prefer filling remaining MIN deficits first, then preferred deficits. Otherwise low value.
+    def _candidate_need_score(day: str, area: str, st: int, en: int, cov: Dict[Tuple[str,str,int], int]) -> int:
         min_need = 0
         pref_need = 0
         for tt in range(st, en):
             k = (day, area, tt)
-            if coverage.get(k, 0) < min_req2.get(k, 0):
+            if cov.get(k, 0) < min_req2.get(k, 0):
                 min_need += 1
-            if coverage.get(k, 0) < pref_req2.get(k, 0):
+            if cov.get(k, 0) < pref_req2.get(k, 0):
                 pref_need += 1
         return (min_need * 100) + (pref_need * 10)
 
-    # Only attempt repair for eligible employees who currently have < 1 hour scheduled
-    missing_participants = [nm for nm in eligible_map.keys() if emp_hours.get(nm, 0.0) + 1e-9 < 1.0]
-    for nm in missing_participants:
+    def _candidate_is_hard_valid(a: Assignment, working: List[Assignment]) -> bool:
+        trial = working + [a]
+        for v in evaluate_schedule_hard_rules(model, label, trial, include_override_warnings=False):
+            if v.severity == "error" and v.assignment_source == ASSIGNMENT_SOURCE_ENGINE:
+                return False
+        return True
+
+    def _try_add_target_hours(emp: Employee,
+                              required_hours: float,
+                              reason_tag: str,
+                              cov: Dict[Tuple[str,str,int], int]) -> float:
+        added = 0.0
+        if required_hours <= 1e-9:
+            return 0.0
+        min_shift_ticks = int(max(1, math.ceil(max(0.0, float(getattr(emp, "min_hours_per_shift", 1.0) or 1.0)) * TICKS_PER_HOUR)))
+        max_shift_ticks = int(max(min_shift_ticks, round(employee_allowed_max_shift_hours(emp) * TICKS_PER_HOUR)))
+        if max_shift_ticks < min_shift_ticks:
+            participation_details[emp.name] = {"result": "blocked", "reason": "min shift exceeds max shift"}
+            return 0.0
+
+        total_hours_now = float(sum(hours_between_ticks(a.start_t, a.end_t) for a in assignments))
+        best: Optional[Tuple[int, int, str, str, int, int]] = None
+
+        for day in DAYS:
+            for area in (getattr(emp, "areas_allowed", []) or []):
+                for seg_ticks in sorted(set([min_shift_ticks, min(max_shift_ticks, min_shift_ticks + 2), min(max_shift_ticks, min_shift_ticks + 4)]), reverse=True):
+                    if seg_ticks <= 0:
+                        continue
+                    earliest = 0
+                    latest = DAY_TICKS - seg_ticks
+                    if latest < earliest:
+                        continue
+                    for st in range(earliest, latest + 1):
+                        en = st + seg_ticks
+                        seg_h = hours_between_ticks(st, en)
+                        if seg_h > (required_hours - added) + max(0.0, float(getattr(emp, "min_hours_per_shift", 1.0) or 1.0)):
+                            continue
+                        if max_weekly_cap > 0.0 and (total_hours_now + seg_h) - max_weekly_cap > 1e-9:
+                            continue
+                        if not _has_real_demand(day, area, st, en):
+                            continue
+                        if not _is_attached_or_extendable(emp.name, day, area, st, en, cov):
+                            continue
+                        if emp_hours.get(emp.name, 0.0) + seg_h > float(getattr(emp, "max_weekly_hours", 0.0) or 0.0) + 1e-9:
+                            continue
+                        cand = Assignment(day, area, st, en, emp.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE)
+                        if not _candidate_is_hard_valid(cand, assignments):
+                            continue
+                        if any(cov.get((day, area, tt), 0) >= max_req2.get((day, area, tt), 10**9) for tt in range(st, en)):
+                            continue
+                        need_sc = _candidate_need_score(day, area, st, en, cov)
+                        tie_break = -seg_ticks
+                        if best is None or (need_sc, tie_break) > (best[0], best[1]):
+                            best = (need_sc, tie_break, day, area, st, en)
+
+        if best is None:
+            return 0.0
+
+        _need_sc, _tb, day, area, st, en = best
+        a = Assignment(day, area, st, en, emp.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE)
+        assignments.append(a)
+        seg_h = hours_between_ticks(st, en)
+        emp_hours[emp.name] = emp_hours.get(emp.name, 0.0) + seg_h
+        for tt in range(st, en):
+            cov[(day, area, tt)] = cov.get((day, area, tt), 0) + 1
+        return seg_h
+
+    # unified participation + hard-min routine
+    for nm in sorted(eligible_map.keys()):
         e = next((x for x in model.employees if x.name == nm), None)
         if e is None:
             participation_missed[nm] = "Employee record not found."
             continue
-
-        best = None
-        best_score = -1
-        min_shift_ticks = max(one_hour_ticks, int(math.ceil(max(0.0, float(getattr(e, "min_hours_per_shift", 1.0) or 1.0)) * TICKS_PER_HOUR)))
-        max_shift_ticks = int(max(0, round(float(getattr(e, "max_hours_per_shift", 8.0) or 8.0) * TICKS_PER_HOUR)))
-        if max_shift_ticks < min_shift_ticks:
-            participation_missed[nm] = "Employee min shift exceeds employee max shift; no feasible repair segment."
+        cur_h = float(emp_hours.get(nm, 0.0) or 0.0)
+        target_h = max(1.0, float(getattr(e, "hard_min_weekly_hours", 0.0) or 0.0))
+        if cur_h + 1e-9 >= target_h:
+            participation_details[nm] = {"result": "already_met", "current_hours": cur_h, "target_hours": target_h}
             continue
 
-        # Search for a feasible segment, prioritizing places that help MIN then preferred coverage.
-        for day in DAYS:
-            for area in getattr(e, "areas_allowed", []) or []:
-                area_open_t, area_close_t = area_open_close_ticks(model, area)
-                earliest_st = max(0, int(area_open_t))
-                latest_st = min(DAY_TICKS - min_shift_ticks, int(area_close_t) - min_shift_ticks)
-                if latest_st < earliest_st:
-                    continue
-                max_len_for_area = int(area_close_t) - int(area_open_t)
-                seg_ticks = min(min_shift_ticks, max_shift_ticks, max_len_for_area)
-                if seg_ticks < min_shift_ticks:
-                    continue
-                for st in range(earliest_st, latest_st + 1):
-                    en = st + seg_ticks
+        needed = target_h - cur_h
+        loops = 0
+        added_total = 0.0
+        while needed - added_total > 1e-9 and loops < 6:
+            loops += 1
+            added = _try_add_target_hours(e, needed - added_total, "hard_min", coverage)
+            if added <= 1e-9:
+                break
+            added_total += added
 
-                    # availability + hard constraints
-                    if not is_employee_available(model, e, label, day, st, en, area, clopen_min_start):
-                        continue
-                    if not respects_max_consecutive_days(assignments, e, day):
-                        continue
-                    if not respects_daily_shift_limits(assignments, e, day, extra=(st, en)):
-                        continue
-                    if _overlaps_existing(e.name, day, st, en):
-                        continue
-                    if _violates_max2(day, area, st, en):
-                        continue
-                    if not all((int(min_req2.get((day, area, tt), 0)) > 0) or (int(pref_req2.get((day, area, tt), 0)) > 0) for tt in range(st, en)):
-                        continue
+        final_h = float(emp_hours.get(nm, 0.0) or 0.0)
+        if final_h + 1e-9 < target_h:
+            reasons = []
+            if max_weekly_cap > 0.0 and float(sum(emp_hours.values())) + 0.5 - max_weekly_cap > 1e-9:
+                reasons.append("weekly labor max cap")
+            if final_h + 1e-9 >= float(getattr(e, "max_weekly_hours", 0.0) or 0.0):
+                reasons.append("employee max weekly hours")
+            if not reasons:
+                reasons.append("no feasible demand-window attach/extend slot under hard rules")
+            participation_missed[nm] = f"Could not reach hard minimum ({final_h:.1f}/{target_h:.1f}h): " + ", ".join(reasons)
+            participation_details[nm] = {"result": "shortfall", "current_hours": final_h, "target_hours": target_h, "missing_hours": max(0.0, target_h-final_h), "reasons": reasons}
+        else:
+            participation_details[nm] = {"result": "met_by_topup", "current_hours": final_h, "target_hours": target_h, "added_hours": added_total}
 
-                    seg_h = hours_between_ticks(st, en)
-                    if emp_hours.get(e.name, 0.0) + seg_h > float(getattr(e, "max_weekly_hours", 9999.0)) + 1e-9:
-                        continue
-
-                    # Maximum weekly labor cap is hard here (participation is "if feasible")
-                    if max_weekly_cap > 0.0 and (total_labor_hours_now + seg_h) - max_weekly_cap > 1e-9:
-                        continue
-
-                    candidate_assignment = Assignment(day, area, st, en, e.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE)
-                    candidate_assignments = assignments + [candidate_assignment]
-
-                    # Validate candidate schedule still respects hard rules after insertion.
-                    if not respects_max_consecutive_days(candidate_assignments, e, day):
-                        continue
-                    if any(
-                        ex.employee_name == e.name and ex.day == day and ex is not candidate_assignment
-                        and not (en <= ex.start_t or st >= ex.end_t)
-                        for ex in candidate_assignments
-                    ):
-                        continue
-                    candidate_weekly_hours = sum(
-                        hours_between_ticks(ax.start_t, ax.end_t)
-                        for ax in candidate_assignments
-                        if ax.employee_name == e.name
-                    )
-                    if candidate_weekly_hours - float(getattr(e, "max_weekly_hours", 9999.0)) > 1e-9:
-                        continue
-                    if not nd_minor_hours_feasible(model, e, day, st, en, assignments):
-                        continue
-                    if max_weekly_cap > 0.0:
-                        candidate_total_labor = sum(hours_between_ticks(ax.start_t, ax.end_t) for ax in candidate_assignments)
-                        if candidate_total_labor - max_weekly_cap > 1e-9:
-                            continue
-                    candidate_cov = count_coverage_per_tick(candidate_assignments)
-                    if any(candidate_cov.get((day, area, tt), 0) > max_req2.get((day, area, tt), 10**9) for tt in range(st, en)):
-                        continue
-
-                    sc = _segment_need_score(day, area, st, en)
-                    if sc > best_score:
-                        best_score = sc
-                        best = (day, area, st, en)
-
-        if best is None:
-            # Record miss with a helpful reason
-            if max_weekly_cap > 0.0 and total_labor_hours_now + 1.0 - max_weekly_cap > 1e-9:
-                participation_missed[nm] = "No feasible participation slot without exceeding Maximum Weekly Labor Cap."
-            else:
-                participation_missed[nm] = "No feasible participation slot found under hard constraints (availability/max staffing/daily/consecutive-day rules)."
-            continue
-
-        day, area, st, en = best
-        a = Assignment(day, area, st, en, e.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE)
-
-        # Add and update structures (coverage + hours). This segment is always >= 1 hour.
-        assignments.append(a)
-        seg_h = hours_between_ticks(st, en)
-        emp_hours[e.name] = emp_hours.get(e.name, 0.0) + seg_h
-        total_labor_hours_now += seg_h
-        for tt in range(st, en):
-            k = (day, area, tt)
-            coverage[k] = coverage.get(k, 0) + 1
-
+    # constructive weekly labor floor top-up (best effort, still hard-safe)
+    labor_floor = float(getattr(model.manager_goals, 'minimum_weekly_floor', 0.0) or 0.0)
+    floor_shortfall_hours = 0.0
+    if labor_floor > 0.0:
+        floor_loop = 0
+        while float(sum(emp_hours.values())) + 1e-9 < labor_floor and floor_loop < 32:
+            floor_loop += 1
+            remaining = labor_floor - float(sum(emp_hours.values()))
+            candidates = [e for e in model.employees if e.work_status == "Active" and bool(getattr(e, "wants_hours", True))]
+            candidates.sort(key=lambda e: float(emp_hours.get(e.name, 0.0) or 0.0))
+            progressed = False
+            for e in candidates:
+                add_h = _try_add_target_hours(e, remaining, "labor_floor", coverage)
+                if add_h > 1e-9:
+                    progressed = True
+                    break
+            if not progressed:
+                break
+        floor_shortfall_hours = max(0.0, labor_floor - float(sum(emp_hours.values())))
     # ND minor hour limits are now hard constraints during all add/mutate paths.
     # Keep a lightweight invariant check for diagnostics; this should never fire.
     if model.nd_rules.enforce:
@@ -4396,10 +4413,12 @@ def generate_schedule(model: DataModel, label: str,
                 if daily_cap is not None and h - daily_cap > 1e-9:
                     warnings.append(f"INTERNAL CHECK: ND minor daily cap violated for {e.name} on {d} ({h:.1f} > {daily_cap:.1f}).")
 
-    # participation reporting (Milestone 4)
+    # participation / hard-min reporting
     if participation_missed:
         for nm, reason in participation_missed.items():
-            warnings.append(f"Participation: could not give >=1 hr to {nm} ({reason})")
+            warnings.append(f"Participation hard-min shortfall: {nm} ({reason})")
+    if floor_shortfall_hours > 1e-9:
+        warnings.append(f"Labor floor shortfall: could not reach minimum_weekly_floor by {floor_shortfall_hours:.1f} hours under hard constraints.")
 
     total_hours = float(sum(emp_hours.values()))
     # Report Maximum Weekly Labor Cap infeasibility (Milestone 2).
@@ -4418,12 +4437,60 @@ def generate_schedule(model: DataModel, label: str,
         over = total_hours - preferred_weekly_cap
         warnings.append(f"Soft: exceeded Preferred Weekly Labor Hours Cap by {over:.1f} hours (preferred={preferred_weekly_cap:.1f}, scheduled={total_hours:.1f}).")
 
+    def _repair_engine_hard_by_removal(assigns: List[Assignment], max_iters: int = 40) -> Tuple[List[Assignment], int]:
+        working = list(assigns)
+        removed = 0
+        for _ in range(max_iters):
+            vv = evaluate_schedule_hard_rules(model, label, working, include_override_warnings=True)
+            engine_bad = [v for v in vv if (not v.is_override_allowed and v.severity == "error")]
+            if not engine_bad:
+                break
+            removable = [i for i, a in enumerate(working) if assignment_provenance(a) == ASSIGNMENT_SOURCE_ENGINE]
+            if not removable:
+                break
+            cov_now = count_coverage_per_tick(working)
+            best_idx = None
+            best_key = None
+            cur_count = len(engine_bad)
+            for i in removable[:160]:
+                a = working[i]
+                trial = working[:i] + working[i+1:]
+                t_v = evaluate_schedule_hard_rules(model, label, trial, include_override_warnings=True)
+                t_engine_bad = [v for v in t_v if (not v.is_override_allowed and v.severity == "error")]
+                support_loss = 0
+                for tt in range(int(a.start_t), int(a.end_t)):
+                    k = (a.day, a.area, int(tt))
+                    if cov_now.get(k, 0) <= min_req2.get(k, 0):
+                        support_loss += 1
+                key = (len(t_engine_bad), support_loss)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_idx = i
+            if best_idx is None:
+                break
+            if best_key is not None and best_key[0] >= cur_count:
+                break
+            working.pop(best_idx)
+            removed += 1
+        return working, removed
+
     # Final shared hard-rule validation gate before return.
     final_structured_violations = evaluate_schedule_hard_rules(model, label, assignments, include_override_warnings=True)
     engine_hard = [v for v in final_structured_violations if (not v.is_override_allowed and v.severity == "error")]
+    if engine_hard:
+        repaired_assignments, removed_ct = _repair_engine_hard_by_removal(assignments)
+        if removed_ct > 0:
+            assignments = repaired_assignments
+            emp_hours = {e.name: 0.0 for e in model.employees}
+            for a in assignments:
+                emp_hours[a.employee_name] += hours_between_ticks(a.start_t, a.end_t)
+            total_hours = float(sum(emp_hours.values()))
+            final_structured_violations = evaluate_schedule_hard_rules(model, label, assignments, include_override_warnings=True)
+            engine_hard = [v for v in final_structured_violations if (not v.is_override_allowed and v.severity == "error")]
+            warnings.append(f"Final hard-rule repair removed {removed_ct} engine assignment(s) to eliminate invalid placements.")
     override_only = [v for v in final_structured_violations if v.is_override_allowed]
     if engine_hard:
-        warnings.append(f"INFEASIBLE: final hard-rule validation found {len(engine_hard)} engine-created hard violation(s).")
+        warnings.append(f"INFEASIBLE: scenario invalid after final hard validation ({len(engine_hard)} engine hard violations remain).")
     if override_only:
         warnings.append(f"Override diagnostics: {len(override_only)} override assignment rule warning(s) retained by manager authority.")
     for v in final_structured_violations:
@@ -4432,12 +4499,12 @@ def generate_schedule(model: DataModel, label: str,
     # Explainability/Diagnostics (P2-2): store limiting factors in a structured form.
     limiting: List[str] = []
     try:
-        if min_short > 0:
-            limiting.append(f"MIN coverage shortfall: {int(min_short)} tick(s) under minimum")
-        if pref_short > 0:
-            limiting.append(f"Preferred coverage shortfall: {int(pref_short)} tick(s) under preferred")
-        if max_viol > 0:
-            limiting.append(f"Max staffing violated: {int(max_viol)} tick(s) over max")
+        if min_short2 > 0:
+            limiting.append(f"MIN coverage shortfall: {int(min_short2)} tick(s) under minimum")
+        if pref_short2 > 0:
+            limiting.append(f"Preferred coverage shortfall: {int(pref_short2)} tick(s) under preferred")
+        if max_viol2 > 0:
+            limiting.append(f"Max staffing violated: {int(max_viol2)} tick(s) over max")
     except Exception:
         pass
     try:
@@ -4448,6 +4515,8 @@ def generate_schedule(model: DataModel, label: str,
     try:
         if participation_missed:
             limiting.append(f"Participation infeasible for {len(participation_missed)} employee(s)")
+        if floor_shortfall_hours > 1e-9:
+            limiting.append(f"Labor floor shortfall: {floor_shortfall_hours:.1f}h")
     except Exception:
         pass
     try:
@@ -4458,12 +4527,14 @@ def generate_schedule(model: DataModel, label: str,
         pass
 
     diagnostics = {
-    "min_short": int(min_short) if 'min_short' in locals() else int(unfilled),
-    "pref_short": int(pref_short) if 'pref_short' in locals() else 0,
-    "max_viol": int(max_viol) if 'max_viol' in locals() else 0,
+    "min_short": int(min_short2) if 'min_short2' in locals() else int(unfilled),
+    "pref_short": int(pref_short2) if 'pref_short2' in locals() else 0,
+    "max_viol": int(max_viol2) if 'max_viol2' in locals() else 0,
     "cap_blocked_attempts": int(cap_blocked_attempts) if 'cap_blocked_attempts' in locals() else 0,
     "cap_blocked_ticks": int(cap_blocked_ticks) if 'cap_blocked_ticks' in locals() else 0,
     "participation_missed": dict(participation_missed) if 'participation_missed' in locals() else {},
+    "participation_details": dict(participation_details) if 'participation_details' in locals() else {},
+    "labor_floor_shortfall_hours": float(floor_shortfall_hours) if 'floor_shortfall_hours' in locals() else 0.0,
     "locked_hours": float(locked_hours) if 'locked_hours' in locals() else 0.0,
     "engine_hard_violations": int(len(engine_hard)) if 'engine_hard' in locals() else 0,
     "override_rule_warnings": int(len(override_only)) if 'override_only' in locals() else 0,
@@ -4479,7 +4550,8 @@ def generate_schedule(model: DataModel, label: str,
     "learned_patterns_count": int(len(learned_patterns)) if 'learned_patterns' in locals() else 0,
     "w_pattern_learning": float(w_pattern_learning) if 'w_pattern_learning' in locals() else 0.0,
 
-    "final_hard_validation_failed": bool(final_structured_violations),
+    "final_hard_validation_failed": bool(engine_hard),
+    "final_schedule_valid": bool(len(engine_hard) == 0),
     "final_hard_validation_violation_count": int(len(final_structured_violations)),
     "final_hard_validation_violations": list(final_structured_violations),
 
