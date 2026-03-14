@@ -3864,6 +3864,15 @@ def generate_schedule(model: DataModel, label: str,
     # Scarcity maps (risk protection): how many employees could cover a 1-hour segment starting at tick t
     tick_scarcity: Dict[Tuple[str,str,int], int] = {}
     emp_feasible_totals: Dict[str, int] = {e.name: 0 for e in model.employees}
+    specialty_areas: Tuple[str, ...] = ("KITCHEN", "CARWASH")
+    specialty_cross_trained: Set[str] = {
+        e.name for e in model.employees
+        if getattr(e, "work_status", "") == "Active"
+        and "CSTORE" in set(getattr(e, "areas_allowed", []) or [])
+        and any(sa in set(getattr(e, "areas_allowed", []) or []) for sa in specialty_areas)
+    }
+    specialty_reserve_hours: float = 3.0
+    specialty_peak_windows: List[Dict[str, Any]] = []
 
     if enable_risk and w_risk > 0.0:
         demand_keys = set()
@@ -3907,6 +3916,30 @@ def generate_schedule(model: DataModel, label: str,
                 except Exception:
                     continue
             emp_feasible_totals[e.name] = tot
+
+    # Step 1 diagnostics support: identify specialty peaks where demand pressure is high.
+    try:
+        specialty_peak_rows: List[Tuple[float, str, str, int, int, int]] = []
+        for (day, area, t), mn in min_req.items():
+            if area not in specialty_areas or int(mn) <= 0:
+                continue
+            feasible_count = max(1, int(tick_scarcity.get((day, area, int(t)), 0)))
+            pressure = float(mn) / float(feasible_count)
+            specialty_peak_rows.append((pressure, day, area, int(t), int(mn), feasible_count))
+        specialty_peak_rows.sort(key=lambda x: x[0], reverse=True)
+        for pressure, day, area, t, mn, feasible_count in specialty_peak_rows[:40]:
+            specialty_peak_windows.append({
+                "day": str(day),
+                "area": str(area),
+                "tick": int(t),
+                "start": tick_to_hhmm(int(t)),
+                "end": tick_to_hhmm(int(t) + 1),
+                "min_required": int(mn),
+                "feasible_employee_count": int(feasible_count),
+                "pressure": float(pressure),
+            })
+    except Exception:
+        specialty_peak_windows = []
 
 
     def add_best_segment(day: str, area: str, st: int, en: int, locked_ok: bool=False, enforce_weekly_cap: bool=True) -> bool:
@@ -3954,6 +3987,16 @@ def generate_schedule(model: DataModel, label: str,
             else:
                 current_avg_active_wants = 0.0
             pool.sort(key=lambda e: candidate_score(e, day, area, st, en), reverse=True)
+
+        # Step 2: preserve weekly-hour slack for scarce CSTORE+specialty employees while solving CSTORE demand.
+        if area == "CSTORE" and specialty_cross_trained:
+            def _slack_priority(emp: Employee) -> Tuple[int, float]:
+                curr_h = float(emp_hours.get(emp.name, 0.0) or 0.0)
+                max_h = float(getattr(emp, "max_weekly_hours", 0.0) or 0.0)
+                remaining = max(0.0, max_h - curr_h)
+                reserve_block = 1 if (emp.name in specialty_cross_trained and remaining <= (specialty_reserve_hours + 1.0)) else 0
+                return (reserve_block, curr_h)
+            pool.sort(key=_slack_priority)
 
         for e in pool[:50]:
             within = can_place_segment_within_envelope(e.name, day, st, en, envelopes_by_emp_day)
@@ -4060,6 +4103,66 @@ def generate_schedule(model: DataModel, label: str,
     )
 
     uncovered_min_by_area = recompute_uncovered_maps_incremental()
+
+    def _build_contiguous_deficit_windows(area: str, min_need_ticks: int = 2) -> List[Tuple[str, int, int, int]]:
+        windows: List[Tuple[str, int, int, int]] = []
+        for day in DAYS:
+            t = 0
+            while t < DAY_TICKS:
+                key = (day, area, int(t))
+                deficit = int(min_req.get(key, 0) - coverage.get(key, 0))
+                if deficit <= 0:
+                    t += 1
+                    continue
+                st = int(t)
+                total_deficit = 0
+                while t < DAY_TICKS:
+                    dk = (day, area, int(t))
+                    d = int(min_req.get(dk, 0) - coverage.get(dk, 0))
+                    if d <= 0:
+                        break
+                    total_deficit += int(d)
+                    t += 1
+                en = int(t)
+                if (en - st) >= int(min_need_ticks):
+                    windows.append((day, st, en, total_deficit))
+            t += 1
+        windows.sort(key=lambda w: (int(w[3]), int(w[2] - w[1])), reverse=True)
+        return windows
+
+    def _targeted_late_micro_fill() -> Dict[str, int]:
+        stats = {"window_attempts": 0, "adds_extend": 0, "adds_open": 0}
+        for area in ("KITCHEN", "CARWASH", "CSTORE"):
+            min_window = 2 if area != "CSTORE" else 3
+            windows = _build_contiguous_deficit_windows(area, min_need_ticks=min_window)
+            for (day, wst, wen, _demand) in windows[:80]:
+                local_progress = True
+                while local_progress:
+                    local_progress = False
+                    for L in (6, 4, 2):
+                        if L == 2 and area == "CSTORE":
+                            continue
+                        for st in range(int(wst), max(int(wst), int(wen) - int(L)) + 1):
+                            en = int(st) + int(L)
+                            if en > int(wen):
+                                continue
+                            need_ticks = sum(1 for tt in range(int(st), int(en)) if coverage.get((day, area, int(tt)), 0) < min_req.get((day, area, int(tt)), 0))
+                            if need_ticks < max(2, int(L // 2)):
+                                continue
+                            stats["window_attempts"] += 1
+                            if open_or_extend_master_envelope(day, area, st, en, only_within_existing=True, enforce_weekly_cap=True, prefer_underutilized=(area == "CSTORE")):
+                                local_progress = True
+                                stats["adds_extend"] += 1
+                                break
+                            if open_or_extend_master_envelope(day, area, st, en, only_within_existing=False, enforce_weekly_cap=True, prefer_underutilized=(area == "CSTORE")):
+                                local_progress = True
+                                stats["adds_open"] += 1
+                                break
+                        if local_progress:
+                            break
+                # Recompute to keep ranking fresh after each window.
+                windows = _build_contiguous_deficit_windows(area, min_need_ticks=min_window)
+        return stats
 
 
     # If Maximum Weekly Labor Cap is enabled, enforce it during MIN fill.
@@ -4197,6 +4300,9 @@ def generate_schedule(model: DataModel, label: str,
             if short_growth_progress:
                 break
 
+    # Step 3: late targeted micro-fill of highest-shortfall contiguous windows, prioritizing specialty areas.
+    late_micro_fill_stats = _targeted_late_micro_fill()
+
     # Stage-4 checkpoint: run one broad legality check after constructive fill.
     constructive_checkpoint_violations = _engine_hard_violations(assignments)
     if constructive_checkpoint_violations:
@@ -4205,6 +4311,7 @@ def generate_schedule(model: DataModel, label: str,
         phase_diagnostics["phase6_targeted_final_repair"] = {
             "constructive_checkpoint_engine_hard": int(len(constructive_checkpoint_violations)),
             "envelope_consistency": validate_master_envelope_consistency(assignments),
+            "late_micro_fill": dict(late_micro_fill_stats) if 'late_micro_fill_stats' in locals() else {},
         }
 
     # Compute shortfalls for reporting/scoring
@@ -5041,6 +5148,12 @@ def generate_schedule(model: DataModel, label: str,
     "phase_diagnostics": dict(phase_diagnostics) if 'phase_diagnostics' in locals() else {},
     "uncovered_min_by_area": {k: int(len(v)) for k, v in (uncovered_min_by_area.items() if 'uncovered_min_by_area' in locals() else [])},
     "master_envelope_consistency": validate_master_envelope_consistency(assignments),
+    "specialty_peak_windows": list(specialty_peak_windows) if 'specialty_peak_windows' in locals() else [],
+    "specialty_cross_trained": sorted(list(specialty_cross_trained)) if 'specialty_cross_trained' in locals() else [],
+    "specialty_weekly_slack_hours": {
+        str(name): float(max(0.0, float(getattr(emp_by_name.get(name), "max_weekly_hours", 0.0) or 0.0) - float(emp_hours.get(name, 0.0) or 0.0)))
+        for name in sorted(list(specialty_cross_trained))
+    } if 'specialty_cross_trained' in locals() else {},
 
     "limiting_factors": list(limiting),
     "limiting_factors_structured": list(limiting_structured),
