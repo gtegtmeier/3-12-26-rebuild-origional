@@ -32,6 +32,10 @@ import tkinter.font as tkfont
 # ---- Build/version ----
 APP_VERSION = 'V3.5 PHASE5_E3_EMPLOYEE_FIT'
 
+ASSIGNMENT_SOURCE_ENGINE = "engine_created"
+ASSIGNMENT_SOURCE_FIXED_LOCKED = "fixed_locked_override"
+ASSIGNMENT_SOURCE_MANUAL = "manual_override"
+
 def _app_dir() -> str:
     try:
         if getattr(sys, 'frozen', False):
@@ -569,7 +573,8 @@ class Employee:
     max_hours_per_shift: float = 8.0            # per-employee cap; may be raised if double_shifts_ok
     max_shifts_per_day: int = 1                 # contiguous work blocks/day (area changes w/o break count as same shift)
     max_weekly_hours: float = 30.0
-    target_min_hours: float = 0.0               # optional
+    target_min_hours: float = 0.0               # soft preference
+    hard_min_weekly_hours: float = 0.0          # hard participation floor (if feasible)
     minor_type: str = "ADULT"                   # ADULT / MINOR_14_15 / MINOR_16_17
 
     areas_allowed: List[str] = field(default_factory=lambda: ["CSTORE"])
@@ -610,7 +615,7 @@ class Assignment:
     end_t: int
     employee_name: str
     locked: bool = False
-    source: str = "solver"   # solver / fixed_locked / fixed_prefer
+    source: str = ASSIGNMENT_SOURCE_ENGINE
 
 @dataclass
 class ScheduleSummary:
@@ -704,6 +709,7 @@ class ManagerGoals:
     # maximum_weekly_cap: hard cap (0 = disabled) — enforced starting Milestone 2
     preferred_weekly_cap: float = 0.0
     maximum_weekly_cap: float = 0.0
+    minimum_weekly_floor: float = 0.0              # desired labor floor (best-effort)
 
 
     # --- Milestone 6: Scoring weights (soft penalties) ---
@@ -826,6 +832,7 @@ def ser_employee(e: Employee) -> dict:
         "max_shifts_per_day": int(getattr(e, "max_shifts_per_day", 1)),
         "max_weekly_hours": float(e.max_weekly_hours),
         "target_min_hours": float(e.target_min_hours),
+        "hard_min_weekly_hours": float(getattr(e, "hard_min_weekly_hours", 0.0)),
         "minor_type": e.minor_type,
         "areas_allowed": list(e.areas_allowed),
         "preferred_areas": list(e.preferred_areas),
@@ -928,6 +935,7 @@ def des_employee(d: dict) -> Employee:
         max_shifts_per_day=max_shifts_day,
         max_weekly_hours=float(d.get("max_weekly_hours", 30.0)),
         target_min_hours=float(d.get("target_min_hours", 0.0)),
+        hard_min_weekly_hours=float(d.get("hard_min_weekly_hours", d.get("min_weekly_hours", 0.0)) or 0.0),
         minor_type=mt,
         areas_allowed=areas,
         preferred_areas=pref_areas,
@@ -986,17 +994,33 @@ def des_req(d: dict) -> RequirementBlock:
     )
 
 def ser_assignment(a: Assignment) -> dict:
-    return asdict(a)
+    out = asdict(a)
+    out["source"] = assignment_provenance(a)
+    return out
+
+def _normalize_assignment_source(source: str, locked: bool = False) -> str:
+    s = str(source or "").strip().lower()
+    if s in {ASSIGNMENT_SOURCE_ENGINE, "solver", "participation", "weak_area_improve", "prev", "final", "repair"}:
+        return ASSIGNMENT_SOURCE_ENGINE
+    if s in {ASSIGNMENT_SOURCE_MANUAL, "manual_edit"}:
+        return ASSIGNMENT_SOURCE_MANUAL
+    if locked or s in {ASSIGNMENT_SOURCE_FIXED_LOCKED, "locked", "recurring_locked", "fixed_locked", "fixed_prefer"}:
+        return ASSIGNMENT_SOURCE_FIXED_LOCKED
+    return ASSIGNMENT_SOURCE_ENGINE
+
+def assignment_provenance(a: Assignment) -> str:
+    return _normalize_assignment_source(getattr(a, "source", ASSIGNMENT_SOURCE_ENGINE), bool(getattr(a, "locked", False)))
 
 def des_assignment(d: dict) -> Assignment:
+    locked = bool(d.get("locked", False))
     return Assignment(
         day=str(d.get("day", "Sun")),
         area=str(d.get("area", "CSTORE")),
         start_t=int(d.get("start_t", 0)),
         end_t=int(d.get("end_t", 0)),
         employee_name=str(d.get("employee_name", "")).strip(),
-        locked=bool(d.get("locked", False)),
-        source=str(d.get("source", "solver") or "solver"),
+        locked=locked,
+        source=_normalize_assignment_source(str(d.get("source", ASSIGNMENT_SOURCE_ENGINE) or ASSIGNMENT_SOURCE_ENGINE), locked),
     )
 
 def ser_summary(s: ScheduleSummary) -> dict:
@@ -1090,6 +1114,8 @@ def load_data(path: str) -> DataModel:
     # Ensure new field exists (0 = disabled)
     if "maximum_weekly_cap" not in mg:
         mg["maximum_weekly_cap"] = 0.0
+    if "minimum_weekly_floor" not in mg:
+        mg["minimum_weekly_floor"] = 0.0
     # P2-3 stability defaults
     if "enable_schedule_stability" not in mg:
         mg["enable_schedule_stability"] = True
@@ -1941,121 +1967,126 @@ def respects_max_consecutive_days(assigns: List[Assignment], e: Employee, day: s
     return maxrun <= lim
 
 
-def validate_final_schedule_hard(model: DataModel, label: str, assignments: List[Assignment]) -> List[str]:
-    """Strict hard-rule validation for the final schedule returned by generate_schedule()."""
-    violations: List[str] = []
-    emp_by_name: Dict[str, Employee] = {e.name: e for e in getattr(model, "employees", []) or []}
-    by_emp: Dict[str, List[Assignment]] = {}
-    for a in assignments or []:
-        by_emp.setdefault(a.employee_name, []).append(a)
+@dataclass
+class HardRuleViolation:
+    code: str
+    message: str
+    severity: str = "error"
+    employee_name: str = ""
+    day: str = ""
+    assignment_source: str = ASSIGNMENT_SOURCE_ENGINE
+    assignment_index: int = -1
+    is_override_allowed: bool = False
 
-    # Per-employee hard checks (availability/work status/overlap/daily limits/consecutive-day/weekly caps/minor rules).
-    for emp_name, emp_assigns in by_emp.items():
+
+def _viol_to_text(v: HardRuleViolation) -> str:
+    src = f" source={v.assignment_source}" if v.assignment_source else ""
+    who = f" employee={v.employee_name}" if v.employee_name else ""
+    day = f" day={v.day}" if v.day else ""
+    tag = "override-allowed" if v.is_override_allowed else "hard"
+    return f"{tag} rule={v.code}{who}{day}{src} {v.message}".strip()
+
+
+def evaluate_schedule_hard_rules(model: DataModel, label: str, assignments: List[Assignment], include_override_warnings: bool = True) -> List[HardRuleViolation]:
+    violations: List[HardRuleViolation] = []
+    emp_by_name: Dict[str, Employee] = {e.name: e for e in getattr(model, "employees", []) or []}
+    by_emp: Dict[str, List[Tuple[int, Assignment]]] = {}
+    for idx, a in enumerate(assignments or []):
+        by_emp.setdefault(a.employee_name, []).append((idx, a))
+
+    coverage = count_coverage_per_tick(assignments)
+    _min_req, _pref_req, max_req = build_requirement_maps(model.requirements, goals=getattr(model, 'manager_goals', None), store_info=getattr(model, "store_info", None))
+
+    for emp_name, pairs in by_emp.items():
         e = emp_by_name.get(emp_name)
         if e is None:
-            violations.append(f"employee={emp_name} rule=unknown-employee assignments={len(emp_assigns)}")
+            violations.append(HardRuleViolation(code="unknown-employee", message=f"unknown employee in assignment set ({len(pairs)} assignments)", employee_name=emp_name))
             continue
-
-        ordered = sorted(emp_assigns, key=lambda x: (DAYS.index(x.day), int(x.start_t), int(x.end_t), AREAS.index(x.area) if x.area in AREAS else 999))
-
-        for i in range(len(ordered)):
-            for j in range(i + 1, len(ordered)):
-                if ordered[i].day != ordered[j].day:
-                    break
-                if overlaps(ordered[i], ordered[j]):
-                    violations.append(
-                        f"employee={emp_name} day={ordered[i].day} rule=overlap "
-                        f"assignments={tick_to_hhmm(ordered[i].start_t)}-{tick_to_hhmm(ordered[i].end_t)} {ordered[i].area} and "
-                        f"{tick_to_hhmm(ordered[j].start_t)}-{tick_to_hhmm(ordered[j].end_t)} {ordered[j].area}"
-                    )
-
+        ordered = sorted(pairs, key=lambda x: (DAYS.index(x[1].day), int(x[1].start_t), int(x[1].end_t), AREAS.index(x[1].area) if x[1].area in AREAS else 999))
+        running: List[Assignment] = []
         clopen_min_start: Dict[Tuple[str, str], int] = {}
         weekly_hours = 0.0
         daily_hours: Dict[str, float] = {d: 0.0 for d in DAYS}
-        for a in ordered:
+
+        for idx, a in ordered:
+            prov = assignment_provenance(a)
+            is_override = prov in {ASSIGNMENT_SOURCE_FIXED_LOCKED, ASSIGNMENT_SOURCE_MANUAL}
+
+            if e.work_status != "Active":
+                violations.append(HardRuleViolation(code="active-status", message="employee is not Active", employee_name=emp_name, day=a.day, assignment_source=prov, assignment_index=idx, is_override_allowed=is_override))
+            if a.area not in e.areas_allowed:
+                violations.append(HardRuleViolation(code="allowed-area", message=f"area={a.area} not in employee allowed list", employee_name=emp_name, day=a.day, assignment_source=prov, assignment_index=idx, is_override_allowed=is_override))
             if not is_employee_available(model, e, label, a.day, int(a.start_t), int(a.end_t), a.area, clopen_min_start):
-                violations.append(
-                    f"employee={emp_name} day={a.day} rule=availability/override/blocked-time "
-                    f"assignment={tick_to_hhmm(a.start_t)}-{tick_to_hhmm(a.end_t)} {a.area}"
-                )
+                violations.append(HardRuleViolation(code="availability-window", message=f"{tick_to_hhmm(a.start_t)}-{tick_to_hhmm(a.end_t)} violates availability/override/minor-time rules", employee_name=emp_name, day=a.day, assignment_source=prov, assignment_index=idx, is_override_allowed=is_override))
+            if any(overlaps(a, prev) for prev in running if prev.employee_name == emp_name and prev.day == a.day):
+                violations.append(HardRuleViolation(code="overlap", message=f"overlap at {tick_to_hhmm(a.start_t)}-{tick_to_hhmm(a.end_t)}", employee_name=emp_name, day=a.day, assignment_source=prov, assignment_index=idx, is_override_allowed=is_override))
+
+            trial = running + [a]
+            if not respects_daily_shift_limits(trial, e, a.day):
+                violations.append(HardRuleViolation(code="daily-shift-limits", message="split/max-shifts/max-shift-length violated", employee_name=emp_name, day=a.day, assignment_source=prov, assignment_index=idx, is_override_allowed=is_override))
+            if not respects_max_consecutive_days(trial, e, a.day):
+                violations.append(HardRuleViolation(code="max-consecutive-days", message="max consecutive day limit violated", employee_name=emp_name, day=a.day, assignment_source=prov, assignment_index=idx, is_override_allowed=is_override))
+
             h = hours_between_ticks(int(a.start_t), int(a.end_t))
             weekly_hours += h
             daily_hours[a.day] += h
+            running.append(a)
             apply_clopen_from(model, e, a, clopen_min_start)
 
         for day in DAYS:
-            day_assigns = [a for a in ordered if a.day == day]
-            if not day_assigns:
+            blocks = daily_shift_blocks(running, emp_name, day)
+            if not blocks:
                 continue
-            if not respects_daily_shift_limits(ordered, e, day):
-                violations.append(f"employee={emp_name} day={day} rule=max-shifts-per-day/split-shift/max-hours-per-shift")
-            blocks = daily_shift_blocks(ordered, emp_name, day)
             min_h = float(getattr(e, "min_hours_per_shift", 1.0) or 0.0)
             mx_h = employee_allowed_max_shift_hours(e)
             for st, en in blocks:
                 block_h = hours_between_ticks(st, en)
                 if min_h > 0.0 and block_h + 1e-9 < min_h:
-                    violations.append(
-                        f"employee={emp_name} day={day} rule=min-hours-per-shift "
-                        f"block={tick_to_hhmm(st)}-{tick_to_hhmm(en)} hours={block_h:.1f} min={min_h:.1f}"
-                    )
+                    violations.append(HardRuleViolation(code="min-hours-per-shift", message=f"block {tick_to_hhmm(st)}-{tick_to_hhmm(en)} ({block_h:.1f}h) < min {min_h:.1f}h", employee_name=emp_name, day=day, assignment_source=ASSIGNMENT_SOURCE_ENGINE))
                 if block_h - mx_h > 1e-9:
-                    violations.append(
-                        f"employee={emp_name} day={day} rule=max-hours-per-shift "
-                        f"block={tick_to_hhmm(st)}-{tick_to_hhmm(en)} hours={block_h:.1f} max={mx_h:.1f}"
-                    )
-            if not respects_max_consecutive_days(ordered, e, day):
-                violations.append(f"employee={emp_name} day={day} rule=max-consecutive-days")
+                    violations.append(HardRuleViolation(code="max-hours-per-shift", message=f"block {tick_to_hhmm(st)}-{tick_to_hhmm(en)} ({block_h:.1f}h) > max {mx_h:.1f}h", employee_name=emp_name, day=day, assignment_source=ASSIGNMENT_SOURCE_ENGINE))
 
         max_weekly = float(getattr(e, "max_weekly_hours", 0.0) or 0.0)
         if max_weekly > 0.0 and (weekly_hours - max_weekly) > 1e-9:
-            violations.append(
-                f"employee={emp_name} rule=employee-max-weekly-hours scheduled={weekly_hours:.1f} max={max_weekly:.1f}"
-            )
+            violations.append(HardRuleViolation(code="employee-max-weekly-hours", message=f"scheduled={weekly_hours:.1f} max={max_weekly:.1f}", employee_name=emp_name, assignment_source=ASSIGNMENT_SOURCE_ENGINE))
+
+        hard_min_weekly = float(getattr(e, "hard_min_weekly_hours", 0.0) or 0.0)
+        if e.work_status == "Active" and bool(getattr(e, "wants_hours", True)) and hard_min_weekly > 0.0 and weekly_hours + 1e-9 < hard_min_weekly:
+            violations.append(HardRuleViolation(code="employee-hard-min-weekly-shortfall", severity="warning", message=f"scheduled={weekly_hours:.1f} min={hard_min_weekly:.1f}", employee_name=emp_name, assignment_source=ASSIGNMENT_SOURCE_ENGINE))
 
         if model.nd_rules.enforce and e.minor_type == "MINOR_14_15":
             weekly_cap = nd_minor_weekly_hour_cap(model, e)
             if weekly_cap is not None and (weekly_hours - weekly_cap) > 1e-9:
-                violations.append(
-                    f"employee={emp_name} rule=nd-minor-weekly-hours scheduled={weekly_hours:.1f} max={weekly_cap:.1f}"
-                )
+                violations.append(HardRuleViolation(code="nd-minor-weekly-hours", message=f"scheduled={weekly_hours:.1f} max={weekly_cap:.1f}", employee_name=emp_name, assignment_source=ASSIGNMENT_SOURCE_ENGINE))
             for day, day_h in daily_hours.items():
                 daily_cap = nd_minor_daily_hour_cap(model, e, day)
                 if daily_cap is not None and (day_h - daily_cap) > 1e-9:
-                    violations.append(
-                        f"employee={emp_name} day={day} rule=nd-minor-daily-hours scheduled={day_h:.1f} max={daily_cap:.1f}"
-                    )
-            ws = week_sun_from_label(label) or datetime.date.today()
-            for a in ordered:
-                ddate = day_date(ws, a.day)
-                summer = is_summer_for_minor_14_15(ddate)
-                earliest = hhmm_to_tick("07:00")
-                latest = hhmm_to_tick("21:00") if summer else hhmm_to_tick("19:00")
-                if int(a.start_t) < earliest or int(a.end_t) > latest:
-                    violations.append(
-                        f"employee={emp_name} day={a.day} rule=nd-minor-time-window "
-                        f"assignment={tick_to_hhmm(a.start_t)}-{tick_to_hhmm(a.end_t)} allowed={tick_to_hhmm(earliest)}-{tick_to_hhmm(latest)}"
-                    )
+                    violations.append(HardRuleViolation(code="nd-minor-daily-hours", message=f"scheduled={day_h:.1f} max={daily_cap:.1f}", employee_name=emp_name, day=day, assignment_source=ASSIGNMENT_SOURCE_ENGINE))
 
-    # Global caps (max staffing + weekly labor cap).
-    coverage = count_coverage_per_tick(assignments)
-    _min_req, _pref_req, max_req = build_requirement_maps(model.requirements, goals=getattr(model, 'manager_goals', None), store_info=getattr(model, "store_info", None))
     for k, cap in max_req.items():
         cov = int(coverage.get(k, 0))
         if cov > int(cap):
             day, area, tick = k
-            violations.append(
-                f"day={day} rule=max-staffing-cap area={area} tick={tick_to_hhmm(int(tick))} scheduled={cov} max={int(cap)}"
-            )
+            violations.append(HardRuleViolation(code="max-staffing-cap", message=f"area={area} tick={tick_to_hhmm(int(tick))} scheduled={cov} max={int(cap)}", day=day, assignment_source=ASSIGNMENT_SOURCE_ENGINE))
 
     total_hours = float(sum(hours_between_ticks(int(a.start_t), int(a.end_t)) for a in assignments))
     max_weekly_cap = float(getattr(model.manager_goals, 'maximum_weekly_cap', 0.0) or 0.0)
     if max_weekly_cap > 0.0 and (total_hours - max_weekly_cap) > 1e-9:
-        violations.append(
-            f"rule=maximum-weekly-labor-cap scheduled={total_hours:.1f} cap={max_weekly_cap:.1f}"
-        )
+        violations.append(HardRuleViolation(code="maximum-weekly-labor-cap", message=f"scheduled={total_hours:.1f} cap={max_weekly_cap:.1f}", assignment_source=ASSIGNMENT_SOURCE_ENGINE))
 
-    return violations
+    labor_floor = float(getattr(model.manager_goals, 'minimum_weekly_floor', 0.0) or 0.0)
+    if labor_floor > 0.0 and total_hours + 1e-9 < labor_floor:
+        violations.append(HardRuleViolation(code="minimum-weekly-labor-floor-shortfall", severity="warning", message=f"scheduled={total_hours:.1f} floor={labor_floor:.1f}", assignment_source=ASSIGNMENT_SOURCE_ENGINE))
+
+    if include_override_warnings:
+        return violations
+    return [v for v in violations if not v.is_override_allowed]
+
+
+def validate_final_schedule_hard(model: DataModel, label: str, assignments: List[Assignment]) -> List[str]:
+    """Strict hard-rule validation for the final schedule returned by generate_schedule()."""
+    violations = evaluate_schedule_hard_rules(model, label, assignments, include_override_warnings=True)
+    return [_viol_to_text(v) for v in violations]
 
 
 def schedule_score(model: DataModel, label: str,
@@ -2642,7 +2673,7 @@ def build_locked_and_prefer_from_fixed(model: DataModel, label: str) -> Tuple[Li
             if key in seen_locked:
                 continue
             seen_locked.add(key)
-            locked.append(Assignment(fs.day, fs.area, fs.start_t, fs.end_t, e.name, locked=True, source="recurring_locked"))
+            locked.append(Assignment(fs.day, fs.area, fs.start_t, fs.end_t, e.name, locked=True, source=ASSIGNMENT_SOURCE_FIXED_LOCKED))
         for fs in e.fixed_schedule:
             if fs.day not in DAYS or fs.area not in AREAS:
                 continue
@@ -2652,7 +2683,7 @@ def build_locked_and_prefer_from_fixed(model: DataModel, label: str) -> Tuple[Li
                     continue
                 seen_locked.add(key)
             a = Assignment(fs.day, fs.area, fs.start_t, fs.end_t, e.name, locked=fs.locked,
-                           source="fixed_locked" if fs.locked else "fixed_prefer")
+                           source=ASSIGNMENT_SOURCE_FIXED_LOCKED if fs.locked else ASSIGNMENT_SOURCE_FIXED_LOCKED)
             (locked if fs.locked else prefer).append(a)
     return locked, prefer
 
@@ -2708,7 +2739,7 @@ def improve_weak_areas(model: DataModel,
     def _is_protected(a: Assignment) -> bool:
         if protect_locked and bool(getattr(a, "locked", False)):
             return True
-        if protect_manual and str(getattr(a, "source", "") or "") == "manual_edit":
+        if protect_manual and assignment_provenance(a) == ASSIGNMENT_SOURCE_MANUAL:
             return True
         return False
 
@@ -2885,7 +2916,7 @@ def improve_weak_areas(model: DataModel,
                             diagnostics["rejected_moves"] += 1
                             continue
                         trial = list(current)
-                        trial.append(Assignment(day=day, area=area, start_t=st, end_t=en, employee_name=e.name, locked=False, source="weak_area_improve"))
+                        trial.append(Assignment(day=day, area=area, start_t=st, end_t=en, employee_name=e.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE))
                         t_min, t_pref, t_max, t_short, t_score = _metrics(trial)
                         min_ok = (t_min <= cur_min)
                         score_ok = (t_score <= cur_score + 1e-9)
@@ -3182,7 +3213,7 @@ def run_regression_harness(model: DataModel, label: str, assignments: Optional[L
         except Exception:
             working = []
     try:
-        protected = [a for a in working if bool(getattr(a, "locked", False)) or str(getattr(a, "source", "") or "") == "manual_edit"]
+        protected = [a for a in working if bool(getattr(a, "locked", False)) or assignment_provenance(a) == ASSIGNMENT_SOURCE_MANUAL]
         improved, diag = improve_weak_areas(model, label, working)
         prot_after = {(a.day, a.area, int(a.start_t), int(a.end_t), a.employee_name, bool(a.locked), str(a.source)) for a in improved}
         preserved = True
@@ -3331,46 +3362,35 @@ def generate_schedule(model: DataModel, label: str,
         e = emp_by_name.get(a.employee_name)
         if e is None:
             return False
-        if (not bool(getattr(e, "wants_hours", True))) and (not locked_ok):
+        if int(a.end_t) <= int(a.start_t):
             return False
-        if not is_employee_available(model, e, label, a.day, a.start_t, a.end_t, a.area, clopen_min_start):
-            return False
-        # hard max staffing cap (except locked_ok=True: allow but warn)
-        if _violates_max(a.day, a.area, a.start_t, a.end_t, cov):
-            if locked_ok:
-                warnings.append(f"Locked fixed shift violates Max staffing cap: {e.name} {a.day} {a.area} {tick_to_hhmm(a.start_t)}-{tick_to_hhmm(a.end_t)}")
-            else:
+
+        # Manager overrides are givens by design: accept and report, then work around them.
+        if not locked_ok:
+            if (not bool(getattr(e, "wants_hours", True))):
                 return False
-        # daily shift constraints
-        if not respects_daily_shift_limits(assignments, e, a.day, extra=(a.start_t, a.end_t)):
-            if locked_ok:
-                warnings.append(f"Locked fixed shift violates daily shift rules: {e.name} {a.day} {tick_to_hhmm(a.start_t)}-{tick_to_hhmm(a.end_t)}")
-            return False
-        if not respects_max_consecutive_days(assignments, e, a.day):
-            if locked_ok:
-                warnings.append(f"Locked fixed shift violates max consecutive days: {e.name} {a.day}")
-            return False
-        # overlap
-        for ex in assignments:
-            if overlaps(ex, a):
+            if not is_employee_available(model, e, label, a.day, a.start_t, a.end_t, a.area, clopen_min_start):
                 return False
+            if _violates_max(a.day, a.area, a.start_t, a.end_t, cov):
+                return False
+            if not respects_daily_shift_limits(assignments, e, a.day, extra=(a.start_t, a.end_t)):
+                return False
+            if not respects_max_consecutive_days(assignments, e, a.day):
+                return False
+            for ex in assignments:
+                if overlaps(ex, a):
+                    return False
+
         h = hours_between_ticks(a.start_t, a.end_t)
-        # Maximum Weekly Labor Hours Cap (hard unless infeasible).
-        if enforce_weekly_cap and max_weekly_cap > 0.0 and (total_labor_hours + h) - max_weekly_cap > 1e-9:
-            if locked_ok:
-                warnings.append(f"Locked fixed shift exceeds Maximum Weekly Labor Cap: {e.name} {a.day} {a.area} {tick_to_hhmm(a.start_t)}-{tick_to_hhmm(a.end_t)}")
-            else:
-                cap_blocked_attempts += 1
-                cap_blocked_ticks += int(a.end_t - a.start_t)
-                return False
-        if emp_hours[e.name] + h > e.max_weekly_hours + 1e-9:
-            if locked_ok:
-                warnings.append(f"Locked fixed shift exceeds max weekly hours: {e.name} {a.day} {tick_to_hhmm(a.start_t)}-{tick_to_hhmm(a.end_t)}")
+        if (not locked_ok) and enforce_weekly_cap and max_weekly_cap > 0.0 and (total_labor_hours + h) - max_weekly_cap > 1e-9:
+            cap_blocked_attempts += 1
+            cap_blocked_ticks += int(a.end_t - a.start_t)
             return False
-        if not nd_minor_hours_feasible(model, e, a.day, a.start_t, a.end_t, assignments):
-            if locked_ok:
-                warnings.append(f"Locked fixed shift violates ND minor hour limits: {e.name} {a.day} {tick_to_hhmm(a.start_t)}-{tick_to_hhmm(a.end_t)}")
+        if (not locked_ok) and emp_hours[e.name] + h > e.max_weekly_hours + 1e-9:
             return False
+        if (not locked_ok) and not nd_minor_hours_feasible(model, e, a.day, a.start_t, a.end_t, assignments):
+            return False
+
         assignments.append(a)
         try:
             emp_day_segments[(a.employee_name, a.day)].append((int(a.start_t), int(a.end_t), a.area))
@@ -3379,7 +3399,7 @@ def generate_schedule(model: DataModel, label: str,
 
         emp_hours[e.name] += h
         total_labor_hours += h
-        if a.locked or a.source=='locked':
+        if assignment_provenance(a) == ASSIGNMENT_SOURCE_FIXED_LOCKED:
             locked_hours += h
         apply_clopen_from(model, e, a, clopen_min_start)
         for k in _tick_keys_in(a.day, a.area, a.start_t, a.end_t):
@@ -3389,12 +3409,6 @@ def generate_schedule(model: DataModel, label: str,
     # Seed coverage with locked shifts
     coverage = {}
     for a in locked:
-        if str(getattr(a, "source", "") or "") == "recurring_locked":
-            e = emp_by_name.get(a.employee_name)
-            if e is None or e.work_status != "Active":
-                continue
-            if not is_employee_available(model, e, label, a.day, a.start_t, a.end_t, a.area, clopen_min_start):
-                continue
         if not add_assignment(a, locked_ok=True, cov=coverage):
             warnings.append(f"Locked fixed shift could not be assigned: {a.employee_name} {a.day} {a.area} {tick_to_hhmm(a.start_t)}-{tick_to_hhmm(a.end_t)}")
 
@@ -3584,31 +3598,17 @@ def generate_schedule(model: DataModel, label: str,
     def feasible_segment(e: Employee, day: str, area: str, st: int, en: int) -> bool:
         if st < 0 or en > DAY_TICKS or en <= st:
             return False
-        if area not in e.areas_allowed:
-            return False
         if not bool(getattr(e, "wants_hours", True)):
             return False
-        if not is_employee_available(model, e, label, day, st, en, area, clopen_min_start):
-            return False
-        if not respects_daily_shift_limits(assignments, e, day, extra=(st,en)):
-            return False
-        if not respects_max_consecutive_days(assignments, e, day):
-            return False
-        min_h = float(getattr(e, "min_hours_per_shift", 1.0) or 1.0)
-        if hours_between_ticks(st, en) + 1e-9 < min_h:
-            return False
-        # overlap
-        for ex in assignments:
-            if ex.employee_name==e.name and ex.day==day and not (en<=ex.start_t or st>=ex.end_t):
-                return False
-        h = hours_between_ticks(st,en)
-        if emp_hours[e.name] + h > e.max_weekly_hours + 1e-9:
-            return False
-        if not nd_minor_hours_feasible(model, e, day, st, en, assignments):
-            return False
-        # max cap per tick
+        trial_a = Assignment(day, area, st, en, e.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE)
+        trial = assignments + [trial_a]
         if _violates_max(day, area, st, en, coverage):
             return False
+        if max_weekly_cap > 0.0 and (total_labor_hours + hours_between_ticks(st, en)) - max_weekly_cap > 1e-9:
+            return False
+        for v in evaluate_schedule_hard_rules(model, label, trial, include_override_warnings=False):
+            if v.assignment_source == ASSIGNMENT_SOURCE_ENGINE and v.severity == "error":
+                return False
         return True
 
     # --- Phase 3: Coverage Risk Protection + Utilization Optimizer precomputations ---
@@ -3690,7 +3690,7 @@ def generate_schedule(model: DataModel, label: str,
         pool.sort(key=lambda e: candidate_score(e, day, area, st, en), reverse=True)
         for e in pool[:40]:
             if feasible_segment(e, day, area, st, en):
-                return add_assignment(Assignment(day, area, st, en, e.name, locked=False, source="solver"), locked_ok=locked_ok, cov=coverage, enforce_weekly_cap=enforce_weekly_cap)
+                return add_assignment(Assignment(day, area, st, en, e.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE), locked_ok=locked_ok, cov=coverage, enforce_weekly_cap=enforce_weekly_cap)
         return False
 
     # ---- Greedy fill: HARD mins first ----
@@ -3782,7 +3782,7 @@ def generate_schedule(model: DataModel, label: str,
                             need_ticks += 1
                     if not ok or need_ticks < 2:
                         continue
-                    if add_best_segment(day, area, st, en, locked_ok=False, enforce_weekly_cap=False):
+                    if add_best_segment(day, area, st, en, locked_ok=False, enforce_weekly_cap=True):
                         progress_cap = True
                         break
                 if progress_cap:
@@ -3839,7 +3839,7 @@ def generate_schedule(model: DataModel, label: str,
                 continue
             # attempt fixed employee
             if feasible_segment(e, day, area, st, en):
-                if add_assignment(Assignment(day, area, st, en, e.name, locked=False, source="participation"), locked_ok=False, cov=coverage):
+                if add_assignment(Assignment(day, area, st, en, e.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE), locked_ok=False, cov=coverage):
                     placed = True
                     break
         if not placed:
@@ -4077,7 +4077,7 @@ def generate_schedule(model: DataModel, label: str,
             for e2 in pool[:20]:
                 if feasible_add(e2, day, st, en, area, cand):
                     trial = list(cand)
-                    trial.append(Assignment(day, area, st, en, e2.name, locked=False, source="solver"))
+                    trial.append(Assignment(day, area, st, en, e2.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE))
                     if _employee_day_hard_valid(trial, e2, day):
                         if cur_quality is not None:
                             q_new = _quality_key(trial)
@@ -4112,8 +4112,8 @@ def generate_schedule(model: DataModel, label: str,
                 return cand
             if feasible_add(empB, a.day, a.start_t, a.end_t, a.area, temp_list) and feasible_add(empA, b.day, b.start_t, b.end_t, b.area, temp_list):
                 trial = list(temp_list)
-                trial.append(Assignment(a.day,a.area,a.start_t,a.end_t,empB.name,locked=False,source="solver"))
-                trial.append(Assignment(b.day,b.area,b.start_t,b.end_t,empA.name,locked=False,source="solver"))
+                trial.append(Assignment(a.day,a.area,a.start_t,a.end_t,empB.name,locked=False,source=ASSIGNMENT_SOURCE_ENGINE))
+                trial.append(Assignment(b.day,b.area,b.start_t,b.end_t,empA.name,locked=False,source=ASSIGNMENT_SOURCE_ENGINE))
                 if _employee_day_hard_valid(trial, empB, a.day) and _employee_day_hard_valid(trial, empA, b.day):
                     if cur_quality is not None:
                         q_new = _quality_key(trial)
@@ -4323,7 +4323,7 @@ def generate_schedule(model: DataModel, label: str,
                     if max_weekly_cap > 0.0 and (total_labor_hours_now + seg_h) - max_weekly_cap > 1e-9:
                         continue
 
-                    candidate_assignment = Assignment(day, area, st, en, e.name, locked=False, source="participation")
+                    candidate_assignment = Assignment(day, area, st, en, e.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE)
                     candidate_assignments = assignments + [candidate_assignment]
 
                     # Validate candidate schedule still respects hard rules after insertion.
@@ -4366,7 +4366,7 @@ def generate_schedule(model: DataModel, label: str,
             continue
 
         day, area, st, en = best
-        a = Assignment(day, area, st, en, e.name, locked=False, source="participation")
+        a = Assignment(day, area, st, en, e.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE)
 
         # Add and update structures (coverage + hours). This segment is always >= 1 hour.
         assignments.append(a)
@@ -4410,7 +4410,7 @@ def generate_schedule(model: DataModel, label: str,
         if locked_hours > 0.0 and locked_hours - max_weekly_cap > 1e-9:
             warnings.append(f"Reason: Locked fixed shifts alone total {locked_hours:.1f} hours, which already exceeds the cap.")
         if 'min_short_cap_check' in locals() and min_short_cap_check > 0:
-            warnings.append("Reason: Minimum coverage could not be met under the weekly cap; minimal overage was allowed to cover remaining MIN deficits.")
+            warnings.append("Reason: Maximum weekly labor cap blocked minimum-coverage construction; shortfall retained in diagnostics.")
         if cap_blocked_attempts > 0:
             warnings.append(f"Reason: Weekly cap blocked {cap_blocked_attempts} placement attempts during MIN construction.")
     # Report Preferred Weekly Cap overage (soft) (Milestone 5).
@@ -4418,14 +4418,16 @@ def generate_schedule(model: DataModel, label: str,
         over = total_hours - preferred_weekly_cap
         warnings.append(f"Soft: exceeded Preferred Weekly Labor Hours Cap by {over:.1f} hours (preferred={preferred_weekly_cap:.1f}, scheduled={total_hours:.1f}).")
 
-    # Phase 5: Final strict hard-rule validation gate before return.
-    final_hard_violations = validate_final_schedule_hard(model, label, assignments)
-    if final_hard_violations:
-        warnings.append(
-            f"INFEASIBLE: final hard-rule validation failed with {len(final_hard_violations)} violation(s)."
-        )
-        for msg in final_hard_violations:
-            warnings.append(f"FINAL HARD VALIDATION: {msg}")
+    # Final shared hard-rule validation gate before return.
+    final_structured_violations = evaluate_schedule_hard_rules(model, label, assignments, include_override_warnings=True)
+    engine_hard = [v for v in final_structured_violations if (not v.is_override_allowed and v.severity == "error")]
+    override_only = [v for v in final_structured_violations if v.is_override_allowed]
+    if engine_hard:
+        warnings.append(f"INFEASIBLE: final hard-rule validation found {len(engine_hard)} engine-created hard violation(s).")
+    if override_only:
+        warnings.append(f"Override diagnostics: {len(override_only)} override assignment rule warning(s) retained by manager authority.")
+    for v in final_structured_violations:
+        warnings.append(f"FINAL HARD VALIDATION: {_viol_to_text(v)}")
 
     # Explainability/Diagnostics (P2-2): store limiting factors in a structured form.
     limiting: List[str] = []
@@ -4449,7 +4451,7 @@ def generate_schedule(model: DataModel, label: str,
     except Exception:
         pass
     try:
-        locked_ct = sum(1 for a in assignments if a.locked or a.source=='locked')
+        locked_ct = sum(1 for a in assignments if assignment_provenance(a) == ASSIGNMENT_SOURCE_FIXED_LOCKED)
         if locked_ct:
             limiting.append(f"Locked shifts present: {locked_ct} assignment(s)")
     except Exception:
@@ -4463,6 +4465,8 @@ def generate_schedule(model: DataModel, label: str,
     "cap_blocked_ticks": int(cap_blocked_ticks) if 'cap_blocked_ticks' in locals() else 0,
     "participation_missed": dict(participation_missed) if 'participation_missed' in locals() else {},
     "locked_hours": float(locked_hours) if 'locked_hours' in locals() else 0.0,
+    "engine_hard_violations": int(len(engine_hard)) if 'engine_hard' in locals() else 0,
+    "override_rule_warnings": int(len(override_only)) if 'override_only' in locals() else 0,
 
     # Phase 3 toggles/weights (for debugging & explainability)
     "enable_coverage_risk_protection": bool(enable_risk) if 'enable_risk' in locals() else False,
@@ -4475,9 +4479,9 @@ def generate_schedule(model: DataModel, label: str,
     "learned_patterns_count": int(len(learned_patterns)) if 'learned_patterns' in locals() else 0,
     "w_pattern_learning": float(w_pattern_learning) if 'w_pattern_learning' in locals() else 0.0,
 
-    "final_hard_validation_failed": bool(final_hard_violations),
-    "final_hard_validation_violation_count": int(len(final_hard_violations)),
-    "final_hard_validation_violations": list(final_hard_violations),
+    "final_hard_validation_failed": bool(final_structured_violations),
+    "final_hard_validation_violation_count": int(len(final_structured_violations)),
+    "final_hard_validation_violations": list(final_structured_violations),
 
     "limiting_factors": list(limiting),
 }
@@ -5543,6 +5547,7 @@ class EmployeeDialog(tk.Toplevel):
 
         self.max_weekly_var = tk.StringVar(value=str(employee.max_weekly_hours if employee else 30))
         self.target_min_var = tk.StringVar(value=str(employee.target_min_hours if employee else 0))
+        self.hard_min_weekly_var = tk.StringVar(value=str(float(getattr(employee, "hard_min_weekly_hours", 0.0)) if employee else 0))
         self.minor_var = tk.StringVar(value=employee.minor_type if employee else "ADULT")
 
         self.avoid_clopen_var = tk.BooleanVar(value=(employee.avoid_clopens if employee else True))
@@ -5598,8 +5603,8 @@ class EmployeeDialog(tk.Toplevel):
         ttk.Radiobutton(basics, text="No", value="No", variable=self.split_ok_var).grid(row=r, column=4, sticky="w", padx=(2,8), pady=6)
         ttk.Label(basics, text="Max weekly hours:").grid(row=r, column=5, sticky="w", padx=8, pady=6)
         ttk.Entry(basics, textvariable=self.max_weekly_var, width=8).grid(row=r, column=6, sticky="w", padx=8, pady=6)
-        ttk.Label(basics, text="Max shifts/day:").grid(row=r, column=7, sticky="w", padx=8, pady=6)
-        ttk.Entry(basics, textvariable=self.max_shifts_day_var, width=6).grid(row=r, column=8, sticky="w", padx=8, pady=6)
+        ttk.Label(basics, text="Hard min weekly hrs:").grid(row=r, column=7, sticky="w", padx=8, pady=6)
+        ttk.Entry(basics, textvariable=self.hard_min_weekly_var, width=6).grid(row=r, column=8, sticky="w", padx=8, pady=6)
 
         r+=1
         ttk.Label(basics, text="Minor type:").grid(row=r, column=0, sticky="w", padx=8, pady=6)
@@ -5610,7 +5615,8 @@ class EmployeeDialog(tk.Toplevel):
         ttk.Entry(basics, textvariable=self.min_shift_var, width=6).grid(row=r, column=4, sticky="w", padx=8, pady=6)
         ttk.Label(basics, text="Max hrs/shift:").grid(row=r, column=5, sticky="w", padx=8, pady=6)
         ttk.Entry(basics, textvariable=self.max_shift_var, width=6).grid(row=r, column=6, sticky="w", padx=8, pady=6)
-        ttk.Label(basics, text="(Hard cap 8h unless Double shifts ok)").grid(row=r, column=7, columnspan=2, sticky="w", padx=8, pady=6)
+        ttk.Label(basics, text="Max shifts/day:").grid(row=r, column=7, sticky="w", padx=8, pady=6)
+        ttk.Entry(basics, textvariable=self.max_shifts_day_var, width=6).grid(row=r, column=8, sticky="w", padx=8, pady=6)
 
         areas = ttk.LabelFrame(frm, text="Areas allowed (hard)")
         areas.pack(fill="x", pady=(0,10))
@@ -5841,6 +5847,10 @@ class EmployeeDialog(tk.Toplevel):
         except Exception:
             max_week = 30.0
         try:
+            hard_min_week = float(self.hard_min_weekly_var.get().strip())
+        except Exception:
+            hard_min_week = 0.0
+        try:
             targ = float(self.target_min_var.get().strip())
         except Exception:
             targ = 0.0
@@ -5907,6 +5917,7 @@ class EmployeeDialog(tk.Toplevel):
             max_shifts_per_day=max_shifts_day,
             max_weekly_hours=max_week,
             target_min_hours=targ,
+            hard_min_weekly_hours=max(0.0, hard_min_week),
             minor_type=self.minor_var.get(),
             areas_allowed=areas,
             preferred_areas=pref,
@@ -6961,7 +6972,7 @@ class SchedulerApp(tk.Tk):
                 infeasible_alts.append((e.name, reason))
                 continue
             cand = list(minus)
-            cand.append(Assignment(day, area, st, en, e.name, locked=False, source="solver"))
+            cand.append(Assignment(day, area, st, en, e.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE))
             uf = compute_unfilled(cand)
             bd = schedule_score_breakdown(model, label, cand, uf, hist)
             feasible_alts.append((bd.get("total", 0.0), e.name, bd))
@@ -7867,39 +7878,21 @@ class SchedulerApp(tk.Tk):
                             if cleaned:
                                 issues.append(f'Could not read {page_kind} {day} for {emp}: "{raw_s}"')
                     for st, en in blocks:
-                        assigns.append(Assignment(day=day, area=area, start_t=st, end_t=en, employee_name=emp, locked=False, source='manual_edit'))
+                        assigns.append(Assignment(day=day, area=area, start_t=st, end_t=en, employee_name=emp, locked=False, source=ASSIGNMENT_SOURCE_MANUAL))
         assigns.sort(key=lambda a: (a.employee_name.lower(), DAYS.index(a.day), AREAS.index(a.area), a.start_t, a.end_t))
         return assigns, issues
 
     def _manual_validate_assignments(self, assigns: List[Assignment]) -> List[str]:
-        warnings: List[str] = []
-        emp_map = {(e.name or '').strip(): e for e in getattr(self.model, 'employees', []) or [] if (e.name or '').strip()}
-        by_emp: Dict[str, List[Assignment]] = {}
-        for a in assigns:
-            by_emp.setdefault(a.employee_name, []).append(a)
         use_label = self.current_label or self.label_var.get().strip() or self._default_week_label()
-        for emp_name, lst in by_emp.items():
-            emp = emp_map.get(emp_name)
-            if emp is None:
-                warnings.append(f'Unknown employee in manual editor: {emp_name}')
-                continue
-            running: List[Assignment] = []
-            clopen: Dict[Tuple[str,str], int] = {}
-            total_hours = 0.0
-            for a in sorted(lst, key=lambda x: (DAYS.index(x.day), x.start_t, x.end_t, AREAS.index(x.area))):
-                if any(overlaps(a, prev) for prev in running):
-                    warnings.append(f'Overlap for {emp_name} on {a.day} ({tick_to_ampm(a.start_t)}-{tick_to_ampm(a.end_t)}).')
-                if not is_employee_available(self.model, emp, use_label, a.day, a.start_t, a.end_t, a.area, clopen):
-                    warnings.append(f'Availability / time-off / minor-rule issue for {emp_name} on {a.day} in {a.area} ({tick_to_ampm(a.start_t)}-{tick_to_ampm(a.end_t)}).')
-                if not respects_daily_shift_limits(running, emp, a.day, extra=(a.start_t, a.end_t)):
-                    warnings.append(f'Daily shift rule issue for {emp_name} on {a.day}.')
-                running.append(a)
-                total_hours += hours_between_ticks(a.start_t, a.end_t)
-                apply_clopen_from(self.model, emp, a, clopen)
-            max_weekly = float(getattr(emp, 'max_weekly_hours', 0.0) or 0.0)
-            if max_weekly > 0 and total_hours - max_weekly > 1e-9:
-                warnings.append(f'{emp_name} exceeds weekly max hours ({total_hours:.1f} > {max_weekly:.1f}).')
-        cov = count_coverage_per_tick(assigns)
+        normalized: List[Assignment] = []
+        for a in assigns:
+            normalized.append(Assignment(day=a.day, area=a.area, start_t=a.start_t, end_t=a.end_t, employee_name=a.employee_name, locked=bool(getattr(a, "locked", False)), source=ASSIGNMENT_SOURCE_MANUAL))
+
+        warnings: List[str] = []
+        for v in evaluate_schedule_hard_rules(self.model, use_label, normalized, include_override_warnings=True):
+            warnings.append(_viol_to_text(v))
+
+        cov = count_coverage_per_tick(normalized)
         min_req, pref_req, max_req = build_requirement_maps(self.model.requirements, goals=getattr(self.model, 'manager_goals', None))
         min_short, pref_short, max_viol = compute_requirement_shortfalls(min_req, pref_req, max_req, cov)
         if min_short > 0:
@@ -9091,6 +9084,7 @@ class SchedulerApp(tk.Tk):
         # Caps
         self.mgr_pref_weekly_cap = tk.StringVar(value=str(getattr(goals, "preferred_weekly_cap", getattr(goals, "weekly_hours_cap", 0.0))))
         self.mgr_max_weekly_cap = tk.StringVar(value=str(getattr(goals, "maximum_weekly_cap", 0.0)))
+        self.mgr_min_weekly_floor = tk.StringVar(value=str(getattr(goals, "minimum_weekly_floor", 0.0)))
         # Demand multipliers (Phase 2 P2-5)
         self.mgr_demand_morning = tk.StringVar(value=str(getattr(goals, "demand_morning_multiplier", 1.0)))
         self.mgr_demand_midday = tk.StringVar(value=str(getattr(goals, "demand_midday_multiplier", 1.0)))
@@ -9135,6 +9129,10 @@ class SchedulerApp(tk.Tk):
             # Maximum (hard) cap (0 = disabled)
             try:
                 goals.maximum_weekly_cap = float(self.mgr_max_weekly_cap.get() or 0.0)
+            except Exception:
+                pass
+            try:
+                goals.minimum_weekly_floor = float(self.mgr_min_weekly_floor.get() or 0.0)
             except Exception:
                 pass
 
@@ -9244,7 +9242,7 @@ class SchedulerApp(tk.Tk):
                 pass
 
         # Auto-apply on edits
-        for v in (self.mgr_cov_goal, self.mgr_daily_over, self.mgr_pref_weekly_cap, self.mgr_max_weekly_cap, self.mgr_demand_morning, self.mgr_demand_midday, self.mgr_demand_evening, self.mgr_w_risk, self.mgr_w_new_emp, self.mgr_w_frag, self.mgr_w_extend, self.mgr_call_depth):
+        for v in (self.mgr_cov_goal, self.mgr_daily_over, self.mgr_pref_weekly_cap, self.mgr_max_weekly_cap, self.mgr_min_weekly_floor, self.mgr_demand_morning, self.mgr_demand_midday, self.mgr_demand_evening, self.mgr_w_risk, self.mgr_w_new_emp, self.mgr_w_frag, self.mgr_w_extend, self.mgr_call_depth):
             try:
                 v.trace_add("write", _apply_vars)
             except Exception:
