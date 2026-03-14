@@ -8865,13 +8865,42 @@ class SchedulerApp(tk.Tk):
     def _build_generate_tab(self):
         frm = ttk.Frame(self.tab_gen); frm.pack(fill="both", expand=True, padx=12, pady=12)
 
-        top = ttk.Frame(frm); top.pack(fill="x", pady=(0,10))
-        ttk.Button(top, text="Generate Schedule", command=self.on_generate).pack(side="left")
-        ttk.Button(top, text="Save to History", command=self.save_to_history).pack(side="left", padx=8)
-        ttk.Label(top, text="Week Label:").pack(side="left", padx=(18,6))
+        ttk.Label(
+            frm,
+            text="Schedule Workspace: Generate the selected week, review results, and open dense tools (manual edit, compare, heatmap, call-off).",
+            style="SubHeader.TLabel",
+        ).pack(anchor="w", pady=(0, 8))
+
+        gen_box = ttk.LabelFrame(frm, text="Generate / Regenerate")
+        gen_box.pack(fill="x", pady=(0, 8))
+
+        top = ttk.Frame(gen_box); top.pack(fill="x", padx=8, pady=8)
         self.label_var = tk.StringVar(value=self.current_label)
-        ttk.Entry(top, textvariable=self.label_var, width=40).pack(side="left")
+        ttk.Label(top, text="Week Label:").pack(side="left", padx=(0,6))
+        ttk.Entry(top, textvariable=self.label_var, width=42).pack(side="left")
         ttk.Button(top, text="Set to This Week (Sun)", command=self.set_label_to_this_week).pack(side="left", padx=8)
+        ttk.Button(top, text="Generate Fresh", command=lambda: self.on_generate(mode="fresh")).pack(side="left", padx=(18, 6))
+        ttk.Button(top, text="Regenerate From Current", command=lambda: self.on_generate(mode="regenerate")).pack(side="left", padx=6)
+        ttk.Button(top, text="Save to History", command=self.save_to_history).pack(side="left", padx=6)
+
+        tools_box = ttk.LabelFrame(frm, text="Schedule Workspace Tools")
+        tools_box.pack(fill="x", pady=(0, 8))
+        trow = ttk.Frame(tools_box); trow.pack(fill="x", padx=8, pady=8)
+        ttk.Button(trow, text="Open Manual Edit (Popup)", command=self._open_manual_popup).pack(side="left", padx=(0, 8))
+        ttk.Button(trow, text="Open Coverage Heatmap (Popup)", command=self._open_heatmap_popup).pack(side="left", padx=8)
+        ttk.Button(trow, text="Run Analyzer Review (Popup)", command=self._open_analyzer_popup).pack(side="left", padx=8)
+        ttk.Button(trow, text="Compare Versions", command=lambda: self.nb.select(self.tab_changes)).pack(side="left", padx=8)
+        ttk.Button(trow, text="Call-Off Simulator", command=lambda: self.nb.select(self.tab_calloff)).pack(side="left", padx=8)
+
+        ns_box = ttk.LabelFrame(frm, text="Selected-Week No School Days")
+        ns_box.pack(fill="x", pady=(0, 8))
+        self.ws_no_school_vars = {d: tk.BooleanVar(value=False) for d in DAYS}
+        ttk.Label(ns_box, text="Uses the same selected-week exception bucket as Schedule Exceptions. No duplicate data source.").pack(anchor="w", padx=8, pady=(6,4))
+        ns_row = ttk.Frame(ns_box); ns_row.pack(fill="x", padx=8, pady=(0,8))
+        for d in DAYS:
+            ttk.Checkbutton(ns_row, text=d, variable=self.ws_no_school_vars[d], command=self._workspace_apply_no_school_days).pack(side="left", padx=(0, 10))
+        ttk.Button(ns_row, text="Sync From Week Settings", command=self._workspace_sync_no_school_days).pack(side="left", padx=(10,6))
+        self._workspace_sync_no_school_days()
 
         self.summary_lbl = ttk.Label(frm, text="", foreground="#333")
         self.summary_lbl.pack(fill="x", pady=(0,8))
@@ -9088,8 +9117,629 @@ class SchedulerApp(tk.Tk):
 
     def set_label_to_this_week(self):
         self.label_var.set(self._default_week_label())
+        try:
+            self._workspace_sync_no_school_days()
+        except Exception:
+            pass
 
-    def on_generate(self):
+    def _workspace_sync_no_school_days(self):
+        try:
+            label = self.label_var.get().strip() or self.current_label or self._default_week_label()
+            bucket = get_week_exception_bucket(self.model, label)
+            flags = _normalize_exception_day_flags(bucket.get("no_school_days", {}))
+            for d in DAYS:
+                if d in getattr(self, "ws_no_school_vars", {}):
+                    self.ws_no_school_vars[d].set(bool(flags.get(d, False)))
+        except Exception:
+            pass
+
+    def _workspace_apply_no_school_days(self):
+        try:
+            label = self.label_var.get().strip() or self.current_label or self._default_week_label()
+            bucket = get_week_exception_bucket(self.model, label)
+            bucket["no_school_days"] = {d: bool(self.ws_no_school_vars[d].get()) for d in DAYS}
+            self.autosave()
+        except Exception:
+            pass
+
+    def _open_manual_popup(self):
+        try:
+            if getattr(self, "manual_popup_win", None) is not None and self.manual_popup_win.winfo_exists():
+                self.manual_popup_win.lift()
+                self.manual_popup_win.focus_force()
+                return
+        except Exception:
+            pass
+
+        win = tk.Toplevel(self)
+        self.manual_popup_win = win
+        win.title("Manual Edit (Popup Workspace)")
+        win.geometry("1400x900")
+
+        popup_vars: Dict[str, Dict[str, Dict[str, tk.StringVar]]] = {"MAIN": {}, "KITCHEN": {}, "CARWASH": {}}
+        self.manual_popup_vars = popup_vars
+
+        ttk.Label(win, text="Smart manual editor popup. Edit printable schedule cells, analyze warnings, then apply to current schedule.", style="SubHeader.TLabel").pack(anchor="w", padx=12, pady=(10,4))
+        ttk.Label(win, text="Policy: manual edits override rules. Analyzer is advisory; no auto-fix by default.", style="Hint.TLabel").pack(anchor="w", padx=12, pady=(0,8))
+
+        top = ttk.Frame(win); top.pack(fill="x", padx=12, pady=(0,8))
+
+        def _popup_payload() -> dict:
+            return self._manual_payload_from_vars(popup_vars)
+
+        def _popup_apply_pages(pages: dict):
+            self._manual_apply_to_vars(popup_vars, pages)
+
+        def _popup_status(msg: str):
+            try:
+                popup_status_lbl.config(text=str(msg or ""))
+            except Exception:
+                pass
+
+        def _popup_warn(lines: List[str]):
+            try:
+                popup_warn_txt.delete("1.0", tk.END)
+                for ln in (lines or []):
+                    popup_warn_txt.insert(tk.END, f"{ln}\n")
+                if not lines:
+                    popup_warn_txt.insert(tk.END, "No warnings.\n")
+            except Exception:
+                pass
+
+        def _popup_load():
+            payload = self._load_manual_overrides()
+            cur_label = str(getattr(self, "current_label", "") or "")
+            stored_label = str(payload.get("label", "") or "")
+            if payload and (not cur_label or stored_label == cur_label):
+                _popup_apply_pages(payload.get("pages", {}) or {})
+                _popup_status("Loaded manual schedule edits.")
+                return
+            if not self.current_assignments:
+                messagebox.showinfo("Manual Edit", "No manual edits saved for this week and no generated schedule available yet.\n\nGenerate a schedule first, then click Load.", parent=win)
+                return
+            _popup_apply_pages(self._compute_calendar_base_texts(self.current_assignments))
+            _popup_status("Loaded popup editor from current generated schedule.")
+
+        def _popup_save():
+            self._save_manual_overrides({
+                "label": str(getattr(self, "current_label", "") or ""),
+                "saved_on": today_iso(),
+                "pages": _popup_payload(),
+            })
+            _popup_status("Saved manual schedule edits.")
+
+        def _popup_clear():
+            for kind in popup_vars:
+                for emp in popup_vars[kind]:
+                    for d in popup_vars[kind][emp]:
+                        popup_vars[kind][emp][d].set("")
+            self._save_manual_overrides({})
+            _popup_status("Cleared manual schedule edits.")
+
+        def _popup_analyze():
+            try:
+                assigns, parse_issues = self._manual_parse_pages_to_assignments_from_pages(_popup_payload())
+                warnings = parse_issues + self._manual_validate_assignments(assigns)
+                emp_hours, total_hours, filled, total_slots = calc_schedule_stats(self.model, assigns)
+                summary = [
+                    f"Manual analysis for {len(assigns)} assignments.",
+                    f"Total hours: {total_hours:.1f}",
+                    f"Coverage: {filled}/{total_slots} required 30-minute blocks filled",
+                ]
+                if emp_hours:
+                    lowest = min(emp_hours.items(), key=lambda kv: kv[1])
+                    highest = max(emp_hours.items(), key=lambda kv: kv[1])
+                    summary.append(f"Hours range: {lowest[0]} {lowest[1]:.1f} hrs → {highest[0]} {highest[1]:.1f} hrs")
+                _popup_status("Manual analysis complete.")
+                _popup_warn(summary + [""] + (warnings if warnings else ["No warnings detected."]))
+            except Exception as e:
+                messagebox.showerror("Manual Edit", f"Could not analyze popup manual edits.\n\n{e}", parent=win)
+
+        def _popup_apply():
+            try:
+                assigns, parse_issues = self._manual_parse_pages_to_assignments_from_pages(_popup_payload())
+                warnings = parse_issues + self._manual_validate_assignments(assigns)
+                if warnings:
+                    ok = messagebox.askyesno("Apply Manual Edits", "Warnings were found. Apply manual edits anyway?", parent=win)
+                    if not ok:
+                        _popup_warn(warnings)
+                        _popup_status("Manual apply canceled because warnings were found.")
+                        return
+                self.current_assignments = list(assigns)
+                self.current_emp_hours, self.current_total_hours, self.current_filled, self.current_total_slots = calc_schedule_stats(self.model, self.current_assignments)
+                self.current_warnings = list(warnings)
+                self._apply_current_schedule_to_output_views()
+                try:
+                    self._refresh_schedule_analysis()
+                except Exception:
+                    pass
+                _popup_save()
+                _popup_status("Manual edits applied to current schedule.")
+                _popup_warn(warnings if warnings else ["Manual edits applied with no warnings."])
+                self._set_status("Manual schedule edits applied to current schedule.")
+            except Exception as e:
+                messagebox.showerror("Manual Edit", f"Could not apply popup manual edits.\n\n{e}", parent=win)
+
+        ttk.Button(top, text="Load From Current / Saved", command=_popup_load).pack(side="left")
+        ttk.Button(top, text="Analyze Manual Edits", command=_popup_analyze).pack(side="left", padx=8)
+        ttk.Button(top, text="Apply To Current Schedule", command=_popup_apply).pack(side="left", padx=8)
+        ttk.Button(top, text="Save Manual Edits", command=_popup_save).pack(side="left", padx=8)
+        ttk.Button(top, text="Clear Manual Edits", command=_popup_clear).pack(side="left", padx=8)
+
+        swap = ttk.LabelFrame(win, text="Quick Swap")
+        swap.pack(fill="x", padx=12, pady=(0,8))
+        popup_swap_kind_var = tk.StringVar(value="MAIN")
+        popup_swap_day_var = tk.StringVar(value=DAYS[0])
+        popup_swap_from_var = tk.StringVar(value="")
+        popup_swap_to_var = tk.StringVar(value="")
+        ttk.Label(swap, text="Page").grid(row=0, column=0, sticky="w", padx=4, pady=6)
+        ttk.OptionMenu(swap, popup_swap_kind_var, "MAIN", "MAIN", "KITCHEN", "CARWASH").grid(row=0, column=1, sticky="w", padx=4, pady=6)
+        ttk.Label(swap, text="Day").grid(row=0, column=2, sticky="w", padx=4, pady=6)
+        ttk.OptionMenu(swap, popup_swap_day_var, DAYS[0], *DAYS).grid(row=0, column=3, sticky="w", padx=4, pady=6)
+        names = self._manual_employee_names()
+        ttk.Label(swap, text="From").grid(row=0, column=4, sticky="w", padx=4, pady=6)
+        ttk.OptionMenu(swap, popup_swap_from_var, names[0] if names else "", *(names if names else [""])).grid(row=0, column=5, sticky="w", padx=4, pady=6)
+        ttk.Label(swap, text="To").grid(row=0, column=6, sticky="w", padx=4, pady=6)
+        ttk.OptionMenu(swap, popup_swap_to_var, names[1] if len(names) > 1 else (names[0] if names else ""), *(names if names else [""])).grid(row=0, column=7, sticky="w", padx=4, pady=6)
+
+        def _popup_swap():
+            kind = popup_swap_kind_var.get() or "MAIN"
+            day = popup_swap_day_var.get() or DAYS[0]
+            src = popup_swap_from_var.get() or ""
+            dst = popup_swap_to_var.get() or ""
+            if not src or not dst or src == dst:
+                messagebox.showinfo("Quick Swap", "Pick two different employees to swap.", parent=win)
+                return
+            try:
+                a = popup_vars[kind][src][day].get()
+                b = popup_vars[kind][dst][day].get()
+                popup_vars[kind][src][day].set(b)
+                popup_vars[kind][dst][day].set(a)
+                _popup_status(f"Swapped {kind} {day}: {src} ↔ {dst}")
+            except Exception as e:
+                messagebox.showerror("Quick Swap", f"Could not swap those cells.\n\n{e}", parent=win)
+
+        ttk.Button(swap, text="Swap Cells", command=_popup_swap).grid(row=0, column=8, sticky="w", padx=(14,8), pady=6)
+
+        popup_status_lbl = ttk.Label(win, text="", foreground="#333")
+        popup_status_lbl.pack(anchor="w", padx=12, pady=(0,6))
+
+        warn_wrap = ttk.LabelFrame(win, text="Manual Edit Warnings")
+        warn_wrap.pack(fill="both", expand=False, padx=12, pady=(0,8))
+        popup_warn_txt = tk.Text(warn_wrap, height=9, wrap="word")
+        mvs = ttk.Scrollbar(warn_wrap, orient="vertical", command=popup_warn_txt.yview)
+        popup_warn_txt.configure(yscrollcommand=mvs.set)
+        popup_warn_txt.grid(row=0, column=0, sticky="nsew")
+        mvs.grid(row=0, column=1, sticky="ns")
+        warn_wrap.rowconfigure(0, weight=1)
+        warn_wrap.columnconfigure(0, weight=1)
+
+        note = ttk.Notebook(win); note.pack(fill="both", expand=True, padx=12, pady=(0,12))
+
+        def _make_scroll(parent):
+            outer = ttk.Frame(parent)
+            outer.pack(fill="both", expand=True)
+            canvas = tk.Canvas(outer, highlightthickness=0)
+            vs = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+            hs = ttk.Scrollbar(outer, orient="horizontal", command=canvas.xview)
+            canvas.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+            vs.pack(side="right", fill="y")
+            hs.pack(side="bottom", fill="x")
+            canvas.pack(side="left", fill="both", expand=True)
+            inner = ttk.Frame(canvas)
+            win_id = canvas.create_window((0,0), window=inner, anchor="nw")
+            inner.bind("<Configure>", lambda _e=None: canvas.configure(scrollregion=canvas.bbox("all")))
+            canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win_id, width=max(e.width, 980)))
+            return inner
+
+        def _build_grid(parent, kind: str):
+            inner = _make_scroll(parent)
+            ttk.Label(inner, text="Employee", style="SubHeader.TLabel").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+            for j, d in enumerate(DAYS, start=1):
+                ttk.Label(inner, text=d, style="SubHeader.TLabel").grid(row=0, column=j, sticky="n", padx=3, pady=4)
+            emps = sorted(self.model.employees, key=lambda e: (e.name or "").lower())
+            for i, e in enumerate(emps, start=1):
+                nm = (e.name or "").strip()
+                if not nm:
+                    continue
+                phone_str = (e.phone or "").strip()
+                name_line = nm + (f" - {phone_str}" if phone_str else "")
+                ttk.Label(inner, text=name_line).grid(row=i, column=0, sticky="w", padx=4, pady=2)
+                popup_vars[kind].setdefault(nm, {})
+                for j, d in enumerate(DAYS, start=1):
+                    var = tk.StringVar(value="")
+                    ent = ttk.Entry(inner, textvariable=var, width=18)
+                    ent.grid(row=i, column=j, sticky="nsew", padx=2, pady=2)
+                    popup_vars[kind][nm][d] = var
+            for j in range(0, len(DAYS)+1):
+                inner.grid_columnconfigure(j, weight=1)
+
+        for title, kind in [("Manual: Main (C-Store + hints)", "MAIN"), ("Manual: Kitchen", "KITCHEN"), ("Manual: Carwash", "CARWASH")]:
+            f = ttk.Frame(note)
+            note.add(f, text=title)
+            _build_grid(f, kind)
+
+        payload = self._load_manual_overrides()
+        cur_label = str(getattr(self, "current_label", "") or "")
+        stored_label = str(payload.get("label", "") or "")
+        if payload and (not cur_label or stored_label == cur_label):
+            _popup_apply_pages(payload.get("pages", {}) or {})
+        elif self.current_assignments:
+            _popup_apply_pages(self._compute_calendar_base_texts(self.current_assignments))
+        _popup_status("Manual editor popup ready.")
+        _popup_warn(["Analyze Manual Edits to check coverage, availability, overlaps, minors rules, and weekly hours before applying."])
+
+    def _open_heatmap_popup(self):
+        try:
+            if getattr(self, "heatmap_popup_win", None) is not None and self.heatmap_popup_win.winfo_exists():
+                self.heatmap_popup_win.lift()
+                self.heatmap_popup_win.focus_force()
+                self._refresh_heatmap_popup()
+                return
+        except Exception:
+            pass
+
+        win = tk.Toplevel(self)
+        self.heatmap_popup_win = win
+        win.title("Coverage Heatmap (Popup Workspace)")
+        win.geometry("1280x840")
+
+        ttk.Label(win, text="Coverage Risk Heatmap (read-only)", style="Header.TLabel").pack(anchor="w", padx=12, pady=(10,4))
+        ttk.Label(win, text="Shows scheduled headcount vs staffing requirements for each 30-minute block.", style="Hint.TLabel").pack(anchor="w", padx=12, pady=(0,8))
+
+        top = ttk.Frame(win); top.pack(fill="x", padx=12, pady=(0,8))
+        ttk.Label(top, text="Target:").pack(side="left")
+        self.hm_popup_target_var = tk.StringVar(value="Minimum")
+        ttk.OptionMenu(top, self.hm_popup_target_var, "Minimum", "Minimum", "Preferred").pack(side="left", padx=(6,14))
+        self.hm_popup_fragile_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top, text="Highlight fragile (1 scheduled / 1 required)", variable=self.hm_popup_fragile_var).pack(side="left")
+        ttk.Button(top, text="Refresh Heatmap", command=self._refresh_heatmap_popup).pack(side="left", padx=(14,0))
+
+        legend = ttk.Frame(win); legend.pack(fill="x", padx=12, pady=(0,8))
+        ttk.Label(legend, text="Legend:", style="SubHeader.TLabel").pack(side="left")
+        self._legend_chip(legend, "Red: scheduled < minimum", "#ff6b6b")
+        self._legend_chip(legend, "Orange: scheduled == minimum and fragile", "#ffb366")
+        self._legend_chip(legend, "Green: minimum met but below preferred", "#66c266")
+        self._legend_chip(legend, "Light Green: preferred met to max", "#c9f7c9")
+        self._legend_chip(legend, "Yellow-Green: scheduled > max", "#d8f23f")
+        self._legend_chip(legend, "No requirement", "#f0f0f0")
+
+        outer = ttk.Frame(win); outer.pack(fill="both", expand=True, padx=12, pady=(0,12))
+        self.hm_popup_canvas = tk.Canvas(outer, highlightthickness=0)
+        vs = ttk.Scrollbar(outer, orient="vertical", command=self.hm_popup_canvas.yview)
+        hs = ttk.Scrollbar(outer, orient="horizontal", command=self.hm_popup_canvas.xview)
+        self.hm_popup_canvas.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        self.hm_popup_canvas.grid(row=0, column=0, sticky="nsew")
+        vs.grid(row=0, column=1, sticky="ns")
+        hs.grid(row=1, column=0, sticky="ew")
+        outer.rowconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)
+        self.hm_popup_items = []
+        self._refresh_heatmap_popup()
+
+    def _refresh_heatmap_popup(self):
+        if not hasattr(self, "hm_popup_canvas"):
+            return
+        try:
+            for it in getattr(self, "hm_popup_items", []):
+                try:
+                    self.hm_popup_canvas.delete(it)
+                except Exception:
+                    pass
+            self.hm_popup_items = []
+
+            target = (self.hm_popup_target_var.get() or "Minimum").strip()
+            assignments = list(self.current_assignments or [])
+            if not assignments:
+                try:
+                    wk = self._week_start_sunday_iso()
+                    final_path = os.path.join(_app_dir(), "data", "final_schedules", f"{wk}.json")
+                    if os.path.isfile(final_path):
+                        with open(final_path, "r", encoding="utf-8") as f:
+                            payload = json.load(f)
+                        assignments = [des_assignment(a) for a in (payload.get("assignments") or [])]
+                except Exception:
+                    pass
+            if not assignments:
+                it = self.hm_popup_canvas.create_text(20, 20, text="No schedule found yet. Generate a schedule (or lock a final schedule) and then click Refresh.", anchor="nw")
+                self.hm_popup_items.append(it)
+                self.hm_popup_canvas.configure(scrollregion=(0,0,800,200))
+                return
+
+            min_req, pref_req, max_req = build_requirement_maps(self.model.requirements, goals=getattr(self.model, "manager_goals", None))
+            cov = count_coverage_per_tick(assignments)
+            self.hm_popup_last_req_map = dict(pref_req if target.lower().startswith("pref") else min_req)
+            self.hm_popup_last_cov = dict(cov)
+            self.hm_popup_last_assignments = list(assignments)
+
+            col_groups = [(d,a) for d in DAYS for a in AREAS]
+            cell_w, cell_h, row_header_w, header_h = 74, 20, 60, 24
+            c_under, c_frag, c_mid, c_pref, c_over, c_none = "#ff6b6b", "#ffb366", "#66c266", "#c9f7c9", "#d8f23f", "#f0f0f0"
+
+            for ci, (d,a) in enumerate(col_groups):
+                x = row_header_w + ci*cell_w
+                self.hm_popup_items.append(self.hm_popup_canvas.create_rectangle(x, 0, x+cell_w, header_h, fill="#e9ecef", outline="#c9c9c9"))
+                self.hm_popup_items.append(self.hm_popup_canvas.create_text(x+cell_w/2, header_h/2, text=f"{d}\\n{a[:1]}", justify="center", font=("Segoe UI", 9)))
+
+            for tck in range(DAY_TICKS):
+                y = header_h + tck*cell_h
+                self.hm_popup_items.append(self.hm_popup_canvas.create_rectangle(0, y, row_header_w, y+cell_h, fill="#e9ecef", outline="#c9c9c9"))
+                self.hm_popup_items.append(self.hm_popup_canvas.create_text(row_header_w/2, y+cell_h/2, text=tick_to_hhmm(tck), font=("Segoe UI", 9)))
+                for ci, (d,a) in enumerate(col_groups):
+                    x = row_header_w + ci*cell_w
+                    k = (d,a,int(tck))
+                    req = int(min_req.get(k, 0)); pref_v = int(pref_req.get(k, 0)); max_v = int(max_req.get(k, 0)); sc = int(cov.get(k, 0))
+                    if req <= 0 and sc <= 0:
+                        fill = c_none; txt = ""
+                    else:
+                        if sc < req:
+                            fill = c_under
+                        elif sc == req:
+                            fill = c_frag if (bool(self.hm_popup_fragile_var.get()) and req == 1 and sc == 1) else c_mid
+                        else:
+                            if sc > max_v and max_v > 0:
+                                fill = c_over
+                            elif sc >= pref_v and pref_v > 0:
+                                fill = c_pref
+                            else:
+                                fill = c_mid
+                        txt = f"{sc}/{req}" if req > 0 else f"{sc}/0"
+                    r = self.hm_popup_canvas.create_rectangle(x, y, x+cell_w, y+cell_h, fill=fill, outline="#d0d0d0")
+                    t = self.hm_popup_canvas.create_text(x+cell_w/2, y+cell_h/2, text=txt, font=("Segoe UI", 9))
+                    self.hm_popup_canvas.tag_bind(r, "<Button-1>", lambda ev, dd=d, aa=a, tt=int(tck): self._hm_on_cell_click_popup(dd, aa, tt))
+                    self.hm_popup_canvas.tag_bind(t, "<Button-1>", lambda ev, dd=d, aa=a, tt=int(tck): self._hm_on_cell_click_popup(dd, aa, tt))
+                    self.hm_popup_items.extend([r,t])
+
+            total_w = row_header_w + len(col_groups)*cell_w + 2
+            total_h = header_h + DAY_TICKS*cell_h + 2
+            self.hm_popup_canvas.configure(scrollregion=(0,0,total_w,total_h))
+        except Exception as e:
+            messagebox.showerror("Heatmap", f"Failed to render popup heatmap:\n{e}")
+
+    def _hm_on_cell_click_popup(self, day: str, area: str, tick: int):
+        try:
+            req_map = getattr(self, "hm_popup_last_req_map", {}) or {}
+            cov = getattr(self, "hm_popup_last_cov", {}) or {}
+            assignments = getattr(self, "hm_popup_last_assignments", []) or []
+            req = int(req_map.get((day, area, int(tick)), 0))
+            sc = int(cov.get((day, area, int(tick)), 0))
+            names = []
+            for a in assignments:
+                if a.day == day and a.area == area and int(a.start_t) <= int(tick) < int(a.end_t):
+                    nm = (a.employee_name or "").strip()
+                    if nm:
+                        names.append(nm)
+            seen = set(); uniq=[]
+            for n in names:
+                if n not in seen:
+                    uniq.append(n); seen.add(n)
+            lines = [f"Required Staff: {req}", f"Scheduled Staff: {sc}", "", "Employees Working:"]
+            if uniq:
+                for n in uniq:
+                    lines.append(f"• {n}")
+            else:
+                lines.append("• (none)")
+            if req > 0 and sc < req:
+                lines += ["", f"Coverage Gap: {req-sc} additional employee(s) needed"]
+            elif req > 0 and sc > req:
+                lines += ["", f"Possible Overstaffing: +{sc-req}"]
+            messagebox.showinfo("Heatmap Detail", "\n".join(lines), parent=getattr(self, "heatmap_popup_win", None))
+        except Exception as e:
+            messagebox.showerror("Heatmap Detail", f"Failed to open popup cell detail:\n{e}", parent=getattr(self, "heatmap_popup_win", None))
+
+    def _open_generation_progress_popup(self, title: str = "Generating Schedule"):
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.transient(self)
+        win.grab_set()
+        win.geometry("520x180")
+        status = tk.StringVar(value="Starting...")
+        ttk.Label(win, textvariable=status, style="SubHeader.TLabel").pack(anchor="w", padx=14, pady=(14, 8))
+        pb = ttk.Progressbar(win, orient="horizontal", mode="determinate", maximum=100)
+        pb.pack(fill="x", padx=14, pady=(0, 6))
+        detail = tk.StringVar(value="")
+        ttk.Label(win, textvariable=detail).pack(anchor="w", padx=14)
+
+        def _update(pct: int, msg: str, det: str = ""):
+            try:
+                pb["value"] = max(0, min(100, int(pct)))
+                status.set(msg)
+                detail.set(det)
+                win.update_idletasks()
+            except Exception:
+                pass
+
+        return win, _update
+
+    def _overlay_preserved_assignments(self, regenerated: List[Assignment], preserved: List[Assignment]) -> Tuple[List[Assignment], int]:
+        kept: List[Assignment] = []
+        removed = 0
+        for a in list(regenerated or []):
+            overlap = any((a.day == p.day and a.area == p.area and not (a.end_t <= p.start_t or a.start_t >= p.end_t)) for p in (preserved or []))
+            if overlap and assignment_provenance(a) == ASSIGNMENT_SOURCE_ENGINE:
+                removed += 1
+                continue
+            kept.append(a)
+        kept.extend(copy.deepcopy(list(preserved or [])))
+        kept.sort(key=lambda x: (DAYS.index(x.day), AREAS.index(x.area), x.start_t, x.employee_name))
+        return kept, removed
+
+    def _generate_with_mode(self, mode: str = "fresh"):
+        label = self.label_var.get().strip() or self._default_week_label()
+        self.current_label = label
+        if not self.model.employees:
+            messagebox.showerror("Generate", "Add employees first.")
+            return
+        if not self.model.requirements:
+            messagebox.showerror("Generate", "Set staffing requirements first.")
+            return
+
+        progress_win, progress_update = self._open_generation_progress_popup("Regenerating Schedule" if mode == "regenerate" else "Generating Schedule")
+        preserved: List[Assignment] = []
+        try:
+            if mode == "regenerate":
+                for a in list(self.current_assignments or []):
+                    src = assignment_provenance(a)
+                    if src in {ASSIGNMENT_SOURCE_MANUAL, ASSIGNMENT_SOURCE_FIXED_LOCKED} or bool(getattr(a, "locked", False)):
+                        preserved.append(copy.deepcopy(a))
+            progress_update(8, "Preparing generation", f"Mode: {mode}")
+            self.on_generate(mode="fresh", _suppress_progress=True)
+            progress_update(72, "Applying preserve policy", f"Preserved assignments: {len(preserved)}")
+            if mode == "regenerate" and preserved:
+                self.current_assignments, removed = self._overlay_preserved_assignments(list(self.current_assignments or []), preserved)
+                self.current_emp_hours, self.current_total_hours, self.current_filled, self.current_total_slots = calc_schedule_stats(self.model, self.current_assignments)
+                extra = [f"Regenerate preserved {len(preserved)} manual/fixed-locked assignments exactly."]
+                if removed > 0:
+                    extra.append(f"Removed {removed} overlapping engine-created assignments to honor preserved work.")
+                self.current_warnings = list(self.current_warnings or []) + extra
+                self._apply_current_schedule_to_output_views()
+            progress_update(92, "Refreshing analysis")
+            try:
+                self._refresh_schedule_analysis()
+                self._refresh_change_viewer()
+            except Exception:
+                pass
+            progress_update(100, "Done")
+        finally:
+            try:
+                progress_win.grab_release()
+                progress_win.destroy()
+            except Exception:
+                pass
+
+    def _build_analyzer_findings(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        if not self.current_assignments:
+            return out
+        label = self.current_label or self.label_var.get().strip() or self._default_week_label()
+        for v in evaluate_schedule_hard_rules(self.model, label, list(self.current_assignments), include_override_warnings=True):
+            fixable = str(getattr(v, "code", "")) in {"overlap"}
+            out.append({"kind": "rule", "code": getattr(v, "code", ""), "title": _viol_to_text(v), "detail": repr(v), "fixable": fixable})
+        cov = count_coverage_per_tick(list(self.current_assignments))
+        min_req, pref_req, max_req = build_requirement_maps(self.model.requirements, goals=getattr(self.model, "manager_goals", None), store_info=getattr(self.model, "store_info", None))
+        for (day, area, tick), req in min_req.items():
+            sc = int(cov.get((day, area, tick), 0) or 0)
+            req_i = int(req or 0)
+            if req_i > sc:
+                out.append({
+                    "kind": "understaffed",
+                    "code": "understaffed",
+                    "title": f"Understaffed {day} {area} {tick_to_hhmm(int(tick))} — scheduled {sc}, min {req_i}",
+                    "detail": f"Need {req_i-sc} additional employee(s) in this 30-minute block.",
+                    "fixable": True,
+                    "day": day,
+                    "area": area,
+                    "tick": int(tick),
+                })
+        return out
+
+    def _push_fix_for_finding(self, finding: Dict[str, Any]) -> str:
+        if not self.current_assignments:
+            return "No current schedule loaded."
+        kind = str(finding.get("kind", ""))
+        label = self.current_label or self.label_var.get().strip() or self._default_week_label()
+        if kind == "understaffed":
+            day = str(finding.get("day", ""))
+            area = str(finding.get("area", ""))
+            tick = int(finding.get("tick", 0))
+            clopen = _clopen_map_from_assignments(self.model, list(self.current_assignments))
+            for e in self.model.employees:
+                if getattr(e, "work_status", "") != "Active":
+                    continue
+                if area not in getattr(e, "areas_allowed", []):
+                    continue
+                if not is_employee_available(self.model, e, label, day, tick, tick+1, area, clopen):
+                    continue
+                overlap = any(a.employee_name == e.name and a.day == day and not (a.end_t <= tick or a.start_t >= tick+1) for a in self.current_assignments)
+                if overlap:
+                    continue
+                self.current_assignments.append(Assignment(day=day, area=area, start_t=tick, end_t=tick+1, employee_name=e.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE))
+                self.current_assignments.sort(key=lambda a: (DAYS.index(a.day), AREAS.index(a.area), a.start_t, a.employee_name))
+                self.current_emp_hours, self.current_total_hours, self.current_filled, self.current_total_slots = calc_schedule_stats(self.model, self.current_assignments)
+                self._apply_current_schedule_to_output_views()
+                return f"Added {e.name} to {day} {area} {tick_to_hhmm(tick)}-{tick_to_hhmm(tick+1)}."
+            return "No safe available backup employee found for this understaffed block."
+        if kind == "rule" and str(finding.get("code", "")) == "overlap":
+            by_emp_day: Dict[Tuple[str, str], List[Tuple[int, Assignment]]] = {}
+            for idx, a in enumerate(list(self.current_assignments)):
+                by_emp_day.setdefault((a.employee_name, a.day), []).append((idx, a))
+            for (_emp, _day), rows in by_emp_day.items():
+                rows.sort(key=lambda t: (t[1].start_t, t[1].end_t))
+                for i in range(1, len(rows)):
+                    pidx, prev = rows[i-1]
+                    cidx, cur = rows[i]
+                    if int(cur.start_t) < int(prev.end_t):
+                        csrc = assignment_provenance(cur)
+                        psrc = assignment_provenance(prev)
+                        if csrc == ASSIGNMENT_SOURCE_ENGINE:
+                            del self.current_assignments[cidx]
+                            self.current_emp_hours, self.current_total_hours, self.current_filled, self.current_total_slots = calc_schedule_stats(self.model, self.current_assignments)
+                            self._apply_current_schedule_to_output_views()
+                            return "Removed one overlapping engine assignment."
+                        if psrc == ASSIGNMENT_SOURCE_ENGINE:
+                            del self.current_assignments[pidx]
+                            self.current_emp_hours, self.current_total_hours, self.current_filled, self.current_total_slots = calc_schedule_stats(self.model, self.current_assignments)
+                            self._apply_current_schedule_to_output_views()
+                            return "Removed one overlapping engine assignment."
+                        return "Overlap exists only in preserved/manual work. Leave manual entry or edit manually."
+            return "No actionable overlap found."
+        return "This finding is advisory in v1; no safe local auto-fix is available."
+
+    def _open_analyzer_popup(self):
+        findings = self._build_analyzer_findings()
+        win = tk.Toplevel(self)
+        win.title("Analyzer Findings Review")
+        win.geometry("1080x720")
+        ttk.Label(win, text="Analyzer is advisory. It does not auto-fix. Select a finding, then choose Push Fix or Leave Manual Entry.", wraplength=1020).pack(anchor="w", padx=12, pady=(10,8))
+        cols = ("Type", "Code", "Fix", "Finding")
+        tree = ttk.Treeview(win, columns=cols, show="headings", height=16)
+        for c in cols:
+            tree.heading(c, text=c)
+            tree.column(c, width=120 if c != "Finding" else 640)
+        tree.pack(fill="both", expand=False, padx=12, pady=(0,8))
+        detail = tk.Text(win, height=12, wrap="word")
+        detail.pack(fill="both", expand=True, padx=12, pady=(0,10))
+
+        for i, f in enumerate(findings):
+            tree.insert("", "end", iid=str(i), values=(f.get("kind", ""), f.get("code", ""), "Yes" if f.get("fixable") else "No", f.get("title", "")))
+
+        def _on_sel(_e=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            f = findings[int(sel[0])]
+            detail.delete("1.0", "end")
+            detail.insert("end", str(f.get("title", "")) + "\n\n")
+            detail.insert("end", str(f.get("detail", "")))
+
+        tree.bind("<<TreeviewSelect>>", _on_sel)
+        btn_row = ttk.Frame(win)
+        btn_row.pack(fill="x", padx=12, pady=(0,12))
+
+        def _push_fix():
+            sel = tree.selection()
+            if not sel:
+                return
+            msg = self._push_fix_for_finding(findings[int(sel[0])])
+            messagebox.showinfo("Push Fix", msg, parent=win)
+            refreshed = self._build_analyzer_findings()
+            findings[:] = refreshed
+            for i in tree.get_children():
+                tree.delete(i)
+            for i, f in enumerate(findings):
+                tree.insert("", "end", iid=str(i), values=(f.get("kind", ""), f.get("code", ""), "Yes" if f.get("fixable") else "No", f.get("title", "")))
+            detail.delete("1.0", "end")
+
+        def _leave_manual():
+            messagebox.showinfo("Leave Manual Entry", "Manual entry kept unchanged.", parent=win)
+
+        ttk.Button(btn_row, text="Push Fix to Schedule", command=_push_fix).pack(side="left")
+        ttk.Button(btn_row, text="Leave Manual Entry", command=_leave_manual).pack(side="left", padx=8)
+
+    def on_generate(self, mode: str = "fresh", _suppress_progress: bool = False):
+        if (mode or "fresh") != "fresh" and not _suppress_progress:
+            self._generate_with_mode(mode=mode)
+            return
         label = self.label_var.get().strip() or self._default_week_label()
         self.current_label = label
         if not self.model.employees:
@@ -9706,9 +10356,9 @@ class SchedulerApp(tk.Tk):
                 pages["CARWASH"][nm][d] = carwash  # blank if none
         return pages
 
-    def _manual_payload_from_ui(self) -> dict:
+    def _manual_payload_from_vars(self, vars_map: Dict[str, Dict[str, Dict[str, tk.StringVar]]]) -> dict:
         pages = {}
-        for kind, emp_map in (self.manual_vars or {}).items():
+        for kind, emp_map in (vars_map or {}).items():
             pages[kind] = {}
             for emp, day_map in emp_map.items():
                 pages[kind][emp] = {}
@@ -9716,17 +10366,23 @@ class SchedulerApp(tk.Tk):
                     pages[kind][emp][d] = (var.get() or "").strip()
         return pages
 
-    def _manual_apply_to_ui(self, pages: dict):
+    def _manual_payload_from_ui(self) -> dict:
+        return self._manual_payload_from_vars(getattr(self, "manual_vars", {}))
+
+    def _manual_apply_to_vars(self, vars_map: Dict[str, Dict[str, Dict[str, tk.StringVar]]], pages: dict):
         # pages expected keys MAIN/KITCHEN/CARWASH
         for kind in ["MAIN","KITCHEN","CARWASH"]:
-            if kind not in self.manual_vars:
+            if kind not in vars_map:
                 continue
             src_kind = pages.get(kind, {}) or {}
-            for emp, day_map in self.manual_vars[kind].items():
+            for emp, day_map in vars_map[kind].items():
                 src_emp = src_kind.get(emp, {}) or {}
                 for d, var in day_map.items():
                     if d in src_emp:
                         var.set(src_emp.get(d,"") or "")
+
+    def _manual_apply_to_ui(self, pages: dict):
+        self._manual_apply_to_vars(getattr(self, "manual_vars", {}), pages)
 
     def _manual_load_btn(self):
         # Prefer loading stored manual edits for the current label; otherwise load from current schedule
@@ -9861,8 +10517,7 @@ class SchedulerApp(tk.Tk):
                 notes.append(f'Could not read text: {residual}')
         return out, notes
 
-    def _manual_parse_pages_to_assignments(self) -> Tuple[List[Assignment], List[str]]:
-        pages = self._manual_payload_from_ui()
+    def _manual_parse_pages_to_assignments_from_pages(self, pages: dict) -> Tuple[List[Assignment], List[str]]:
         assigns: List[Assignment] = []
         issues: List[str] = []
         area_map = {'MAIN': 'CSTORE', 'KITCHEN': 'KITCHEN', 'CARWASH': 'CARWASH'}
@@ -9898,6 +10553,10 @@ class SchedulerApp(tk.Tk):
                         assigns.append(Assignment(day=day, area=area, start_t=st, end_t=en, employee_name=emp, locked=False, source=ASSIGNMENT_SOURCE_MANUAL))
         assigns.sort(key=lambda a: (a.employee_name.lower(), DAYS.index(a.day), AREAS.index(a.area), a.start_t, a.end_t))
         return assigns, issues
+
+    def _manual_parse_pages_to_assignments(self) -> Tuple[List[Assignment], List[str]]:
+        pages = self._manual_payload_from_ui()
+        return self._manual_parse_pages_to_assignments_from_pages(pages)
 
     def _manual_validate_assignments(self, assigns: List[Assignment]) -> List[str]:
         use_label = self.current_label or self.label_var.get().strip() or self._default_week_label()
@@ -10478,10 +11137,11 @@ class SchedulerApp(tk.Tk):
         # Legend
         legend = ttk.Frame(frm); legend.pack(fill="x", pady=(0,8))
         ttk.Label(legend, text="Legend:", style="SubHeader.TLabel").pack(side="left")
-        self._legend_chip(legend, "Understaffed", "#ffb3b3")
-        self._legend_chip(legend, "Tight (meets minimum)", "#fff2b3")
-        self._legend_chip(legend, "Fragile (1/1)", "#ffd1a3")
-        self._legend_chip(legend, "Overstaffed", "#c9f7c9")
+        self._legend_chip(legend, "Red: scheduled < minimum", "#ff6b6b")
+        self._legend_chip(legend, "Orange: scheduled == minimum and fragile", "#ffb366")
+        self._legend_chip(legend, "Green: minimum met but below preferred", "#66c266")
+        self._legend_chip(legend, "Light Green: preferred met to max", "#c9f7c9")
+        self._legend_chip(legend, "Yellow-Green: scheduled > max", "#d8f23f")
         self._legend_chip(legend, "No requirement", "#f0f0f0")
 
         # Scrollable canvas grid
@@ -10568,11 +11228,12 @@ class SchedulerApp(tk.Tk):
             row_header_w = 60
             header_h = 24
 
-            # colors
-            c_under = "#ffb3b3"
-            c_tight = "#fff2b3"
-            c_frag  = "#ffd1a3"
-            c_over  = "#c9f7c9"
+            # colors (workspace redesign semantics)
+            c_under = "#ff6b6b"      # Red: scheduled < min
+            c_frag  = "#ffb366"      # Orange: scheduled == min and fragile
+            c_mid   = "#66c266"      # Green: scheduled >= min but < preferred
+            c_pref  = "#c9f7c9"      # Light Green: scheduled >= preferred and <= max
+            c_over  = "#d8f23f"      # Yellow-Green: scheduled > max
             c_none  = "#f0f0f0"
 
             # draw header
@@ -10596,7 +11257,9 @@ class SchedulerApp(tk.Tk):
                 for ci, (d,a) in enumerate(col_groups):
                     x = x0 + ci*cell_w
                     k = (d, a, int(tck))
-                    req = int(req_map.get(k, 0))
+                    req = int(min_req.get(k, 0))
+                    pref_req_v = int(pref_req.get(k, 0))
+                    max_req_v = int(max_req.get(k, 0))
                     sc  = int(cov.get(k, 0))
 
                     if req <= 0 and sc <= 0:
@@ -10609,9 +11272,14 @@ class SchedulerApp(tk.Tk):
                             if self.hm_fragile_var.get() and req == 1 and sc == 1:
                                 fill = c_frag
                             else:
-                                fill = c_tight
+                                fill = c_mid
                         else:
-                            fill = c_over
+                            if sc > max_req_v and max_req_v > 0:
+                                fill = c_over
+                            elif sc >= pref_req_v and pref_req_v > 0:
+                                fill = c_pref
+                            else:
+                                fill = c_mid
                         txt = f"{sc}/{req}" if req>0 else f"{sc}/0"
 
                     r = self.hm_canvas.create_rectangle(x, y, x+cell_w, y+cell_h, fill=fill, outline="#d0d0d0")
