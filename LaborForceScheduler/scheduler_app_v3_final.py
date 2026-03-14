@@ -1750,6 +1750,25 @@ def build_requirement_maps(reqs: List[RequirementBlock], goals: Optional[Any] = 
     min_req: Dict[Tuple[str,str,int], int] = {}
     pref_req: Dict[Tuple[str,str,int], int] = {}
     max_req: Dict[Tuple[str,str,int], int] = {}
+    area_bounds: Dict[str, Tuple[int, int]] = {}
+    if store_info is not None:
+        # Hot-path optimization: precompute sanitized open/close ticks once per area.
+        for _area in AREAS:
+            if _area == "CSTORE":
+                op = _norm_hhmm_or_default(getattr(store_info, "cstore_open", "00:00"), "00:00")
+                cl = _norm_hhmm_or_default(getattr(store_info, "cstore_close", "24:00"), "24:00")
+            elif _area == "KITCHEN":
+                op = _norm_hhmm_or_default(getattr(store_info, "kitchen_open", "00:00"), "00:00")
+                cl = _norm_hhmm_or_default(getattr(store_info, "kitchen_close", "24:00"), "24:00")
+            else:
+                op = _norm_hhmm_or_default(getattr(store_info, "carwash_open", "00:00"), "00:00")
+                cl = _norm_hhmm_or_default(getattr(store_info, "carwash_close", "24:00"), "24:00")
+            op_t = hhmm_to_tick(op)
+            cl_t = hhmm_to_tick(cl)
+            if cl_t <= op_t:
+                area_bounds[_area] = (0, DAY_TICKS)
+            else:
+                area_bounds[_area] = (int(op_t), int(cl_t))
     for r in reqs:
         if r.day not in DAYS or r.area not in AREAS:
             continue
@@ -1760,8 +1779,8 @@ def build_requirement_maps(reqs: List[RequirementBlock], goals: Optional[Any] = 
         m_mid  = float(getattr(goals, "demand_midday_multiplier", 1.0) or 1.0) if goals is not None else 1.0
         m_eve  = float(getattr(goals, "demand_evening_multiplier", 1.0) or 1.0) if goals is not None else 1.0
         if store_info is not None:
-            tmp_model = DataModel(store_info=store_info)
-            if not is_within_area_hours(tmp_model, r.area, int(r.start_t), int(r.end_t)):
+            op_t, cl_t = area_bounds.get(r.area, (0, DAY_TICKS))
+            if int(r.start_t) < int(op_t) or int(r.end_t) > int(cl_t) or int(r.end_t) <= int(r.start_t):
                 continue
         for t in range(int(r.start_t), int(r.end_t)):
             mult = 1.0
@@ -3415,11 +3434,24 @@ def generate_schedule(model: DataModel, label: str,
     locked, prefer_fixed = build_locked_and_prefer_from_fixed(model, label)
     # Track existing day segments for utilization scoring (updated as we add assignments)
     emp_day_segments: Dict[Tuple[str,str], List[Tuple[int,int,str]]] = {}
+    emp_day_occupancy: Dict[Tuple[str,str], Set[int]] = {}
+    emp_assigned_days: Dict[str, Set[str]] = {e.name: set() for e in model.employees}
+    emp_state_version: Dict[str, int] = {e.name: 0 for e in model.employees}
+    local_feasible_cache: Dict[Tuple[str, str, str, int, int, int, int], bool] = {}
     for _e in model.employees:
         for _d in DAYS:
             emp_day_segments[(_e.name, _d)] = []
+            emp_day_occupancy[(_e.name, _d)] = set()
 
-
+    # Stage-1 run-state cache for incremental constructive checks.
+    area_bounds: Dict[str, Tuple[int, int]] = {a: area_open_close_ticks(model, a) for a in AREAS}
+    run_state: Dict[str, Any] = {
+        "requirement_maps": (min_req, pref_req, max_req),
+        "area_bounds": area_bounds,
+        "uncovered_min": {k: int(v) for k, v in min_req.items()},
+        "accepted_engine_adds": 0,
+        "checkpoint_every": 120,
+    }
 
     def _tick_keys_in(day: str, area: str, st: int, en: int):
         for t in range(int(st), int(en)):
@@ -3468,6 +3500,10 @@ def generate_schedule(model: DataModel, label: str,
         assignments.append(a)
         try:
             emp_day_segments[(a.employee_name, a.day)].append((int(a.start_t), int(a.end_t), a.area))
+            emp_assigned_days.setdefault(a.employee_name, set()).add(a.day)
+            occ = emp_day_occupancy.setdefault((a.employee_name, a.day), set())
+            for tt in range(int(a.start_t), int(a.end_t)):
+                occ.add(int(tt))
         except Exception as ex:
             _log_once('emp_day_segments_append', f"[solver] emp_day_segments append failed (likely before init): {ex}")
 
@@ -3478,6 +3514,11 @@ def generate_schedule(model: DataModel, label: str,
         apply_clopen_from(model, e, a, clopen_min_start)
         for k in _tick_keys_in(a.day, a.area, a.start_t, a.end_t):
             cov[k] = cov.get(k, 0) + 1
+            if k in run_state["uncovered_min"] and run_state["uncovered_min"][k] > 0:
+                run_state["uncovered_min"][k] -= 1
+        if not locked_ok:
+            run_state["accepted_engine_adds"] = int(run_state.get("accepted_engine_adds", 0)) + 1
+            emp_state_version[a.employee_name] = int(emp_state_version.get(a.employee_name, 0)) + 1
         return True
 
     # Seed coverage with locked shifts
@@ -3670,17 +3711,67 @@ def generate_schedule(model: DataModel, label: str,
         return score
 
     def feasible_segment(e: Employee, day: str, area: str, st: int, en: int) -> bool:
+        """Stage-2 local feasibility gate for constructive placement.
+
+        This intentionally avoids full-schedule hard-rule evaluation on every candidate.
+        Global legality remains enforced at checkpoint/final validation stages.
+        """
+        emp_ver = int(emp_state_version.get(e.name, 0))
+        clopen_gate = int(clopen_min_start.get((e.name, day), 0))
+        cache_key = (e.name, day, area, int(st), int(en), emp_ver, clopen_gate)
+        cached_local = local_feasible_cache.get(cache_key)
+        if cached_local is not None:
+            return bool(cached_local)
+
+        def _ret(v: bool) -> bool:
+            try:
+                local_feasible_cache[cache_key] = bool(v)
+            except Exception:
+                pass
+            return bool(v)
+
         if st < 0 or en > DAY_TICKS or en <= st:
-            return False
+            return _ret(False)
+        if getattr(e, "work_status", "") != "Active":
+            return _ret(False)
         if not bool(getattr(e, "wants_hours", True)):
-            return False
-        trial_a = Assignment(day, area, st, en, e.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE)
-        trial = assignments + [trial_a]
+            return _ret(False)
+        if area not in getattr(e, "areas_allowed", []):
+            return _ret(False)
+        op_t, cl_t = run_state["area_bounds"].get(area, (0, DAY_TICKS))
+        if int(st) < int(op_t) or int(en) > int(cl_t) or int(en) <= int(st):
+            return _ret(False)
+
+        seg_h = hours_between_ticks(st, en)
+        min_h = float(getattr(e, "min_hours_per_shift", 1.0) or 1.0)
+        max_h = float(employee_allowed_max_shift_hours(e) or 0.0)
+        if seg_h + 1e-9 < min_h:
+            return _ret(False)
+        if max_h > 0.0 and seg_h - max_h > 1e-9:
+            return _ret(False)
+
         if _violates_max(day, area, st, en, coverage):
-            return False
-        if max_weekly_cap > 0.0 and (total_labor_hours + hours_between_ticks(st, en)) - max_weekly_cap > 1e-9:
-            return False
-        return len(_engine_hard_violations(trial)) == 0
+            return _ret(False)
+
+        if max_weekly_cap > 0.0 and (total_labor_hours + seg_h) - max_weekly_cap > 1e-9:
+            return _ret(False)
+        if (emp_hours.get(e.name, 0.0) + seg_h) - float(getattr(e, "max_weekly_hours", 0.0) or 0.0) > 1e-9:
+            return _ret(False)
+
+        occ = emp_day_occupancy.get((e.name, day), set())
+        for tt in range(int(st), int(en)):
+            if int(tt) in occ:
+                return _ret(False)
+
+        if not is_employee_available(model, e, label, day, st, en, area, clopen_min_start):
+            return _ret(False)
+        if not respects_daily_shift_limits(assignments, e, day, extra=(st, en)):
+            return _ret(False)
+        if not respects_max_consecutive_days(assignments, e, day):
+            return _ret(False)
+        if not nd_minor_hours_feasible(model, e, day, st, en, assignments):
+            return _ret(False)
+        return _ret(True)
 
     # --- Phase 3: Coverage Risk Protection + Utilization Optimizer precomputations ---
     try:
@@ -3954,6 +4045,11 @@ def generate_schedule(model: DataModel, label: str,
                     break
             if short_growth_progress:
                 break
+
+    # Stage-4 checkpoint: run one broad legality check after constructive fill.
+    constructive_checkpoint_violations = _engine_hard_violations(assignments)
+    if constructive_checkpoint_violations:
+        warnings.append(f"Constructive checkpoint found {len(constructive_checkpoint_violations)} hard-rule issue(s); final legalization will repair or reject.")
 
     # Compute shortfalls for reporting/scoring
     min_short, pref_short, max_viol = compute_requirement_shortfalls(min_req, pref_req, max_req, coverage)
