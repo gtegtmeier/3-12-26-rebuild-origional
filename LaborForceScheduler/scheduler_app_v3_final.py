@@ -2004,6 +2004,24 @@ def evaluate_schedule_hard_rules(model: DataModel, label: str, assignments: List
     coverage = count_coverage_per_tick(assignments)
     _min_req, _pref_req, max_req = build_requirement_maps(model.requirements, goals=getattr(model, 'manager_goals', None), store_info=getattr(model, "store_info", None))
 
+    def _derived_provenance(parts: List[Assignment]) -> Tuple[str, bool]:
+        """Attribution policy for derived (block/aggregate) violations.
+
+        - If any engine-managed assignment contributes, classify as engine-managed hard.
+        - If contributors are override-only (fixed_locked/manual), classify override-allowed.
+        - For override-only contributors, prefer MANUAL when any manual edit participates.
+        """
+        provs = {assignment_provenance(a) for a in (parts or [])}
+        if not provs:
+            return ASSIGNMENT_SOURCE_ENGINE, False
+        if any(is_engine_managed_source(p) for p in provs):
+            return ASSIGNMENT_SOURCE_ENGINE, False
+        if ASSIGNMENT_SOURCE_MANUAL in provs:
+            return ASSIGNMENT_SOURCE_MANUAL, True
+        if ASSIGNMENT_SOURCE_FIXED_LOCKED in provs:
+            return ASSIGNMENT_SOURCE_FIXED_LOCKED, True
+        return ASSIGNMENT_SOURCE_ENGINE, False
+
     for emp_name, pairs in by_emp.items():
         e = emp_by_name.get(emp_name)
         if e is None:
@@ -2048,15 +2066,22 @@ def evaluate_schedule_hard_rules(model: DataModel, label: str, assignments: List
             mx_h = employee_allowed_max_shift_hours(e)
             for st, en in blocks:
                 block_h = hours_between_ticks(st, en)
+                block_parts = [
+                    x for x in running
+                    if x.employee_name == emp_name and x.day == day and not (int(en) <= int(x.start_t) or int(st) >= int(x.end_t))
+                ]
+                block_src, block_override = _derived_provenance(block_parts)
                 if min_h > 0.0 and block_h + 1e-9 < min_h:
-                    violations.append(HardRuleViolation(code="min-hours-per-shift", message=f"block {tick_to_hhmm(st)}-{tick_to_hhmm(en)} ({block_h:.1f}h) < min {min_h:.1f}h", employee_name=emp_name, day=day, assignment_source=ASSIGNMENT_SOURCE_ENGINE))
+                    violations.append(HardRuleViolation(code="min-hours-per-shift", message=f"block {tick_to_hhmm(st)}-{tick_to_hhmm(en)} ({block_h:.1f}h) < min {min_h:.1f}h", employee_name=emp_name, day=day, assignment_source=block_src, is_override_allowed=block_override))
                 if block_h - mx_h > 1e-9:
-                    violations.append(HardRuleViolation(code="max-hours-per-shift", message=f"block {tick_to_hhmm(st)}-{tick_to_hhmm(en)} ({block_h:.1f}h) > max {mx_h:.1f}h", employee_name=emp_name, day=day, assignment_source=ASSIGNMENT_SOURCE_ENGINE))
+                    violations.append(HardRuleViolation(code="max-hours-per-shift", message=f"block {tick_to_hhmm(st)}-{tick_to_hhmm(en)} ({block_h:.1f}h) > max {mx_h:.1f}h", employee_name=emp_name, day=day, assignment_source=block_src, is_override_allowed=block_override))
 
         max_weekly = float(getattr(e, "max_weekly_hours", 0.0) or 0.0)
         if max_weekly > 0.0 and (weekly_hours - max_weekly) > 1e-9:
-            violations.append(HardRuleViolation(code="employee-max-weekly-hours", message=f"scheduled={weekly_hours:.1f} max={max_weekly:.1f}", employee_name=emp_name, assignment_source=ASSIGNMENT_SOURCE_ENGINE))
+            weekly_src, weekly_override = _derived_provenance(running)
+            violations.append(HardRuleViolation(code="employee-max-weekly-hours", message=f"scheduled={weekly_hours:.1f} max={max_weekly:.1f}", employee_name=emp_name, assignment_source=weekly_src, is_override_allowed=weekly_override))
 
+        # Best-effort participation floor: warning-only signal (does not block legality).
         hard_min_weekly = float(getattr(e, "hard_min_weekly_hours", 0.0) or 0.0)
         if e.work_status == "Active" and bool(getattr(e, "wants_hours", True)) and hard_min_weekly > 0.0 and weekly_hours + 1e-9 < hard_min_weekly:
             violations.append(HardRuleViolation(code="employee-hard-min-weekly-shortfall", severity="warning", message=f"scheduled={weekly_hours:.1f} min={hard_min_weekly:.1f}", employee_name=emp_name, assignment_source=ASSIGNMENT_SOURCE_ENGINE))
@@ -2094,6 +2119,7 @@ def evaluate_schedule_hard_rules(model: DataModel, label: str, assignments: List
 
     labor_floor = float(getattr(model.manager_goals, 'minimum_weekly_floor', 0.0) or 0.0)
     if labor_floor > 0.0 and total_hours + 1e-9 < labor_floor:
+        # Best-effort planning target (warning-only): does not block legality.
         violations.append(HardRuleViolation(code="minimum-weekly-labor-floor-shortfall", severity="warning", message=f"scheduled={total_hours:.1f} floor={labor_floor:.1f}", assignment_source=ASSIGNMENT_SOURCE_ENGINE))
 
     if include_override_warnings:
