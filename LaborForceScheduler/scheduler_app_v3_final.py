@@ -1003,11 +1003,12 @@ def _normalize_assignment_source(source: str, locked: bool = False) -> str:
     s = str(source or "").strip().lower()
     if s in {ASSIGNMENT_SOURCE_ENGINE, "solver", "participation", "weak_area_improve", "prev", "final", "repair"}:
         return ASSIGNMENT_SOURCE_ENGINE
+    # Legacy "fixed_prefer" aliases map to fixed-unlocked preference semantics.
     if s in {ASSIGNMENT_SOURCE_FIXED_UNLOCKED, "fixed_unlocked", "fixed_prefer", "fixed_unlocked_preference"}:
         return ASSIGNMENT_SOURCE_FIXED_UNLOCKED
     if s in {ASSIGNMENT_SOURCE_MANUAL, "manual_edit"}:
         return ASSIGNMENT_SOURCE_MANUAL
-    if locked or s in {ASSIGNMENT_SOURCE_FIXED_LOCKED, "locked", "recurring_locked", "fixed_locked", "fixed_prefer"}:
+    if locked or s in {ASSIGNMENT_SOURCE_FIXED_LOCKED, "locked", "recurring_locked", "fixed_locked"}:
         return ASSIGNMENT_SOURCE_FIXED_LOCKED
     return ASSIGNMENT_SOURCE_ENGINE
 
@@ -2101,7 +2102,11 @@ def evaluate_schedule_hard_rules(model: DataModel, label: str, assignments: List
 
 
 def validate_final_schedule_hard(model: DataModel, label: str, assignments: List[Assignment]) -> List[str]:
-    """Strict hard-rule validation for the final schedule returned by generate_schedule()."""
+    """Strict hard-rule validation for finalized schedules.
+
+    Used by generated and manually-loaded flows; includes manager-override warnings so
+    diagnostics can distinguish override-authorized exceptions from engine hard failures.
+    """
     violations = evaluate_schedule_hard_rules(model, label, assignments, include_override_warnings=True)
     return [_viol_to_text(v) for v in violations]
 
@@ -3333,6 +3338,11 @@ def generate_schedule_multi_scenario(model: DataModel, label: str, prev_tick_map
 
 def generate_schedule(model: DataModel, label: str,
                       prev_tick_map: Optional[Dict[Tuple[str,str,int], str]] = None) -> Tuple[List[Assignment], Dict[str,float], float, List[str], int, int, int, int, Dict[str, Any]]:
+    """Primary schedule generation path.
+
+    Hard legality remains contract-driven: fast local feasibility checks are retained for performance,
+    and final legality is always gated by shared hard-rule evaluation + repair.
+    """
     warnings: List[str] = []
     assignments: List[Assignment] = []
     emp_hours: Dict[str,float] = {e.name: 0.0 for e in model.employees}
@@ -3358,6 +3368,14 @@ def generate_schedule(model: DataModel, label: str,
             _write_run_log(msg)
         except Exception:
             pass
+
+    def _engine_hard_violations(assigns: List[Assignment]) -> List[HardRuleViolation]:
+        """Return non-override hard errors attributable to engine-managed assignments only."""
+        out: List[HardRuleViolation] = []
+        for v in evaluate_schedule_hard_rules(model, label, assigns, include_override_warnings=False):
+            if v.severity == "error" and is_engine_managed_source(v.assignment_source):
+                out.append(v)
+        return out
 
 
     history_stats = history_stats_from(model)
@@ -3636,10 +3654,7 @@ def generate_schedule(model: DataModel, label: str,
             return False
         if max_weekly_cap > 0.0 and (total_labor_hours + hours_between_ticks(st, en)) - max_weekly_cap > 1e-9:
             return False
-        for v in evaluate_schedule_hard_rules(model, label, trial, include_override_warnings=False):
-            if is_engine_managed_source(v.assignment_source) and v.severity == "error":
-                return False
-        return True
+        return len(_engine_hard_violations(trial)) == 0
 
     # --- Phase 3: Coverage Risk Protection + Utilization Optimizer precomputations ---
     try:
@@ -3994,7 +4009,8 @@ def generate_schedule(model: DataModel, label: str,
             return (0.0, 0.0, 0.0)
 
     def feasible_add(emp: Employee, day: str, st: int, en: int, area: str, assigns: List[Assignment]) -> bool:
-        # availability + overlap + max hours + hard global/coverage caps
+        # Fast path for local-search proposals: keep lightweight filters here for speed,
+        # then run the shared hard-rule contract as the final authority below.
         # clopen: approximate by recomputing a simple clopen map per evaluation (fast enough at small n)
         cl: Dict[Tuple[str,str], int] = {}
         # apply existing late shifts for emp
@@ -4035,7 +4051,9 @@ def generate_schedule(model: DataModel, label: str,
             return False
         if not nd_minor_hours_feasible(model, emp, day, st, en, assigns):
             return False
-        return True
+        trial = list(assigns)
+        trial.append(Assignment(day, area, st, en, emp.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE))
+        return len(_engine_hard_violations(trial)) == 0
 
     def step(cur: List[Assignment], cur_quality: Optional[Tuple[float,float,float]] = None) -> List[Assignment]:
         if not cur:
@@ -4639,33 +4657,45 @@ def generate_schedule(model: DataModel, label: str,
     for v in final_structured_violations:
         warnings.append(f"FINAL HARD VALIDATION: {_viol_to_text(v)}")
 
-    # Explainability/Diagnostics (P2-2): store limiting factors in a structured form.
-    limiting: List[str] = []
+    # Explainability diagnostics: retain legacy text list and add normalized structured factors.
+    limiting_structured: List[Dict[str, Any]] = []
+
+    def _push_limiting_factor(kind: str, message: str, value: Optional[float] = None, unit: str = "count", severity: str = "info") -> None:
+        item: Dict[str, Any] = {
+            "kind": str(kind),
+            "message": str(message),
+            "severity": str(severity),
+            "unit": str(unit),
+        }
+        if value is not None:
+            item["value"] = float(value)
+        limiting_structured.append(item)
+
     try:
         if min_short2 > 0:
-            limiting.append(f"MIN coverage shortfall: {int(min_short2)} tick(s) under minimum")
+            _push_limiting_factor("coverage_min_shortfall", f"MIN coverage shortfall: {int(min_short2)} tick(s) under minimum", value=float(min_short2), unit="ticks", severity="warning")
         if pref_short2 > 0:
-            limiting.append(f"Preferred coverage shortfall: {int(pref_short2)} tick(s) under preferred")
+            _push_limiting_factor("coverage_pref_shortfall", f"Preferred coverage shortfall: {int(pref_short2)} tick(s) under preferred", value=float(pref_short2), unit="ticks")
         if max_viol2 > 0:
-            limiting.append(f"Max staffing violated: {int(max_viol2)} tick(s) over max")
+            _push_limiting_factor("coverage_max_violation", f"Max staffing violated: {int(max_viol2)} tick(s) over max", value=float(max_viol2), unit="ticks", severity="warning")
     except Exception:
         pass
     try:
         if max_weekly_cap > 0.0 and cap_blocked_attempts > 0:
-            limiting.append(f"Weekly cap blocked {int(cap_blocked_attempts)} placement attempts")
+            _push_limiting_factor("labor_cap_blocked_attempts", f"Weekly cap blocked {int(cap_blocked_attempts)} placement attempts", value=float(cap_blocked_attempts), unit="attempts")
     except Exception:
         pass
     try:
         if participation_missed:
-            limiting.append(f"Participation infeasible for {len(participation_missed)} employee(s)")
+            _push_limiting_factor("participation_shortfall", f"Participation infeasible for {len(participation_missed)} employee(s)", value=float(len(participation_missed)), unit="employees", severity="warning")
         if floor_shortfall_hours > 1e-9:
-            limiting.append(f"Labor floor shortfall: {floor_shortfall_hours:.1f}h")
+            _push_limiting_factor("labor_floor_shortfall", f"Labor floor shortfall: {floor_shortfall_hours:.1f}h", value=float(floor_shortfall_hours), unit="hours", severity="warning")
     except Exception:
         pass
     try:
         locked_ct = sum(1 for a in assignments if assignment_provenance(a) == ASSIGNMENT_SOURCE_FIXED_LOCKED)
         if locked_ct:
-            limiting.append(f"Locked shifts present: {locked_ct} assignment(s)")
+            _push_limiting_factor("locked_assignments_present", f"Locked shifts present: {locked_ct} assignment(s)", value=float(locked_ct), unit="assignments")
     except Exception:
         pass
     try:
@@ -4674,14 +4704,16 @@ def generate_schedule(model: DataModel, label: str,
             if e.work_status == "Active" and bool(getattr(e, "wants_hours", True)) and float(emp_hours.get(e.name, 0.0) or 0.0) <= 1e-9
         )
         if unscheduled_opted_in > 0:
-            limiting.append(f"Active opted-in employees unscheduled: {unscheduled_opted_in}")
+            _push_limiting_factor("unscheduled_active_opted_in", f"Active opted-in employees unscheduled: {unscheduled_opted_in}", value=float(unscheduled_opted_in), unit="employees")
     except Exception:
         pass
     try:
         if override_cap_conflicts:
-            limiting.append(f"Override-caused cap/conflict warnings: {len(override_cap_conflicts)}")
+            _push_limiting_factor("override_cap_conflicts", f"Override-caused cap/conflict warnings: {len(override_cap_conflicts)}", value=float(len(override_cap_conflicts)), unit="violations")
     except Exception:
         pass
+
+    limiting: List[str] = [str(x.get("message", "")).strip() for x in limiting_structured if str(x.get("message", "")).strip()]
 
     diagnostics = {
     "min_short": int(min_short2) if 'min_short2' in locals() else int(unfilled),
@@ -4694,8 +4726,11 @@ def generate_schedule(model: DataModel, label: str,
     "labor_floor_shortfall_hours": float(floor_shortfall_hours) if 'floor_shortfall_hours' in locals() else 0.0,
     "locked_hours": float(locked_hours) if 'locked_hours' in locals() else 0.0,
     "engine_hard_violations": int(len(engine_hard)) if 'engine_hard' in locals() else 0,
+    "engine_hard_violation_count": int(len(engine_hard)) if 'engine_hard' in locals() else 0,
     "override_rule_warnings": int(len(override_only)) if 'override_only' in locals() else 0,
+    "override_warning_count": int(len(override_only)) if 'override_only' in locals() else 0,
     "override_cap_conflicts": int(len(override_cap_conflicts)) if 'override_cap_conflicts' in locals() else 0,
+    "override_cap_conflict_count": int(len(override_cap_conflicts)) if 'override_cap_conflicts' in locals() else 0,
     "participation_attempt_stats": dict(participation_attempt_stats) if 'participation_attempt_stats' in locals() else {},
     "unscheduled_active_opted_in": [e.name for e in model.employees if e.work_status == "Active" and bool(getattr(e, "wants_hours", True)) and float(emp_hours.get(e.name, 0.0) or 0.0) <= 1e-9],
     "repair_stats": dict(repair_stats) if 'repair_stats' in locals() else {},
@@ -4715,8 +4750,11 @@ def generate_schedule(model: DataModel, label: str,
     "final_schedule_valid": bool(len(engine_hard) == 0),
     "final_hard_validation_violation_count": int(len(final_structured_violations)),
     "final_hard_validation_violations": list(final_structured_violations),
+    "hard_rule_violations": list(final_structured_violations),
+    "hard_rule_violation_count": int(len(final_structured_violations)),
 
     "limiting_factors": list(limiting),
+    "limiting_factors_structured": list(limiting_structured),
 }
 
     return assignments, emp_hours, total_hours, warnings, filled, total, int(total_iters_done), int(restarts_done), diagnostics
