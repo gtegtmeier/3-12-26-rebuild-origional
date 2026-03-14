@@ -399,6 +399,51 @@ def restore_store_backup_zip(zip_path: str) -> Dict[str, Any]:
 
     return {'path': zip_path, 'restored_files': sorted(restored), 'safety_backups': sorted(set(safety_backups))}
 
+
+
+def get_week_exception_bucket(model: "DataModel", label: str) -> Dict[str, Any]:
+    lbl = str(label or "").strip()
+    all_data = _normalize_weekly_exception_settings(getattr(model, "weekly_exception_settings", {}) or {}, model)
+    try:
+        model.weekly_exception_settings = all_data
+    except Exception:
+        pass
+    if lbl not in all_data:
+        all_data[lbl] = {
+            "no_school_days": {d: False for d in DAYS},
+            "special_event_days": {d: False for d in DAYS},
+            "time_off_requests": [],
+        }
+    return all_data[lbl]
+
+
+def get_week_time_off_requests(model: "DataModel", label: str) -> List[TimeOffRequest]:
+    b = get_week_exception_bucket(model, label)
+    return [des_time_off_request(x) for x in b.get("time_off_requests", [])]
+
+
+def is_no_school_day_for_label(model: "DataModel", label: str, day: str) -> bool:
+    b = get_week_exception_bucket(model, label)
+    flags = _normalize_exception_day_flags(b.get("no_school_days", {}))
+    return bool(flags.get(day, False))
+
+
+def is_special_event_day_for_label(model: "DataModel", label: str, day: str) -> bool:
+    b = get_week_exception_bucket(model, label)
+    flags = _normalize_exception_day_flags(b.get("special_event_days", {}))
+    return bool(flags.get(day, False))
+
+
+def get_employee_time_off_for_window(model: "DataModel", label: str, employee_name: str, day: str, start_t: int, end_t: int) -> List[TimeOffRequest]:
+    out: List[TimeOffRequest] = []
+    for r in get_week_time_off_requests(model, label):
+        if r.employee_name != employee_name or r.day != day:
+            continue
+        if r.all_day:
+            out.append(r); continue
+        if not (int(end_t) <= int(r.start_t) or int(start_t) >= int(r.end_t)):
+            out.append(r)
+    return out
 def compute_weekly_eligibility(model: "DataModel", label: str) -> Tuple[Dict[str, str], Dict[str, str]]:
     """Return (eligible, not_eligible) dicts mapping employee_name -> reason.
 
@@ -414,12 +459,18 @@ def compute_weekly_eligibility(model: "DataModel", label: str) -> Tuple[Dict[str
 
     # Index overrides for quick lookup: (emp, day) -> WeeklyOverride
     ov_map: Dict[Tuple[str, str], WeeklyOverride] = {}
+    approved_time_off: Dict[Tuple[str, str], List[TimeOffRequest]] = {}
     for o in getattr(model, "weekly_overrides", []) or []:
         try:
             if (o.label or "").strip() == (label or "").strip():
                 ov_map[(o.employee_name, o.day)] = o
         except Exception:
             continue
+
+    for r in get_week_time_off_requests(model, label):
+        if r.status != "approved":
+            continue
+        approved_time_off.setdefault((r.employee_name, r.day), []).append(r)
 
     one_hour_ticks = 2  # 30-min ticks => 1 hour
     for e in getattr(model, "employees", []) or []:
@@ -455,6 +506,21 @@ def compute_weekly_eligibility(model: "DataModel", label: str) -> Tuple[Dict[str
                                  int(getattr(dr, "earliest_start", 0)),
                                  int(getattr(dr, "latest_end", DAY_TICKS)),
                                  br)
+                except Exception:
+                    pass
+
+            # Approved selected-week time off requests are hard blackouts in this week.
+            reqs = approved_time_off.get((name, day), [])
+            if reqs:
+                try:
+                    br = list(getattr(dr, "blocked_ranges", []) or [])
+                    for rq in reqs:
+                        if bool(getattr(rq, "all_day", False)):
+                            dr = DayRules(True, int(getattr(dr, "earliest_start", 0)), int(getattr(dr, "latest_end", DAY_TICKS)), br)
+                            break
+                        br.append((int(getattr(rq, "start_t", 0)), int(getattr(rq, "end_t", DAY_TICKS))))
+                    else:
+                        dr = DayRules(bool(getattr(dr, "unavailable_day", False)), int(getattr(dr, "earliest_start", 0)), int(getattr(dr, "latest_end", DAY_TICKS)), br)
                 except Exception:
                     pass
 
@@ -510,13 +576,14 @@ def is_summer_for_minor_14_15(day_date: datetime.date) -> bool:
     ld = labor_day(day_date.year)
     return (day_date >= datetime.date(day_date.year, 6, 1)) and (day_date <= ld)
 
-def nd_minor_daily_hour_cap(model: "DataModel", e: "Employee", day: str) -> Optional[float]:
+def nd_minor_daily_hour_cap(model: "DataModel", e: "Employee", day: str, label: str = "") -> Optional[float]:
     """Return ND daily legal cap (hours) for this employee/day, or None when not applicable."""
     if not bool(getattr(getattr(model, "nd_rules", None), "enforce", False)):
         return None
     if str(getattr(e, "minor_type", "ADULT") or "ADULT") != "MINOR_14_15":
         return None
-    if bool(getattr(model.nd_rules, "is_school_week", True)) and day in {"Mon", "Tue", "Wed", "Thu", "Fri"}:
+    school_week = bool(getattr(model.nd_rules, "is_school_week", True))
+    if school_week and day in {"Mon", "Tue", "Wed", "Thu", "Fri"} and not is_no_school_day_for_label(model, label, day):
         return 3.0
     return 8.0
 
@@ -529,9 +596,9 @@ def nd_minor_weekly_hour_cap(model: "DataModel", e: "Employee") -> Optional[floa
     return 18.0 if bool(getattr(model.nd_rules, "is_school_week", True)) else 40.0
 
 def nd_minor_hours_feasible(model: "DataModel", e: "Employee", day: str, st: int, en: int,
-                            assignments: List["Assignment"]) -> bool:
+                            assignments: List["Assignment"], label: str = "") -> bool:
     """Hard feasibility check for ND minor daily/weekly hour limits."""
-    daily_cap = nd_minor_daily_hour_cap(model, e, day)
+    daily_cap = nd_minor_daily_hour_cap(model, e, day, label=label)
     weekly_cap = nd_minor_weekly_hour_cap(model, e)
     if daily_cap is None or weekly_cap is None:
         return True
@@ -630,6 +697,19 @@ class WeeklyOverride:
     day: str
     off_all_day: bool
     blocked_ranges: List[Tuple[int,int]] = field(default_factory=list)
+    note: str = ""
+
+@dataclass
+class TimeOffRequest:
+    request_id: str
+    group_id: str = ""
+    label: str = ""
+    employee_name: str = ""
+    day: str = "Sun"
+    all_day: bool = False
+    start_t: int = 0
+    end_t: int = DAY_TICKS
+    status: str = "pending"
     note: str = ""
 
 @dataclass
@@ -873,6 +953,7 @@ class DataModel:
     employees: List[Employee] = field(default_factory=list)
     requirements: List[RequirementBlock] = field(default_factory=list)
     weekly_overrides: List[WeeklyOverride] = field(default_factory=list)
+    weekly_exception_settings: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     learned_patterns: Dict[str, Any] = field(default_factory=dict)
 
@@ -1155,6 +1236,181 @@ def des_override(d: dict) -> WeeklyOverride:
         note=str(d.get("note","")).strip(),
     )
 
+
+def _normalize_exception_day_flags(raw: Any) -> Dict[str, bool]:
+    out: Dict[str, bool] = {d: False for d in DAYS}
+    if isinstance(raw, dict):
+        for d in DAYS:
+            out[d] = bool(raw.get(d, False))
+    elif isinstance(raw, list):
+        for day in raw:
+            d = str(day or '').strip().title()[:3]
+            if d in DAYS:
+                out[d] = True
+    return out
+
+
+def _normalize_time_off_status(v: Any) -> str:
+    s = str(v or 'pending').strip().lower()
+    if s in {'approved', 'denied', 'pending'}:
+        return s
+    if s in {'undecided', 'pending / undecided', 'pending/undecided'}:
+        return 'pending'
+    return 'pending'
+
+
+def _normalize_time_range(start_t: Any, end_t: Any) -> Tuple[int, int]:
+    try:
+        st = int(start_t)
+    except Exception:
+        st = 0
+    try:
+        en = int(end_t)
+    except Exception:
+        en = DAY_TICKS
+    st = max(0, min(DAY_TICKS, st))
+    en = max(0, min(DAY_TICKS, en))
+    if en <= st:
+        return st, st
+    return st, en
+
+
+def _normalize_time_off_requests(raw: Any, label_hint: str = '') -> List[TimeOffRequest]:
+    out: List[TimeOffRequest] = []
+    if not isinstance(raw, list):
+        return out
+    for i, row in enumerate(raw):
+        if not isinstance(row, dict):
+            continue
+        label = str(row.get('label', label_hint or '')).strip()
+        emp = str(row.get('employee_name', '')).strip()
+        day = str(row.get('day', '')).strip().title()[:3]
+        if not label or not emp or day not in DAYS:
+            continue
+        all_day = bool(row.get('all_day', False))
+        st, en = _normalize_time_range(row.get('start_t', 0), row.get('end_t', DAY_TICKS))
+        if all_day:
+            st, en = 0, DAY_TICKS
+        elif en <= st:
+            continue
+        rid = str(row.get('request_id', '')).strip() or f"{label}|{emp}|{day}|{st}|{en}|{i}"
+        gid = str(row.get('group_id', '')).strip() or rid
+        out.append(TimeOffRequest(
+            request_id=rid,
+            group_id=gid,
+            label=label,
+            employee_name=emp,
+            day=day,
+            all_day=all_day,
+            start_t=st,
+            end_t=en,
+            status=_normalize_time_off_status(row.get('status', 'pending')),
+            note=str(row.get('note', '')).strip(),
+        ))
+    return out
+
+
+def _normalize_weekly_exception_settings(raw: Any, model: Optional[DataModel] = None) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    if isinstance(raw, dict):
+        for label, payload in raw.items():
+            lbl = str(label or '').strip()
+            if not lbl or not isinstance(payload, dict):
+                continue
+            out[lbl] = {
+                'no_school_days': _normalize_exception_day_flags(payload.get('no_school_days', {})),
+                'special_event_days': _normalize_exception_day_flags(payload.get('special_event_days', {})),
+                'time_off_requests': [asdict(x) for x in _normalize_time_off_requests(payload.get('time_off_requests', []), lbl)],
+            }
+
+    # Backward-safe migration path from legacy weekly_overrides into per-week time-off requests.
+    if model is not None:
+        for o in getattr(model, 'weekly_overrides', []) or []:
+            lbl = str(getattr(o, 'label', '') or '').strip()
+            emp = str(getattr(o, 'employee_name', '') or '').strip()
+            day = str(getattr(o, 'day', '') or '').strip()
+            if not lbl or not emp or day not in DAYS:
+                continue
+            slot = out.setdefault(lbl, {
+                'no_school_days': {d: False for d in DAYS},
+                'special_event_days': {d: False for d in DAYS},
+                'time_off_requests': [],
+            })
+            note = str(getattr(o, 'note', '') or '').strip()
+            if bool(getattr(o, 'off_all_day', False)):
+                slot['time_off_requests'].append(asdict(TimeOffRequest(
+                    request_id=f"legacy|{lbl}|{emp}|{day}|all_day",
+                    group_id=f"legacy|{lbl}|{emp}|{day}|all_day",
+                    label=lbl,
+                    employee_name=emp,
+                    day=day,
+                    all_day=True,
+                    start_t=0,
+                    end_t=DAY_TICKS,
+                    status='approved',
+                    note=note,
+                )))
+            for j, (bs, be) in enumerate(list(getattr(o, 'blocked_ranges', []) or [])):
+                st, en = _normalize_time_range(bs, be)
+                if en <= st:
+                    continue
+                slot['time_off_requests'].append(asdict(TimeOffRequest(
+                    request_id=f"legacy|{lbl}|{emp}|{day}|{st}|{en}|{j}",
+                    group_id=f"legacy|{lbl}|{emp}|{day}|{st}|{en}|{j}",
+                    label=lbl,
+                    employee_name=emp,
+                    day=day,
+                    all_day=False,
+                    start_t=st,
+                    end_t=en,
+                    status='approved',
+                    note=note,
+                )))
+
+    # final dedupe and shape cleanup
+    for lbl, payload in list(out.items()):
+        reqs = _normalize_time_off_requests(payload.get('time_off_requests', []), lbl)
+        seen: Set[str] = set()
+        deduped: List[Dict[str, Any]] = []
+        for r in reqs:
+            key = f"{r.request_id}|{r.employee_name}|{r.day}|{r.start_t}|{r.end_t}|{r.status}"
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(asdict(r))
+        out[lbl] = {
+            'no_school_days': _normalize_exception_day_flags(payload.get('no_school_days', {})),
+            'special_event_days': _normalize_exception_day_flags(payload.get('special_event_days', {})),
+            'time_off_requests': deduped,
+        }
+
+    return out
+
+
+def ser_time_off_request(r: TimeOffRequest) -> dict:
+    return asdict(r)
+
+
+def des_time_off_request(d: dict) -> TimeOffRequest:
+    day = str(d.get('day', '')).strip().title()[:3]
+    st, en = _normalize_time_range(d.get('start_t', 0), d.get('end_t', DAY_TICKS))
+    all_day = bool(d.get('all_day', False))
+    if all_day:
+        st, en = 0, DAY_TICKS
+    rid = str(d.get('request_id', '')).strip()
+    return TimeOffRequest(
+        request_id=rid,
+        group_id=str(d.get('group_id', '')).strip() or rid,
+        label=str(d.get('label', '')).strip(),
+        employee_name=str(d.get('employee_name', '')).strip(),
+        day=day if day in DAYS else 'Sun',
+        all_day=all_day,
+        start_t=st,
+        end_t=en,
+        status=_normalize_time_off_status(d.get('status', 'pending')),
+        note=str(d.get('note', '')).strip(),
+    )
+
 def ser_req(r: RequirementBlock) -> dict:
     return asdict(r)
 
@@ -1241,6 +1497,7 @@ def save_data(model: DataModel, path: str):
         "employees": [ser_employee(e) for e in model.employees],
         "requirements": [ser_req(r) for r in model.requirements],
         "weekly_overrides": [ser_override(o) for o in model.weekly_overrides],
+        "weekly_exception_settings": _normalize_weekly_exception_settings(getattr(model, "weekly_exception_settings", {}) or {}, model),
         "history": [ser_summary(s) for s in model.history],
     }
     ensure_dir(os.path.dirname(path))
@@ -1347,6 +1604,7 @@ def load_data(path: str) -> DataModel:
     if not m.requirements:
         m.requirements = default_requirements()
     m.weekly_overrides = [des_override(o) for o in payload.get("weekly_overrides", [])]
+    m.weekly_exception_settings = _normalize_weekly_exception_settings(payload.get("weekly_exception_settings", {}), m)
     m.history = [des_summary(s) for s in payload.get("history", [])]
     return m
 
@@ -1881,7 +2139,7 @@ def is_employee_available(model: DataModel, e: Employee, label: str, day: str, s
     if not dr.is_available(start_t, end_t):
         return False
 
-    # weekly override
+    # weekly override (legacy support)
     for o in model.weekly_overrides:
         if o.label.strip() == label.strip() and o.employee_name == e.name and o.day == day:
             if o.off_all_day:
@@ -1889,6 +2147,11 @@ def is_employee_available(model: DataModel, e: Employee, label: str, day: str, s
             for bs, be in o.blocked_ranges:
                 if not (end_t <= bs or start_t >= be):
                     return False
+
+    # selected-week approved time-off requests are hard blackout windows.
+    for rq in get_employee_time_off_for_window(model, label, e.name, day, start_t, end_t):
+        if rq.status == 'approved':
+            return False
 
     # clopen rest
     ms = clopen_min_start.get((e.name, day))
@@ -1935,7 +2198,7 @@ def fixed_shift_compliance_ok(model: DataModel, e: Employee, label: str, day: st
         latest = hhmm_to_tick("21:00") if summer else hhmm_to_tick("19:00")
         if int(start_t) < earliest or int(end_t) > latest:
             return False, "Shift violates ND minor allowed working window."
-        if not nd_minor_hours_feasible(model, e, day, int(start_t), int(end_t), list(existing_assignments or [])):
+        if not nd_minor_hours_feasible(model, e, day, int(start_t), int(end_t), list(existing_assignments or []), label=label):
             return False, "Shift violates ND minor daily/weekly hour limits."
 
     return True, ""
@@ -2386,7 +2649,7 @@ def evaluate_schedule_hard_rules(model: DataModel, label: str, assignments: List
             if weekly_cap is not None and (weekly_hours - weekly_cap) > 1e-9:
                 violations.append(HardRuleViolation(code="nd-minor-weekly-hours", message=f"scheduled={weekly_hours:.1f} max={weekly_cap:.1f}", employee_name=emp_name, assignment_source=ASSIGNMENT_SOURCE_ENGINE))
             for day, day_h in daily_hours.items():
-                daily_cap = nd_minor_daily_hour_cap(model, e, day)
+                daily_cap = nd_minor_daily_hour_cap(model, e, day, label=label)
                 if daily_cap is not None and (day_h - daily_cap) > 1e-9:
                     violations.append(HardRuleViolation(code="nd-minor-daily-hours", message=f"scheduled={day_h:.1f} max={daily_cap:.1f}", employee_name=emp_name, day=day, assignment_source=ASSIGNMENT_SOURCE_ENGINE))
 
@@ -3041,7 +3304,7 @@ def _explain_feasible_reason(model: DataModel, label: str, emp: Employee,
     hours_now = sum(hours_between_ticks(a.start_t,a.end_t) for a in assignments if a.employee_name==emp.name)
     if hours_now + h > emp.max_weekly_hours + 1e-9:
         return False, "Would exceed employee max weekly hours"
-    if not nd_minor_hours_feasible(model, emp, day, st, en, assignments):
+    if not nd_minor_hours_feasible(model, emp, day, st, en, assignments, label=label):
         return False, "Would exceed ND minor daily/weekly hour limits"
     return True, ""
 
@@ -3768,6 +4031,15 @@ def generate_schedule(model: DataModel, label: str,
 
         # Compile per-tick requirements (min/preferred/max)
     min_req, pref_req, max_req = build_requirement_maps(model.requirements, goals=getattr(model,'manager_goals',None), store_info=getattr(model, "store_info", None))
+    special_event_days = {d for d in DAYS if is_special_event_day_for_label(model, label, d)}
+    if special_event_days:
+        for (day, area, tick), mn in list(min_req.items()):
+            if day not in special_event_days:
+                continue
+            pr_cur = int(pref_req.get((day, area, tick), mn))
+            mx_cur = int(max_req.get((day, area, tick), max(pr_cur, mn)))
+            pref_req[(day, area, tick)] = max(pr_cur, int(mn) + 1)
+            max_req[(day, area, tick)] = max(mx_cur, int(pref_req[(day, area, tick)]) + 1)
     total_min_slots = sum(min_req.values())
     total_pref_slots = sum(pref_req.values())
 
@@ -3843,7 +4115,7 @@ def generate_schedule(model: DataModel, label: str,
             return False
         if (not locked_ok) and emp_hours[e.name] + h > e.max_weekly_hours + 1e-9:
             return False
-        if (not locked_ok) and not nd_minor_hours_feasible(model, e, a.day, a.start_t, a.end_t, assignments):
+        if (not locked_ok) and not nd_minor_hours_feasible(model, e, a.day, a.start_t, a.end_t, assignments, label=label):
             return False
 
         assignments.append(a)
@@ -3938,6 +4210,17 @@ def generate_schedule(model: DataModel, label: str,
                     score -= SOFT_AVAILABILITY_MISS_PENALTY
         except Exception:
             pass
+
+        # Pending selected-week time-off is a mild soft preference only.
+        try:
+            overlaps_pending = any(r.status == 'pending' for r in get_employee_time_off_for_window(model, label, e.name, day, st, en))
+            if overlaps_pending:
+                score -= 1.2
+        except Exception:
+            pass
+
+        if day in special_event_days:
+            score += 3.0
         # balance: help those under target min
         gap = max(0.0, e.target_min_hours - emp_hours.get(e.name,0.0))
         score += min(5.0, gap) * 0.8
@@ -4563,7 +4846,7 @@ def generate_schedule(model: DataModel, label: str,
                     return False
                 if not is_employee_available(model, e, label, d, int(st), int(en), area, clopen_min_start):
                     return False
-                if not nd_minor_hours_feasible(model, e, d, int(st), int(en), trial):
+                if not nd_minor_hours_feasible(model, e, d, int(st), int(en), trial, label=label):
                     return False
                 cand_a = Assignment(d, area, int(st), int(en), emp_name, locked=False, source="merged_repair")
                 if any(overlaps(cand_a, ex) for ex in trial):
@@ -4965,6 +5248,17 @@ def generate_schedule(model: DataModel, label: str,
         }
 
     # Compute shortfalls for reporting/scoring
+    # Special-event overstaff pass: if available employees remain after baseline fill, add extra support where possible.
+    if special_event_days:
+        for day in sorted(list(special_event_days), key=lambda x: DAYS.index(x)):
+            for area in AREAS:
+                for t in range(0, DAY_TICKS - 1, 2):
+                    k = (day, area, t)
+                    if int(coverage.get(k, 0)) >= int(max_req.get(k, 10**9)):
+                        continue
+                    st = int(t); en = int(t) + 2
+                    _ = add_best_segment(day, area, st, en, locked_ok=False, enforce_weekly_cap=True)
+
     min_short, pref_short, max_viol = compute_requirement_shortfalls(min_req, pref_req, max_req, coverage)
     if max_viol > 0:
         warnings.append("Max staffing cap violated by locked shifts or configuration; review Staffing Requirements Max values.")
@@ -5084,7 +5378,7 @@ def generate_schedule(model: DataModel, label: str,
         hours_now = sum(hours_between_ticks(a.start_t,a.end_t) for a in assigns if a.employee_name==emp.name)
         if hours_now + h > emp.max_weekly_hours + 1e-9:
             return False
-        if not nd_minor_hours_feasible(model, emp, day, st, en, assigns):
+        if not nd_minor_hours_feasible(model, emp, day, st, en, assigns, label=label):
             return False
         trial = list(assigns)
         trial.append(Assignment(day, area, st, en, emp.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE))
@@ -7502,7 +7796,7 @@ class SchedulerApp(tk.Tk):
 
         self.nb.add(self.tab_store, text="1) Store")
         self.nb.add(self.tab_emps, text="2) Employees")
-        self.nb.add(self.tab_over, text="3) Weekly Overrides")
+        self.nb.add(self.tab_over, text="3) Schedule Exceptions (One-Week)")
         self.nb.add(self.tab_reqs, text="4) Staffing Requirements")
         self.nb.add(self.tab_gen, text="5) Generate")
         self.nb.add(self.tab_preview, text="6) Print / Export")
@@ -7783,141 +8077,345 @@ class SchedulerApp(tk.Tk):
         self.refresh_override_dropdowns()
         self.autosave()
 
-    # -------- Weekly Overrides tab --------
+    # -------- Schedule Exceptions (One-Week) tab --------
+    def _selected_exception_label(self) -> str:
+        lbl = ""
+        try:
+            lbl = str(self.label_var.get() or "").strip()
+        except Exception:
+            lbl = ""
+        if not lbl:
+            lbl = str(getattr(self, "current_label", "") or "").strip()
+        if not lbl:
+            lbl = self._default_week_label()
+        return lbl
+
+    def _exception_bucket(self, label: Optional[str] = None) -> Dict[str, Any]:
+        lbl = str(label or self._selected_exception_label()).strip()
+        cur = _normalize_weekly_exception_settings(getattr(self.model, "weekly_exception_settings", {}) or {})
+        self.model.weekly_exception_settings = cur
+        if lbl not in cur:
+            cur[lbl] = {
+                "no_school_days": {d: False for d in DAYS},
+                "special_event_days": {d: False for d in DAYS},
+                "time_off_requests": [],
+            }
+        return cur[lbl]
+
     def _build_overrides_tab(self):
         frm = ttk.Frame(self.tab_over); frm.pack(fill="both", expand=True, padx=12, pady=12)
-        ttk.Label(frm, text="One-week blackout windows (does not change recurring availability).", style="SubHeader.TLabel")\
-            .pack(anchor="w", pady=(0,8))
+        ttk.Label(
+            frm,
+            text="Temporary one-week schedule exceptions for the selected week. These changes affect only that schedule and do not change recurring employee availability.",
+            style="SubHeader.TLabel",
+        ).pack(anchor="w", pady=(0, 8))
 
-        top = ttk.LabelFrame(frm, text="Add / Update Override")
-        top.pack(fill="x", pady=(0,10))
-
+        week_row = ttk.Frame(frm)
+        week_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(week_row, text="Selected Week:").pack(side="left", padx=(0, 8))
         self.ov_label_var = tk.StringVar(value=self.current_label)
-        self.ov_emp_var = tk.StringVar()
-        self.ov_day_var = tk.StringVar(value="Sun")
-        self.ov_off_all_var = tk.BooleanVar(value=False)
-        self.ov_b1s = tk.StringVar(value="")
-        self.ov_b1e = tk.StringVar(value="")
-        self.ov_b2s = tk.StringVar(value="")
-        self.ov_b2e = tk.StringVar(value="")
-        self.ov_note = tk.StringVar(value="")
+        self.ov_week_entry = ttk.Entry(week_row, textvariable=self.ov_label_var, width=40)
+        self.ov_week_entry.pack(side="left")
+        ttk.Button(week_row, text="Use Generate Week", command=self._sync_exception_label_from_generate).pack(side="left", padx=8)
 
-        r=0
-        ttk.Label(top, text="Week Label:").grid(row=r, column=0, sticky="w", padx=8, pady=6)
-        ttk.Entry(top, textvariable=self.ov_label_var, width=34).grid(row=r, column=1, sticky="w", padx=8, pady=6)
-        ttk.Label(top, text="Employee:").grid(row=r, column=2, sticky="w", padx=8, pady=6)
-        self.ov_emp_combo = ttk.Combobox(top, textvariable=self.ov_emp_var, values=[], width=26, state="readonly")
-        self.ov_emp_combo.grid(row=r, column=3, sticky="w", padx=8, pady=6)
+        self.no_school_vars: Dict[str, tk.BooleanVar] = {d: tk.BooleanVar(value=False) for d in DAYS}
+        no_school_box = ttk.LabelFrame(frm, text="No School Days")
+        no_school_box.pack(fill="x", pady=(0, 10))
+        ttk.Label(no_school_box, text="For the selected week only, mark days where school is not in session so school-day-related minor restrictions may be relaxed.").grid(row=0, column=0, columnspan=7, sticky="w", padx=8, pady=(6, 6))
+        for i, d in enumerate(DAYS):
+            ttk.Label(no_school_box, text=DAY_FULL[d]).grid(row=1, column=i, sticky="w", padx=8, pady=(0, 2))
+            ttk.Checkbutton(no_school_box, variable=self.no_school_vars[d], command=self._on_exception_day_toggle).grid(row=2, column=i, sticky="w", padx=8, pady=(0, 8))
 
-        r+=1
-        ttk.Label(top, text="Day:").grid(row=r, column=0, sticky="w", padx=8, pady=6)
-        ttk.Combobox(top, textvariable=self.ov_day_var, values=DAYS, width=10, state="readonly").grid(row=r, column=1, sticky="w", padx=8, pady=6)
-        ttk.Checkbutton(top, text="Off all day", variable=self.ov_off_all_var).grid(row=r, column=2, sticky="w", padx=8, pady=6)
+        self.special_event_vars: Dict[str, tk.BooleanVar] = {d: tk.BooleanVar(value=False) for d in DAYS}
+        special_box = ttk.LabelFrame(frm, text="Special Event Days")
+        special_box.pack(fill="x", pady=(0, 10))
+        ttk.Label(special_box, text="Mark selected-week days where the engine should overstaff more aggressively and prefer extra staffing.").grid(row=0, column=0, columnspan=7, sticky="w", padx=8, pady=(6, 6))
+        for i, d in enumerate(DAYS):
+            ttk.Label(special_box, text=DAY_FULL[d]).grid(row=1, column=i, sticky="w", padx=8, pady=(0, 2))
+            ttk.Checkbutton(special_box, variable=self.special_event_vars[d], command=self._on_exception_day_toggle).grid(row=2, column=i, sticky="w", padx=8, pady=(0, 8))
 
-        r+=1
-        ttk.Label(top, text="Blocked range 1:").grid(row=r, column=0, sticky="w", padx=8, pady=6)
-        ttk.Combobox(top, textvariable=self.ov_b1s, values=[""]+TIME_CHOICES, width=8, state="readonly").grid(row=r, column=1, sticky="w", padx=8, pady=6)
-        ttk.Combobox(top, textvariable=self.ov_b1e, values=[""]+TIME_CHOICES, width=8, state="readonly").grid(row=r, column=2, sticky="w", padx=8, pady=6)
-        ttk.Label(top, text="Blocked range 2:").grid(row=r, column=3, sticky="w", padx=8, pady=6)
-        ttk.Combobox(top, textvariable=self.ov_b2s, values=[""]+TIME_CHOICES, width=8, state="readonly").grid(row=r, column=4, sticky="w", padx=8, pady=6)
-        ttk.Combobox(top, textvariable=self.ov_b2e, values=[""]+TIME_CHOICES, width=8, state="readonly").grid(row=r, column=5, sticky="w", padx=8, pady=6)
+        # Stage 3 will fill the full request-management behavior.
+        req_box = ttk.LabelFrame(frm, text="Time Off Requests")
+        req_box.pack(fill="both", expand=True)
+        btn_row = ttk.Frame(req_box)
+        btn_row.pack(fill="x", padx=8, pady=(8, 6))
+        ttk.Button(btn_row, text="Add Time Off", command=self.add_time_off_request).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_row, text="Edit Request", command=self.edit_time_off_request).pack(side="left", padx=6)
+        ttk.Button(btn_row, text="Delete Request", command=self.delete_time_off_request).pack(side="left", padx=6)
 
-        r+=1
-        ttk.Label(top, text="Note:").grid(row=r, column=0, sticky="w", padx=8, pady=6)
-        ttk.Entry(top, textvariable=self.ov_note, width=72).grid(row=r, column=1, columnspan=5, sticky="w", padx=8, pady=6)
-
-        ttk.Button(top, text="Add / Update", command=self.add_override).grid(row=0, column=6, rowspan=2, padx=10, pady=6, sticky="ns")
-        ttk.Button(top, text="Copy Overrides From Last Saved Week", command=self.copy_last_overrides).grid(row=2, column=6, rowspan=2, padx=10, pady=6, sticky="ns")
-
-        cols = ("Week","Employee","Day","OffAll","Blocked","Note")
-        self.ov_tree = ttk.Treeview(frm, columns=cols, show="headings", height=14)
+        cols = ("Employee", "Day", "Window", "Status", "Note")
+        self.time_off_tree = ttk.Treeview(req_box, columns=cols, show="headings", height=10)
         for c in cols:
-            self.ov_tree.heading(c, text=c)
-            w=150
-            if c=="Week": w=260
-            if c=="Blocked": w=220
-            if c=="Note": w=320
-            self.ov_tree.column(c, width=w)
-        self.ov_tree.pack(fill="both", expand=True, pady=(0,10))
+            self.time_off_tree.heading(c, text=c)
+            self.time_off_tree.column(c, width=170 if c != "Note" else 320)
+        self.time_off_tree.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
-        ttk.Button(frm, text="Delete Selected", command=self.delete_override).pack(anchor="w")
+        status_row = ttk.LabelFrame(req_box, text="Request Status Review")
+        status_row.pack(fill="x", padx=8, pady=(0, 8))
+        self.time_off_status_target_var = tk.StringVar(value="Select a request to review status")
+        ttk.Label(status_row, textvariable=self.time_off_status_target_var).pack(anchor="w", padx=8, pady=(6, 4))
+
+        self.time_off_status_var = tk.StringVar(value="pending")
+        btns = ttk.Frame(status_row)
+        btns.pack(anchor="w", padx=8, pady=(0, 8))
+        self.time_off_status_rb_approved = ttk.Radiobutton(btns, text="Approved", value="approved", variable=self.time_off_status_var, command=self._on_status_radio_change)
+        self.time_off_status_rb_approved.pack(side="left", padx=(0, 10))
+        self.time_off_status_rb_denied = ttk.Radiobutton(btns, text="Denied", value="denied", variable=self.time_off_status_var, command=self._on_status_radio_change)
+        self.time_off_status_rb_denied.pack(side="left", padx=(0, 10))
+        self.time_off_status_rb_pending = ttk.Radiobutton(btns, text="Pending / Undecided", value="pending", variable=self.time_off_status_var, command=self._on_status_radio_change)
+        self.time_off_status_rb_pending.pack(side="left")
+
+        self.time_off_tree.bind("<<TreeviewSelect>>", self._on_time_off_tree_select, add="+")
+        self._set_status_controls_enabled(False)
+
+    def _sync_exception_label_from_generate(self):
+        try:
+            self.ov_label_var.set(str(self.label_var.get() or self.current_label or self._default_week_label()).strip())
+        except Exception:
+            self.ov_label_var.set(str(self.current_label or self._default_week_label()).strip())
+        self.refresh_exception_ui()
+
+    def _on_exception_day_toggle(self):
+        bucket = self._exception_bucket(self.ov_label_var.get().strip())
+        bucket["no_school_days"] = {d: bool(self.no_school_vars[d].get()) for d in DAYS}
+        bucket["special_event_days"] = {d: bool(self.special_event_vars[d].get()) for d in DAYS}
+        self.autosave()
 
     def refresh_override_dropdowns(self):
-        names = sorted([e.name for e in self.model.employees if e.work_status=="Active"], key=str.lower)
-        self.ov_emp_combo["values"] = names
-        if names and self.ov_emp_var.get() not in names:
-            self.ov_emp_var.set(names[0])
+        # Backward compatibility shim for existing refresh calls.
+        self.refresh_exception_ui()
 
-    def add_override(self):
-        label = self.ov_label_var.get().strip()
-        emp = self.ov_emp_var.get().strip()
-        day = self.ov_day_var.get()
-        if not label or not emp:
-            messagebox.showerror("Overrides", "Week label and employee are required.")
+    def refresh_exception_ui(self):
+        if not hasattr(self, "ov_label_var"):
             return
-        br: List[Tuple[int,int]] = []
-        def add_rng(s,e):
-            s=s.strip(); e=e.strip()
-            if not s or not e: return
-            a=hhmm_to_tick(s); b=hhmm_to_tick(e)
-            if b>a: br.append((a,b))
-        add_rng(self.ov_b1s.get(), self.ov_b1e.get())
-        add_rng(self.ov_b2s.get(), self.ov_b2e.get())
-        off_all = self.ov_off_all_var.get()
-        note = self.ov_note.get().strip()
-
-        updated=False
-        for o in self.model.weekly_overrides:
-            if o.label==label and o.employee_name==emp and o.day==day:
-                o.off_all_day = off_all
-                o.blocked_ranges = br
-                o.note = note
-                updated=True
-                break
-        if not updated:
-            self.model.weekly_overrides.append(WeeklyOverride(label, emp, day, off_all, br, note))
-        self.refresh_override_tree()
-        self.autosave()
-
-    def copy_last_overrides(self):
-        # Copy overrides from the most recent label in overrides list (excluding current label if empty)
-        cur = self.ov_label_var.get().strip()
-        labels = [o.label for o in self.model.weekly_overrides if o.label.strip() and o.label.strip()!=cur]
-        if not labels:
-            messagebox.showinfo("Copy", "No prior overrides found.")
-            return
-        # last label by appearing order
-        last = labels[-1]
-        copied = 0
-        for o in list(self.model.weekly_overrides):
-            if o.label == last:
-                # duplicate into current label
-                exists = any(x.label==cur and x.employee_name==o.employee_name and x.day==o.day for x in self.model.weekly_overrides)
-                if not exists:
-                    self.model.weekly_overrides.append(WeeklyOverride(cur, o.employee_name, o.day, o.off_all_day, list(o.blocked_ranges), o.note))
-                    copied += 1
-        self.refresh_override_tree()
-        self.autosave()
-        messagebox.showinfo("Copy", f"Copied {copied} override(s) from '{last}' to '{cur}'.")
+        lbl = self.ov_label_var.get().strip() or self._selected_exception_label()
+        bucket = self._exception_bucket(lbl)
+        ns = _normalize_exception_day_flags(bucket.get("no_school_days", {}))
+        se = _normalize_exception_day_flags(bucket.get("special_event_days", {}))
+        for d in DAYS:
+            if d in getattr(self, "no_school_vars", {}):
+                self.no_school_vars[d].set(bool(ns.get(d, False)))
+            if d in getattr(self, "special_event_vars", {}):
+                self.special_event_vars[d].set(bool(se.get(d, False)))
+        self.refresh_time_off_tree()
 
     def refresh_override_tree(self):
-        for i in self.ov_tree.get_children():
-            self.ov_tree.delete(i)
-        def br_str(br):
-            return ", ".join([f"{tick_to_hhmm(a)}-{tick_to_hhmm(b)}" for a,b in br])
-        for o in sorted(self.model.weekly_overrides, key=lambda x: (x.label, x.employee_name.lower(), DAYS.index(x.day))):
-            self.ov_tree.insert("", "end", values=(o.label, o.employee_name, o.day, "Yes" if o.off_all_day else "No", br_str(o.blocked_ranges), o.note))
+        # Backward compatibility shim for existing refresh calls.
+        self.refresh_time_off_tree()
 
-    def delete_override(self):
-        sel = self.ov_tree.selection()
+    def _new_time_off_request_id(self) -> str:
+        return f"tor_{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+
+    def _active_employee_names(self) -> List[str]:
+        return sorted([e.name for e in self.model.employees if (e.name or '').strip()], key=str.lower)
+
+    def _requests_for_label(self, label: Optional[str] = None) -> List[TimeOffRequest]:
+        lbl = str(label or self.ov_label_var.get().strip() or self._selected_exception_label()).strip()
+        bucket = self._exception_bucket(lbl)
+        return [des_time_off_request(x) for x in bucket.get('time_off_requests', [])]
+
+    def _save_requests_for_label(self, requests: List[TimeOffRequest], label: Optional[str] = None):
+        lbl = str(label or self.ov_label_var.get().strip() or self._selected_exception_label()).strip()
+        bucket = self._exception_bucket(lbl)
+        bucket['time_off_requests'] = [ser_time_off_request(r) for r in _normalize_time_off_requests([ser_time_off_request(x) for x in requests], lbl)]
+
+    def _format_request_window(self, r: TimeOffRequest) -> str:
+        if bool(getattr(r, 'all_day', False)):
+            return 'All Day'
+        return f"{tick_to_hhmm(int(r.start_t))}-{tick_to_hhmm(int(r.end_t))}"
+
+    def refresh_time_off_tree(self):
+        if not hasattr(self, 'time_off_tree'):
+            return
+        for i in self.time_off_tree.get_children():
+            self.time_off_tree.delete(i)
+        for r in sorted(self._requests_for_label(), key=lambda x: (x.employee_name.lower(), DAYS.index(x.day), int(x.start_t), int(x.end_t))):
+            status_txt = 'Pending / Undecided' if r.status == 'pending' else r.status.title()
+            self.time_off_tree.insert('', 'end', iid=r.request_id, values=(r.employee_name, DAY_FULL.get(r.day, r.day), self._format_request_window(r), status_txt, r.note))
+        self._on_time_off_tree_select()
+
+    def _open_time_off_popup(self, mode: str, seed_requests: Optional[List[TimeOffRequest]] = None):
+        lbl = self.ov_label_var.get().strip() or self._selected_exception_label()
+        seed_requests = list(seed_requests or [])
+        top = tk.Toplevel(self)
+        top.title('Add Time Off Request' if mode == 'add' else 'Edit Time Off Request')
+        top.transient(self)
+        top.grab_set()
+
+        frame = ttk.Frame(top)
+        frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+        emp_var = tk.StringVar()
+        names = self._active_employee_names()
+        if seed_requests:
+            emp_var.set(seed_requests[0].employee_name)
+        elif names:
+            emp_var.set(names[0])
+
+        ttk.Label(frame, text='Employee:').grid(row=0, column=0, sticky='w', padx=6, pady=6)
+        ttk.Combobox(frame, textvariable=emp_var, values=names, state='readonly', width=30).grid(row=0, column=1, sticky='w', padx=6, pady=6)
+
+        note_var = tk.StringVar(value=(seed_requests[0].note if seed_requests else ''))
+        ttk.Label(frame, text='Note:').grid(row=0, column=2, sticky='w', padx=6, pady=6)
+        ttk.Entry(frame, textvariable=note_var, width=38).grid(row=0, column=3, sticky='w', padx=6, pady=6)
+
+        day_rows: Dict[str, Dict[str, Any]] = {}
+        seed_by_day: Dict[str, List[TimeOffRequest]] = {}
+        for r in seed_requests:
+            if r.day in DAYS:
+                seed_by_day.setdefault(r.day, []).append(r)
+        for d in DAYS:
+            seed_by_day.setdefault(d, []).sort(key=lambda x: (int(x.start_t), int(x.end_t)))
+
+        ttk.Label(frame, text='Win 1 Start').grid(row=1, column=2, sticky='w', padx=6, pady=(0, 2))
+        ttk.Label(frame, text='Win 1 End').grid(row=1, column=3, sticky='w', padx=6, pady=(0, 2))
+        ttk.Label(frame, text='Win 2 Start').grid(row=1, column=4, sticky='w', padx=6, pady=(0, 2))
+        ttk.Label(frame, text='Win 2 End').grid(row=1, column=5, sticky='w', padx=6, pady=(0, 2))
+
+        for i, d in enumerate(DAYS, start=2):
+            seeds = seed_by_day.get(d, [])
+            seed_all_day = next((x for x in seeds if bool(x.all_day)), None)
+            part = [x for x in seeds if not bool(x.all_day)]
+            p1 = part[0] if len(part) >= 1 else None
+            p2 = part[1] if len(part) >= 2 else None
+
+            all_day_var = tk.BooleanVar(value=bool(seed_all_day) if seed_all_day else False)
+            start1_var = tk.StringVar(value='' if p1 is None else tick_to_hhmm(int(p1.start_t)))
+            end1_var = tk.StringVar(value='' if p1 is None else tick_to_hhmm(int(p1.end_t)))
+            start2_var = tk.StringVar(value='' if p2 is None else tick_to_hhmm(int(p2.start_t)))
+            end2_var = tk.StringVar(value='' if p2 is None else tick_to_hhmm(int(p2.end_t)))
+
+            ttk.Label(frame, text=DAY_FULL[d]).grid(row=i, column=0, sticky='w', padx=6, pady=4)
+            ttk.Checkbutton(frame, text='All Day', variable=all_day_var).grid(row=i, column=1, sticky='w', padx=6, pady=4)
+            ttk.Combobox(frame, textvariable=start1_var, values=[''] + TIME_CHOICES, state='readonly', width=8).grid(row=i, column=2, sticky='w', padx=6, pady=4)
+            ttk.Combobox(frame, textvariable=end1_var, values=[''] + TIME_CHOICES, state='readonly', width=8).grid(row=i, column=3, sticky='w', padx=6, pady=4)
+            ttk.Combobox(frame, textvariable=start2_var, values=[''] + TIME_CHOICES, state='readonly', width=8).grid(row=i, column=4, sticky='w', padx=6, pady=4)
+            ttk.Combobox(frame, textvariable=end2_var, values=[''] + TIME_CHOICES, state='readonly', width=8).grid(row=i, column=5, sticky='w', padx=6, pady=4)
+            day_rows[d] = {'all_day': all_day_var, 'start1': start1_var, 'end1': end1_var, 'start2': start2_var, 'end2': end2_var}
+
+        old_ids = {x.request_id for x in seed_requests}
+        group_id = (seed_requests[0].group_id if seed_requests else '') or self._new_time_off_request_id()
+
+        def _save_popup():
+            emp = emp_var.get().strip()
+            if not emp:
+                messagebox.showerror('Time Off Requests', 'Employee is required.', parent=top)
+                return
+            created: List[TimeOffRequest] = []
+            for d in DAYS:
+                row = day_rows[d]
+                all_day = bool(row['all_day'].get())
+                if all_day:
+                    created.append(TimeOffRequest(request_id=self._new_time_off_request_id(), group_id=group_id, label=lbl, employee_name=emp, day=d, all_day=True, start_t=0, end_t=DAY_TICKS, status='pending', note=note_var.get().strip()))
+                    continue
+
+                for idx in (1, 2):
+                    s = row[f'start{idx}'].get().strip()
+                    e = row[f'end{idx}'].get().strip()
+                    if not s and not e:
+                        continue
+                    if not s or not e:
+                        messagebox.showerror('Time Off Requests', f'{DAY_FULL[d]} window {idx} requires both Start and End for partial-day requests.', parent=top)
+                        return
+                    st = hhmm_to_tick(s); en = hhmm_to_tick(e)
+                    if en <= st:
+                        messagebox.showerror('Time Off Requests', f'{DAY_FULL[d]} window {idx} end time must be after start time.', parent=top)
+                        return
+                    created.append(TimeOffRequest(request_id=self._new_time_off_request_id(), group_id=group_id, label=lbl, employee_name=emp, day=d, all_day=False, start_t=st, end_t=en, status='pending', note=note_var.get().strip()))
+
+            if not created:
+                messagebox.showerror('Time Off Requests', 'Enter at least one day window (all-day or start/end).', parent=top)
+                return
+
+            current = self._requests_for_label(lbl)
+            if old_ids:
+                current = [r for r in current if r.request_id not in old_ids]
+            status_by_key = {(r.day, r.start_t, r.end_t): r.status for r in seed_requests}
+            for r in created:
+                r.status = status_by_key.get((r.day, r.start_t, r.end_t), 'pending')
+            current.extend(created)
+            self._save_requests_for_label(current, lbl)
+            self.refresh_time_off_tree()
+            self.autosave()
+            top.destroy()
+
+        btns = ttk.Frame(frame)
+        btns.grid(row=10, column=0, columnspan=6, sticky='w', padx=6, pady=(8, 2))
+        ttk.Button(btns, text='Save Time Off Request', command=_save_popup).pack(side='left', padx=(0, 8))
+        ttk.Button(btns, text='Cancel', command=top.destroy).pack(side='left')
+
+    def add_time_off_request(self):
+        self._open_time_off_popup('add', [])
+
+    def _selected_request(self) -> Optional[TimeOffRequest]:
+        sel = self.time_off_tree.selection() if hasattr(self, 'time_off_tree') else []
         if not sel:
+            return None
+        rid = str(sel[0])
+        for r in self._requests_for_label():
+            if r.request_id == rid:
+                return r
+        return None
+
+    def edit_time_off_request(self):
+        sel = self._selected_request()
+        if sel is None:
             return
-        vals = self.ov_tree.item(sel[0], "values")
-        label, emp, day = vals[0], vals[1], vals[2]
-        if not messagebox.askyesno("Delete", f"Delete override for {emp} {day} ({label})?"):
+        all_req = self._requests_for_label()
+        group = [r for r in all_req if (r.group_id or r.request_id) == (sel.group_id or sel.request_id) and r.employee_name == sel.employee_name]
+        if not group:
+            group = [sel]
+        self._open_time_off_popup('edit', group)
+
+    def delete_time_off_request(self):
+        sel = self._selected_request()
+        if sel is None:
             return
-        self.model.weekly_overrides = [o for o in self.model.weekly_overrides if not (o.label==label and o.employee_name==emp and o.day==day)]
-        self.refresh_override_tree()
+        if not messagebox.askyesno('Delete Request', f"Delete request for {sel.employee_name} on {DAY_FULL.get(sel.day, sel.day)}?"):
+            return
+        reqs = [r for r in self._requests_for_label() if r.request_id != sel.request_id]
+        self._save_requests_for_label(reqs)
+        self.refresh_time_off_tree()
+        self._on_time_off_tree_select()
+        self.autosave()
+
+    def _set_status_controls_enabled(self, enabled: bool):
+        state = "normal" if bool(enabled) else "disabled"
+        for w in (getattr(self, "time_off_status_rb_approved", None), getattr(self, "time_off_status_rb_denied", None), getattr(self, "time_off_status_rb_pending", None)):
+            if w is not None:
+                try:
+                    w.configure(state=state)
+                except Exception:
+                    pass
+
+    def _on_time_off_tree_select(self, _event=None):
+        sel = self._selected_request()
+        if sel is None:
+            if hasattr(self, "time_off_status_target_var"):
+                self.time_off_status_target_var.set("Select a request to review status")
+            self._set_status_controls_enabled(False)
+            return
+        if hasattr(self, "time_off_status_target_var"):
+            self.time_off_status_target_var.set(f"{sel.employee_name} • {DAY_FULL.get(sel.day, sel.day)} • {self._format_request_window(sel)}")
+        if hasattr(self, "time_off_status_var"):
+            self.time_off_status_var.set(_normalize_time_off_status(sel.status))
+        self._set_status_controls_enabled(True)
+
+    def _on_status_radio_change(self):
+        self.set_time_off_status(getattr(self, "time_off_status_var", tk.StringVar(value="pending")).get())
+
+    def set_time_off_status(self, status: str):
+        st = _normalize_time_off_status(status)
+        sel = self._selected_request()
+        if sel is None:
+            return
+        reqs = self._requests_for_label()
+        for i, r in enumerate(reqs):
+            if r.request_id == sel.request_id:
+                reqs[i].status = st
+                break
+        self._save_requests_for_label(reqs)
+        self.refresh_time_off_tree()
         self.autosave()
 
     # -------- Requirements tab --------
