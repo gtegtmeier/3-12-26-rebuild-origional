@@ -4130,38 +4130,378 @@ def generate_schedule(model: DataModel, label: str,
         windows.sort(key=lambda w: (int(w[3]), int(w[2] - w[1])), reverse=True)
         return windows
 
-    def _targeted_late_micro_fill() -> Dict[str, int]:
-        stats = {"window_attempts": 0, "adds_extend": 0, "adds_open": 0}
+    def _targeted_late_micro_fill() -> Dict[str, Any]:
+        stats: Dict[str, Any] = {
+            "window_attempts": 0,
+            "adds_extend": 0,
+            "adds_open": 0,
+            "merged_candidates_generated": {"extend_absorb": 0, "combined_open": 0, "internal_reslice": 0},
+            "merged_candidates_legal": {"extend_absorb": 0, "combined_open": 0, "internal_reslice": 0},
+            "merged_candidates_selected": {"extend_absorb": 0, "combined_open": 0, "internal_reslice": 0},
+            "example_repairs": [],
+        }
+
+        area_priority = {"KITCHEN": 3.0, "CARWASH": 2.0, "CSTORE": 1.0}
+
+        def _window_deficit_weight(day: str, st: int, en: int) -> float:
+            wt = 0.0
+            for tt in range(int(st), int(en)):
+                for aa in AREAS:
+                    miss = max(0, int(min_req.get((day, aa, int(tt)), 0)) - int(coverage.get((day, aa, int(tt)), 0)))
+                    if miss > 0:
+                        wt += miss * float(area_priority.get(aa, 1.0))
+            return float(wt)
+
+        def _segments_covering_gap(day: str, st: int, en: int) -> List[Tuple[int, int, str, int]]:
+            out: List[Tuple[int, int, str, int]] = []
+            cur_area: Optional[str] = None
+            cur_st: Optional[int] = None
+            for tt in range(int(st), int(en)):
+                best_area = "CSTORE"
+                best_need = 0
+                for aa in ("KITCHEN", "CARWASH", "CSTORE"):
+                    need = max(0, int(min_req.get((day, aa, int(tt)), 0)) - int(coverage.get((day, aa, int(tt)), 0)))
+                    if need > best_need:
+                        best_need = need
+                        best_area = aa
+                if best_need <= 0:
+                    if cur_area is not None and cur_st is not None and tt > cur_st:
+                        seg_need = sum(max(0, int(min_req.get((day, cur_area, x), 0)) - int(coverage.get((day, cur_area, x), 0))) for x in range(cur_st, tt))
+                        out.append((int(cur_st), int(tt), str(cur_area), int(seg_need)))
+                    cur_area = None
+                    cur_st = None
+                    continue
+                if cur_area is None:
+                    cur_area = best_area
+                    cur_st = int(tt)
+                    continue
+                if best_area != cur_area:
+                    seg_need = sum(max(0, int(min_req.get((day, cur_area, x), 0)) - int(coverage.get((day, cur_area, x), 0))) for x in range(int(cur_st), int(tt)))
+                    out.append((int(cur_st), int(tt), str(cur_area), int(seg_need)))
+                    cur_area = best_area
+                    cur_st = int(tt)
+            if cur_area is not None and cur_st is not None and int(en) > int(cur_st):
+                seg_need = sum(max(0, int(min_req.get((day, cur_area, x), 0)) - int(coverage.get((day, cur_area, x), 0))) for x in range(int(cur_st), int(en)))
+                out.append((int(cur_st), int(en), str(cur_area), int(seg_need)))
+            return out
+
+        def _candidate_score(cand: Dict[str, Any]) -> float:
+            gain = float(cand.get("gain_weighted", 0.0))
+            raw_gain = float(cand.get("gain_raw", 0.0))
+            added_h = float(cand.get("delta_hours", 0.0))
+            frag_pen = float(cand.get("fragment_penalty", 0.0))
+            return (gain * 10.0) + raw_gain - (added_h * 1.2) - frag_pen
+
+        def _sim_weekly_hours(emp_name: str, adds: List[Tuple[str, str, int, int]], removes: List[int]) -> float:
+            base = float(emp_hours.get(emp_name, 0.0) or 0.0)
+            add_h = sum(hours_between_ticks(int(st), int(en)) for (_d, _a, st, en) in adds)
+            rem_h = 0.0
+            for idx in removes:
+                if idx < 0 or idx >= len(assignments):
+                    continue
+                aa = assignments[idx]
+                if aa.employee_name != emp_name:
+                    continue
+                rem_h += hours_between_ticks(int(aa.start_t), int(aa.end_t))
+            return base + add_h - rem_h
+
+        def _candidate_legal(cand: Dict[str, Any]) -> bool:
+            emp_name = str(cand.get("employee", ""))
+            day = str(cand.get("day", ""))
+            e = emp_by_name.get(emp_name)
+            if e is None or day not in DAYS:
+                return False
+
+            add_ops: List[Tuple[str, str, int, int]] = list(cand.get("add_ops", []))
+            remove_idxs: List[int] = list(cand.get("remove_idxs", []))
+            modify_ops: List[Tuple[int, str]] = list(cand.get("modify_ops", []))
+
+            if max_weekly_cap > 0.0 and (total_labor_hours + float(cand.get("delta_hours", 0.0)) - max_weekly_cap) > 1e-9:
+                return False
+
+            weekly_after = _sim_weekly_hours(emp_name, add_ops, remove_idxs)
+            if weekly_after - float(getattr(e, "max_weekly_hours", 0.0) or 0.0) > 1e-9:
+                return False
+
+            trial = list(assignments)
+            for ridx in sorted(set(int(x) for x in remove_idxs), reverse=True):
+                if 0 <= ridx < len(trial):
+                    trial.pop(ridx)
+
+            for midx, new_area in modify_ops:
+                if midx < 0 or midx >= len(assignments):
+                    return False
+                old = assignments[midx]
+                if old.employee_name != emp_name or old.day != day:
+                    return False
+                if new_area not in getattr(e, "areas_allowed", []):
+                    return False
+                replaced = False
+                for i, aa in enumerate(trial):
+                    if aa.day == old.day and aa.employee_name == old.employee_name and aa.start_t == old.start_t and aa.end_t == old.end_t and aa.area == old.area:
+                        trial[i] = Assignment(aa.day, str(new_area), int(aa.start_t), int(aa.end_t), aa.employee_name, locked=aa.locked, source=aa.source)
+                        replaced = True
+                        break
+                if not replaced:
+                    return False
+
+            for d, area, st, en in add_ops:
+                if d != day or area not in getattr(e, "areas_allowed", []):
+                    return False
+                op_t, cl_t = run_state["area_bounds"].get(area, (0, DAY_TICKS))
+                if int(st) < int(op_t) or int(en) > int(cl_t) or int(en) <= int(st):
+                    return False
+                if not is_employee_available(model, e, label, d, int(st), int(en), area, clopen_min_start):
+                    return False
+                if not nd_minor_hours_feasible(model, e, d, int(st), int(en), trial):
+                    return False
+                cand_a = Assignment(d, area, int(st), int(en), emp_name, locked=False, source="merged_repair")
+                if any(overlaps(cand_a, ex) for ex in trial):
+                    return False
+                if _violates_max(d, area, int(st), int(en), coverage):
+                    # allow only when this candidate explicitly removes or re-slices the same employee window.
+                    if not remove_idxs and not modify_ops:
+                        return False
+                trial.append(cand_a)
+
+            if not respects_daily_shift_limits(trial, e, day):
+                return False
+            if not respects_max_consecutive_days(trial, e, day):
+                return False
+
+            blocks = daily_shift_blocks(trial, emp_name, day)
+            for st, en in blocks:
+                bh = hours_between_ticks(int(st), int(en))
+                min_h = float(getattr(e, "min_hours_per_shift", 1.0) or 1.0)
+                mx_h = float(employee_allowed_max_shift_hours(e) or 0.0)
+                if bh + 1e-9 < min_h:
+                    return False
+                if mx_h > 0.0 and bh - mx_h > 1e-9:
+                    return False
+
+            # demand safety for re-slice: never reduce source area below MIN on modified intervals.
+            for midx, new_area in modify_ops:
+                old = assignments[midx]
+                if old.area == new_area:
+                    continue
+                for tt in range(int(old.start_t), int(old.end_t)):
+                    src_key = (old.day, old.area, int(tt))
+                    if int(coverage.get(src_key, 0)) - 1 < int(min_req.get(src_key, 0)):
+                        return False
+            return True
+
+        def _apply_candidate(cand: Dict[str, Any]) -> bool:
+            nonlocal envelopes_by_emp_day, total_labor_hours
+            if not _candidate_legal(cand):
+                return False
+
+            emp_name = str(cand.get("employee", ""))
+            day = str(cand.get("day", ""))
+            add_ops: List[Tuple[str, str, int, int]] = list(cand.get("add_ops", []))
+            remove_idxs: List[int] = list(cand.get("remove_idxs", []))
+            modify_ops: List[Tuple[int, str]] = list(cand.get("modify_ops", []))
+
+            for ridx in sorted(set(int(x) for x in remove_idxs), reverse=True):
+                if ridx < 0 or ridx >= len(assignments):
+                    continue
+                aa = assignments.pop(ridx)
+                h = hours_between_ticks(int(aa.start_t), int(aa.end_t))
+                emp_hours[aa.employee_name] = float(emp_hours.get(aa.employee_name, 0.0) or 0.0) - h
+                total_labor_hours -= h
+                occ = emp_day_occupancy.setdefault((aa.employee_name, aa.day), set())
+                for tt in range(int(aa.start_t), int(aa.end_t)):
+                    occ.discard(int(tt))
+                    k = (aa.day, aa.area, int(tt))
+                    coverage[k] = max(0, int(coverage.get(k, 0)) - 1)
+                    run_state["uncovered_min"][k] = max(0, int(min_req.get(k, 0)) - int(coverage.get(k, 0)))
+
+            for midx, new_area in modify_ops:
+                if midx < 0 or midx >= len(assignments):
+                    continue
+                old = assignments[midx]
+                if old.employee_name != emp_name or old.day != day or old.area == new_area:
+                    continue
+                for tt in range(int(old.start_t), int(old.end_t)):
+                    old_k = (old.day, old.area, int(tt))
+                    new_k = (old.day, str(new_area), int(tt))
+                    coverage[old_k] = max(0, int(coverage.get(old_k, 0)) - 1)
+                    coverage[new_k] = int(coverage.get(new_k, 0)) + 1
+                    run_state["uncovered_min"][old_k] = max(0, int(min_req.get(old_k, 0)) - int(coverage.get(old_k, 0)))
+                    run_state["uncovered_min"][new_k] = max(0, int(min_req.get(new_k, 0)) - int(coverage.get(new_k, 0)))
+                assignments[midx] = Assignment(old.day, str(new_area), int(old.start_t), int(old.end_t), old.employee_name, locked=old.locked, source=old.source)
+
+            for d, area, st, en in add_ops:
+                if not add_assignment(Assignment(d, area, int(st), int(en), emp_name, locked=False, source="merged_repair"), locked_ok=False, cov=coverage, enforce_weekly_cap=True):
+                    return False
+
+            emp_state_version[emp_name] = int(emp_state_version.get(emp_name, 0)) + 1
+            envelopes_by_emp_day = derive_master_envelopes(assignments)
+
+            stats["merged_candidates_selected"][str(cand.get("family", "extend_absorb"))] += 1
+            stats["adds_extend"] += 1 if str(cand.get("family", "")) == "extend_absorb" else 0
+            stats["adds_open"] += 1 if str(cand.get("family", "")) == "combined_open" else 0
+            if len(stats["example_repairs"]) < 5:
+                stats["example_repairs"].append({
+                    "family": str(cand.get("family", "")),
+                    "employee": emp_name,
+                    "day": day,
+                    "gain_raw": int(cand.get("gain_raw", 0)),
+                    "gain_weighted": float(cand.get("gain_weighted", 0.0)),
+                    "delta_hours": float(cand.get("delta_hours", 0.0)),
+                    "window": [int(cand.get("wst", 0)), int(cand.get("wen", 0))],
+                })
+            return True
+
+        def _build_candidates_for_window(day: str, area: str, wst: int, wen: int) -> List[Dict[str, Any]]:
+            cands: List[Dict[str, Any]] = []
+            window_core = (int(wst), int(min(int(wen), int(wst) + 8)))
+            w_core_st, w_core_en = window_core
+
+            # Family 1: extend-and-absorb.
+            for e in model.employees[:120]:
+                if getattr(e, "work_status", "") != "Active" or (not bool(getattr(e, "wants_hours", True))):
+                    continue
+                if area not in getattr(e, "areas_allowed", []):
+                    continue
+                blocks = envelopes_by_emp_day.get((e.name, day), [])
+                if not blocks:
+                    continue
+                for bst, ben in blocks[:3]:
+                    for side in ("left", "right"):
+                        if side == "left" and int(w_core_en) <= int(bst):
+                            st = int(w_core_st)
+                            en = int(bst)
+                        elif side == "right" and int(w_core_st) >= int(ben):
+                            st = int(ben)
+                            en = int(w_core_en)
+                        else:
+                            continue
+                        if en <= st or (en - st) > 8:
+                            continue
+                        gain_raw = sum(max(0, int(min_req.get((day, area, tt), 0)) - int(coverage.get((day, area, tt), 0))) for tt in range(int(st), int(en)))
+                        if gain_raw <= 0:
+                            continue
+                        cand = {
+                            "family": "extend_absorb",
+                            "employee": e.name,
+                            "day": day,
+                            "wst": int(wst),
+                            "wen": int(wen),
+                            "add_ops": [(day, area, int(st), int(en))],
+                            "remove_idxs": [],
+                            "modify_ops": [],
+                            "gain_raw": int(gain_raw),
+                            "gain_weighted": float(gain_raw) * float(area_priority.get(area, 1.0)),
+                            "delta_hours": float(hours_between_ticks(int(st), int(en))),
+                            "fragment_penalty": 0.0,
+                        }
+                        cands.append(cand)
+                        stats["merged_candidates_generated"]["extend_absorb"] += 1
+
+            # Family 2: combined new-envelope open.
+            for e in model.employees[:150]:
+                if getattr(e, "work_status", "") != "Active" or (not bool(getattr(e, "wants_hours", True))):
+                    continue
+                if envelopes_by_emp_day.get((e.name, day), []):
+                    continue
+                cst = max(0, int(w_core_st) - 2)
+                cen = min(DAY_TICKS, int(w_core_en) + 2)
+                segs = _segments_covering_gap(day, cst, cen)
+                if not segs:
+                    continue
+                add_ops: List[Tuple[str, str, int, int]] = []
+                gain_raw = 0
+                for st, en, aa, need in segs:
+                    if aa not in getattr(e, "areas_allowed", []):
+                        continue
+                    add_ops.append((day, aa, int(st), int(en)))
+                    gain_raw += int(need)
+                if len(add_ops) <= 0 or gain_raw <= 0:
+                    continue
+                env_st = min(int(x[2]) for x in add_ops)
+                env_en = max(int(x[3]) for x in add_ops)
+                if (env_en - env_st) > 10:
+                    continue
+                merged_int = _merge_touching_intervals([(int(x[2]), int(x[3])) for x in add_ops])
+                if len(merged_int) != 1:
+                    continue
+                cand = {
+                    "family": "combined_open",
+                    "employee": e.name,
+                    "day": day,
+                    "wst": int(wst),
+                    "wen": int(wen),
+                    "add_ops": add_ops,
+                    "remove_idxs": [],
+                    "modify_ops": [],
+                    "gain_raw": int(gain_raw),
+                    "gain_weighted": float(sum(max(0, int(min_req.get((day, aa, tt), 0)) - int(coverage.get((day, aa, tt), 0))) * float(area_priority.get(aa, 1.0)) for (_d, aa, s, e2) in add_ops for tt in range(int(s), int(e2)))),
+                    "delta_hours": float(sum(hours_between_ticks(int(s), int(e2)) for (_d, _a, s, e2) in add_ops)),
+                    "fragment_penalty": float(max(0, len(add_ops) - 1)),
+                }
+                cands.append(cand)
+                stats["merged_candidates_generated"]["combined_open"] += 1
+
+            # Family 3: same-day internal re-slice/repack.
+            for idx, a in enumerate(assignments):
+                if a.day != day or a.area == area:
+                    continue
+                e = emp_by_name.get(a.employee_name)
+                if e is None:
+                    continue
+                if area not in getattr(e, "areas_allowed", []):
+                    continue
+                ov_st = max(int(a.start_t), int(w_core_st))
+                ov_en = min(int(a.end_t), int(w_core_en))
+                if ov_en <= ov_st:
+                    continue
+                gain_raw = sum(max(0, int(min_req.get((day, area, tt), 0)) - int(coverage.get((day, area, tt), 0))) for tt in range(int(ov_st), int(ov_en)))
+                if gain_raw <= 0:
+                    continue
+                cand = {
+                    "family": "internal_reslice",
+                    "employee": a.employee_name,
+                    "day": day,
+                    "wst": int(wst),
+                    "wen": int(wen),
+                    "add_ops": [],
+                    "remove_idxs": [],
+                    "modify_ops": [(int(idx), str(area))],
+                    "gain_raw": int(gain_raw),
+                    "gain_weighted": float(gain_raw) * float(area_priority.get(area, 1.0)),
+                    "delta_hours": 0.0,
+                    "fragment_penalty": 0.6,
+                }
+                cands.append(cand)
+                stats["merged_candidates_generated"]["internal_reslice"] += 1
+
+            cands.sort(key=_candidate_score, reverse=True)
+            return cands[:40]
+
+        windows_ranked: List[Tuple[float, str, str, int, int, int]] = []
         for area in ("KITCHEN", "CARWASH", "CSTORE"):
             min_window = 2 if area != "CSTORE" else 3
-            windows = _build_contiguous_deficit_windows(area, min_need_ticks=min_window)
-            for (day, wst, wen, _demand) in windows[:80]:
-                local_progress = True
-                while local_progress:
-                    local_progress = False
-                    for L in (6, 4, 2):
-                        if L == 2 and area == "CSTORE":
-                            continue
-                        for st in range(int(wst), max(int(wst), int(wen) - int(L)) + 1):
-                            en = int(st) + int(L)
-                            if en > int(wen):
-                                continue
-                            need_ticks = sum(1 for tt in range(int(st), int(en)) if coverage.get((day, area, int(tt)), 0) < min_req.get((day, area, int(tt)), 0))
-                            if need_ticks < max(2, int(L // 2)):
-                                continue
-                            stats["window_attempts"] += 1
-                            if open_or_extend_master_envelope(day, area, st, en, only_within_existing=True, enforce_weekly_cap=True, prefer_underutilized=(area == "CSTORE")):
-                                local_progress = True
-                                stats["adds_extend"] += 1
-                                break
-                            if open_or_extend_master_envelope(day, area, st, en, only_within_existing=False, enforce_weekly_cap=True, prefer_underutilized=(area == "CSTORE")):
-                                local_progress = True
-                                stats["adds_open"] += 1
-                                break
-                        if local_progress:
-                            break
-                # Recompute to keep ranking fresh after each window.
-                windows = _build_contiguous_deficit_windows(area, min_need_ticks=min_window)
+            for (day, st, en, demand) in _build_contiguous_deficit_windows(area, min_need_ticks=min_window)[:60]:
+                wt = _window_deficit_weight(day, int(st), int(en))
+                windows_ranked.append((float(wt), day, area, int(st), int(en), int(demand)))
+        windows_ranked.sort(key=lambda x: (x[0], x[5]), reverse=True)
+
+        for _wt, day, area, wst, wen, _dem in windows_ranked[:120]:
+            stats["window_attempts"] += 1
+            pool = _build_candidates_for_window(day, area, int(wst), int(wen))
+            legal_pool: List[Dict[str, Any]] = []
+            for cand in pool:
+                if _candidate_legal(cand):
+                    legal_pool.append(cand)
+                    stats["merged_candidates_legal"][str(cand.get("family", "extend_absorb"))] += 1
+            if not legal_pool:
+                continue
+            legal_pool.sort(key=_candidate_score, reverse=True)
+            best = legal_pool[0]
+            if _apply_candidate(best):
+                # Refresh deficits after each accepted merged repair.
+                continue
+
         return stats
 
 
