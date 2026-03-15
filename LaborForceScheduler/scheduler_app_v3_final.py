@@ -288,6 +288,43 @@ def load_state_law_profile(state_code: str) -> Tuple[Dict[str, Any], str]:
         return payload, f"State law profile for {code} is missing required sections. Falling back to current/default rules."
     return payload, ""
 
+
+def apply_state_law_profile_to_model(model: "DataModel", state_code: str, profile: Dict[str, Any]) -> Tuple[bool, str]:
+    """Apply a loaded state-law profile to runtime model settings when safely supported.
+
+    Returns (applied, status_message). Caller should keep default behavior when applied=False.
+    """
+    code = str(state_code or "").strip().upper()
+    if not isinstance(profile, dict):
+        return False, f"State law profile apply skipped for {code}: profile payload is not a JSON object."
+    if str(profile.get("state_code", "")).strip().upper() != code:
+        return False, f"State law profile apply skipped for {code}: profile state_code mismatch."
+    if not bool(profile.get("complete", False)):
+        return False, f"State law profile apply skipped for {code}: profile marked incomplete."
+
+    # Runtime mapping is intentionally conservative in this pass.
+    # We map only fields that are already represented by runtime model settings.
+    if code != "ND":
+        return False, f"State law profile loaded for {code}; runtime mapping not defined yet (defaults retained)."
+
+    minor_rules = profile.get("minor_rules", {})
+    if not isinstance(minor_rules, dict):
+        return False, "State law profile apply skipped for ND: minor_rules section missing/invalid."
+
+    mode = str(minor_rules.get("mode", "")).strip().lower()
+    if mode not in {"nd_14_15", "north_dakota_14_15"}:
+        return False, "State law profile apply skipped for ND: unsupported minor_rules mode."
+
+    try:
+        model.nd_rules.enforce = bool(minor_rules.get("enforce", True))
+        school_week_default = minor_rules.get("school_week_default", None)
+        if isinstance(school_week_default, bool):
+            model.nd_rules.is_school_week = bool(school_week_default)
+    except Exception as ex:
+        return False, f"State law profile apply failed for ND: {ex}"
+
+    return True, "State law profile applied for ND runtime minor-rule settings."
+
 def _safe_export_label_token(label: str, max_len: int = 24) -> str:
     raw = str(label or '').strip()
     wk = week_sun_from_label(raw)
@@ -8149,6 +8186,10 @@ class SchedulerApp(tk.Tk):
         style.configure("Header.TLabel", font=("Segoe UI", 18, "bold"))
         style.configure("SubHeader.TLabel", font=("Segoe UI", 12, "bold"))
 
+        # Shared workspace faux-tab chrome (visual-only; architecture unchanged).
+        style.configure("MainTabInactive.TButton", padding=(10, 3), relief="raised")
+        style.configure("MainTabActive.TButton", padding=(10, 3), relief="sunken")
+
     def _build_ui(self):
         topbar = ttk.Frame(self); topbar.pack(fill="x", padx=10, pady=8)
         # Global header (image only)
@@ -8173,10 +8214,14 @@ class SchedulerApp(tk.Tk):
         schedule_row = ttk.Frame(shell)
         schedule_row.grid(row=0, column=0, sticky="ew")
         ttk.Label(schedule_row, text="Schedule Tabs:", style="SubHeader.TLabel").pack(side="left", padx=(0, 8))
+        self.schedule_tabs_host = ttk.Frame(schedule_row)
+        self.schedule_tabs_host.pack(side="left", fill="x", expand=True)
 
         manager_row = ttk.Frame(shell)
         manager_row.grid(row=1, column=0, sticky="ew", pady=(2, 6))
         ttk.Label(manager_row, text="Manager Tabs:", style="SubHeader.TLabel").pack(side="left", padx=(0, 8))
+        self.manager_tabs_host = ttk.Frame(manager_row)
+        self.manager_tabs_host.pack(side="left", fill="x", expand=True)
 
         self.shared_main_host = ttk.Frame(shell)
         self.shared_main_host.grid(row=2, column=0, sticky="nsew")
@@ -8225,12 +8270,25 @@ class SchedulerApp(tk.Tk):
         self.schedule_tab_var = tk.StringVar(value="store")
         self.manager_tab_var = tk.StringVar(value="manager_tasks")
 
+        self._main_tab_buttons: Dict[str, ttk.Button] = {}
         for key, label, _frame in self._schedule_tabs:
-            ttk.Radiobutton(schedule_row, text=label, value=key, variable=self.schedule_tab_var,
-                            command=lambda k=key: self.show_main_tab(k)).pack(side="left", padx=(0, 4))
+            btn = ttk.Button(
+                self.schedule_tabs_host,
+                text=label,
+                style="MainTabInactive.TButton",
+                command=lambda k=key: self.show_main_tab(k),
+            )
+            btn.pack(side="left", padx=(0, 4))
+            self._main_tab_buttons[key] = btn
         for key, label, _frame in self._manager_tabs:
-            ttk.Radiobutton(manager_row, text=label, value=key, variable=self.manager_tab_var,
-                            command=lambda k=key: self.show_main_tab(k)).pack(side="left", padx=(0, 4))
+            btn = ttk.Button(
+                self.manager_tabs_host,
+                text=label,
+                style="MainTabInactive.TButton",
+                command=lambda k=key: self.show_main_tab(k),
+            )
+            btn.pack(side="left", padx=(0, 4))
+            self._main_tab_buttons[key] = btn
 
         self._build_store_tab()
         self._build_emps_tab()
@@ -8250,6 +8308,14 @@ class SchedulerApp(tk.Tk):
         self._build_settings_tab()
         self.show_main_tab("store")
 
+    def _refresh_main_tab_chrome(self, active_key: str):
+        active = str(active_key or "").strip()
+        for key, btn in getattr(self, "_main_tab_buttons", {}).items():
+            try:
+                btn.configure(style=("MainTabActive.TButton" if key == active else "MainTabInactive.TButton"))
+            except Exception:
+                pass
+
     def show_main_tab(self, tab_key: str):
         key = str(tab_key or "").strip()
         if key not in getattr(self, "main_tab_frames", {}):
@@ -8261,6 +8327,7 @@ class SchedulerApp(tk.Tk):
             self.schedule_tab_var.set(key)
         else:
             self.manager_tab_var.set(key)
+        self._refresh_main_tab_chrome(key)
 
     # -------- Store tab --------
     def _build_store_tab(self):
@@ -8430,9 +8497,22 @@ class SchedulerApp(tk.Tk):
             peak_hours_soft=peak_hours_soft,
         )
         prof, warn = load_state_law_profile(store_state)
+        applied = False
+        apply_msg = ""
+        if prof:
+            try:
+                applied, apply_msg = apply_state_law_profile_to_model(self.model, store_state, prof)
+            except Exception as ex:
+                applied, apply_msg = False, f"State law profile apply failed for {store_state}: {ex}"
         if warn:
             _write_run_log(f"STATE_LAW | {warn}")
             messagebox.showwarning("Store State Profile", warn)
+        if apply_msg:
+            _write_run_log(f"STATE_LAW | {apply_msg}")
+        if prof and not warn and not applied:
+            self._set_status(f"State law profile loaded for {store_state}; default runtime rules retained.")
+        elif applied:
+            self._set_status(f"State law profile applied for {store_state}.")
         self.autosave()
         messagebox.showinfo("Store", "Saved.")
 
@@ -8612,11 +8692,20 @@ class SchedulerApp(tk.Tk):
         ttk.Button(btn_row, text="Delete Request", command=self.delete_time_off_request).pack(side="left", padx=6)
 
         cols = ("Employee", "Day", "Window", "Status", "Note")
-        self.time_off_tree = ttk.Treeview(req_box, columns=cols, show="headings", height=10)
+        tor_wrap = ttk.Frame(req_box)
+        tor_wrap.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.time_off_tree = ttk.Treeview(tor_wrap, columns=cols, show="headings", height=10)
         for c in cols:
             self.time_off_tree.heading(c, text=c)
             self.time_off_tree.column(c, width=170 if c != "Note" else 320)
-        self.time_off_tree.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        tor_ys = ttk.Scrollbar(tor_wrap, orient="vertical", command=self.time_off_tree.yview)
+        tor_xs = ttk.Scrollbar(tor_wrap, orient="horizontal", command=self.time_off_tree.xview)
+        self.time_off_tree.configure(yscrollcommand=tor_ys.set, xscrollcommand=tor_xs.set)
+        self.time_off_tree.grid(row=0, column=0, sticky="nsew")
+        tor_ys.grid(row=0, column=1, sticky="ns")
+        tor_xs.grid(row=1, column=0, sticky="ew")
+        tor_wrap.rowconfigure(0, weight=1)
+        tor_wrap.columnconfigure(0, weight=1)
 
         status_row = ttk.LabelFrame(req_box, text="Request Status Review")
         status_row.pack(fill="x", padx=8, pady=(0, 8))
@@ -9399,7 +9488,9 @@ class SchedulerApp(tk.Tk):
         self.summary_lbl.pack(fill="x", pady=(0,8))
 
         cols = ("Day","Area","Start","End","Employee","Source","Locked")
-        self.out_tree = ttk.Treeview(frm, columns=cols, show="headings", height=18)
+        out_wrap = ttk.Frame(frm)
+        out_wrap.pack(fill="both", expand=True)
+        self.out_tree = ttk.Treeview(out_wrap, columns=cols, show="headings", height=18)
         for c in cols:
             self.out_tree.heading(c, text=c)
             w=150
@@ -9407,7 +9498,14 @@ class SchedulerApp(tk.Tk):
             if c=="Source": w=120
             if c=="Locked": w=80
             self.out_tree.column(c, width=w)
-        self.out_tree.pack(fill="both", expand=True)
+        out_ys = ttk.Scrollbar(out_wrap, orient="vertical", command=self.out_tree.yview)
+        out_xs = ttk.Scrollbar(out_wrap, orient="horizontal", command=self.out_tree.xview)
+        self.out_tree.configure(yscrollcommand=out_ys.set, xscrollcommand=out_xs.set)
+        self.out_tree.grid(row=0, column=0, sticky="nsew")
+        out_ys.grid(row=0, column=1, sticky="ns")
+        out_xs.grid(row=1, column=0, sticky="ew")
+        out_wrap.rowconfigure(0, weight=1)
+        out_wrap.columnconfigure(0, weight=1)
 
         # P2-2 Explainability: Right-click an assignment row to explain.
         self._out_tree_menu = tk.Menu(self, tearoff=0)
@@ -9421,6 +9519,7 @@ class SchedulerApp(tk.Tk):
 
         # hint
         ttk.Label(frm, text="Tip: Right-click an assignment row above → Explain Assignment", foreground="#666").pack(anchor="w", pady=(6,0))
+        self._set_schedule_workspace_empty_state()
 
     def _on_out_tree_right_click(self, event):
         try:
@@ -10680,10 +10779,32 @@ class SchedulerApp(tk.Tk):
             return payload.get("pages", {}) or {}
         return {}
 
+    def _set_schedule_workspace_empty_state(self):
+        has_basics = bool(getattr(self.model, "employees", [])) and bool(getattr(self.model, "requirements", []))
+        if has_basics:
+            self.summary_lbl.config(text="No schedule generated yet. Generate Fresh or Regenerate From Current to populate results.")
+        else:
+            self.summary_lbl.config(text="No data loaded. Open or create a data file to begin.")
+
+        self.warn_txt.delete("1.0", tk.END)
+        self.warn_txt.insert(tk.END, "No schedule generated yet.\n")
+        self.warn_txt.insert(tk.END, "Generate Fresh or Regenerate From Current to populate results.\n")
+
+        try:
+            self.preview_txt.delete("1.0", tk.END)
+            self.preview_txt.insert(tk.END, "Current schedule: (none)\n")
+            self.preview_txt.insert(tk.END, "Assignments: 0\n")
+            self.preview_txt.insert(tk.END, "Open or create a data file to begin.\n")
+        except Exception:
+            pass
+
     def _apply_current_schedule_to_output_views(self):
         for i in self.out_tree.get_children():
             self.out_tree.delete(i)
         assigns = list(self.current_assignments or [])
+        if not assigns:
+            self._set_schedule_workspace_empty_state()
+            return
         for a in sorted(assigns, key=lambda x: (DAYS.index(x.day), AREAS.index(x.area), x.start_t, x.employee_name)):
             self.out_tree.insert("", "end", values=(a.day, a.area, tick_to_hhmm(a.start_t), tick_to_hhmm(a.end_t), a.employee_name, a.source, "Yes" if a.locked else "No"))
 
@@ -12801,7 +12922,7 @@ class SchedulerApp(tk.Tk):
             self.perf_detail_text.insert("end", f"- {dt} | {typ}{extra} | {note}\n")
 
     def _build_manager_tab(self):
-        frm = ttk.Frame(self.tab_mgr); frm.pack(fill="both", expand=True, padx=10, pady=10)
+        _outer, frm, _canvas = _build_scrollable_canvas_host(self.tab_mgr, padding=(10, 10, 10, 10), min_width=980)
 
         ttk.Label(frm, text="Manager Goals (caps are saved/validated; solver enforcement starts later)", style="Header.TLabel").pack(anchor="w", pady=(0,8))
 
@@ -13499,6 +13620,14 @@ class SchedulerApp(tk.Tk):
         try:
             self.model = load_data(path)
             self.data_path = path
+            self.current_label = self._default_week_label()
+            self.label_var.set(self.current_label)
+            self.current_assignments = []
+            self.current_emp_hours = {}
+            self.current_total_hours = 0.0
+            self.current_warnings = []
+            self.current_filled = 0
+            self.current_total_slots = 0
             self._apply_ui_scale(self.model.settings.ui_scale)
             self._refresh_all()
             messagebox.showinfo("Open", "Loaded data.")
@@ -13529,6 +13658,8 @@ class SchedulerApp(tk.Tk):
         self.current_emp_hours = {}
         self.current_total_hours = 0.0
         self.current_warnings = []
+        self.current_filled = 0
+        self.current_total_slots = 0
         self._refresh_all()
         self.autosave()
 
@@ -13570,6 +13701,10 @@ class SchedulerApp(tk.Tk):
             pass
         try:
             self._refresh_change_viewer()
+        except Exception:
+            pass
+        try:
+            self._apply_current_schedule_to_output_views()
         except Exception:
             pass
         # Manager Goals

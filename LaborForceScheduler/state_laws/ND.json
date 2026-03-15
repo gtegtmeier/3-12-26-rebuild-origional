@@ -1,9 +1,54 @@
 {
   "state_code": "ND",
   "state_name": "North Dakota",
-  "complete": false,
-  "notes": "Placeholder profile. Program will fall back to default rules until this is completed.",
+  "complete": true,
+  "profile_version": "2026-03-15",
+  "updated_at": "2026-03-15",
+  "notes": "North Dakota baseline profile for scheduling context. Runtime mapping in this build applies ND minor-rule controls; break and overtime sections are stored for profile completeness and future rule-engine expansion.",
+  "source_notes": [
+    "ND meal break baseline: 30-minute meal break for shifts exceeding 5 hours when 2 or more employees are on duty.",
+    "ND short rest breaks are not required; if provided, short breaks are paid.",
+    "Overtime baseline: >40 hours/week for covered nonexempt employees at 1.5x.",
+    "Youth employment scheduling limits (ages 14-15) include time-of-day and school/non-school day/week hour caps."
+  ],
+  "break_rules": {
+    "meal_break_required": true,
+    "meal_break_minutes": 30,
+    "meal_break_trigger_hours": 5,
+    "meal_break_min_employees_on_duty": 2,
+    "paid_rest_break_required": false,
+    "paid_short_break_if_offered": true
+  },
+  "overtime_rules": {
+    "weekly_threshold_hours": 40,
+    "multiplier": 1.5,
+    "applies_to": "covered_nonexempt"
+  },
   "minor_rules": {
-    "mode": "default_fallback"
-  }
+    "mode": "nd_14_15",
+    "enforce": true,
+    "school_week_default": true,
+    "age_14_15": {
+      "time_window": {
+        "school_year": {
+          "earliest": "07:00",
+          "latest": "19:00"
+        },
+        "summer_june_1_to_labor_day": {
+          "earliest": "07:00",
+          "latest": "21:00"
+        }
+      },
+      "hours_limits": {
+        "school_day_max_hours": 3,
+        "school_week_max_hours": 18,
+        "non_school_day_max_hours": 8,
+        "non_school_week_max_hours": 40
+      }
+    }
+  },
+  "scheduling_notes": [
+    "Current runtime hard-checks in this build enforce ND 14-15 minor windows and hour caps using model.nd_rules toggles.",
+    "Break and overtime sections are profile-complete data for policy reference and future runtime expansion."
+  ]
 }
