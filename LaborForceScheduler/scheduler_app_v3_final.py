@@ -26,7 +26,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Tuple, Optional, Set, Any
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, colorchooser
 import tkinter.font as tkfont
 
 # ---- Build/version ----
@@ -957,6 +957,31 @@ class StoreInfo:
         "KITCHEN": [("", ""), ("", ""), ("", "")],
         "CARWASH": [("", ""), ("", ""), ("", "")],
     })
+    # Report/UI metadata only (does not affect solver behavior).
+    area_colors: Dict[str, str] = field(default_factory=lambda: {
+        "CSTORE": "#2f4f4f",
+        "KITCHEN": "#5a4a3a",
+        "CARWASH": "#3d4f6a",
+    })
+
+
+def _default_area_colors() -> Dict[str, str]:
+    return {
+        "CSTORE": "#2f4f4f",
+        "KITCHEN": "#5a4a3a",
+        "CARWASH": "#3d4f6a",
+    }
+
+
+def _normalize_area_colors(raw: Any) -> Dict[str, str]:
+    out = _default_area_colors()
+    if not isinstance(raw, dict):
+        return out
+    for area in AREAS:
+        v = str(raw.get(area, "") or "").strip()
+        if re.fullmatch(r"#[0-9a-fA-F]{6}", v):
+            out[area] = v.lower()
+    return out
 
 
 def _norm_hhmm_or_default(v: str, default: str) -> str:
@@ -1821,6 +1846,10 @@ def load_data(path: str) -> DataModel:
         m.store_info.peak_hours_soft = _normalize_peak_hours_soft(getattr(m.store_info, "peak_hours_soft", {}) or {})
     except Exception:
         m.store_info.peak_hours_soft = _normalize_peak_hours_soft({})
+    try:
+        m.store_info.area_colors = _normalize_area_colors(getattr(m.store_info, "area_colors", {}) or {})
+    except Exception:
+        m.store_info.area_colors = _default_area_colors()
 
     settings_raw = dict(payload.get("settings", {}) or {})
     try:
@@ -6637,10 +6666,15 @@ def make_employee_calendar_html(model: DataModel, label: str, assignments: List[
     def _format_hints(areas: set) -> str:
         hints = []
         if "KITCHEN" in areas:
-            hints.append("See Kitchen")
+            hints.append("<span class='hint-kitchen'>See Kitchen</span>")
         if "CARWASH" in areas:
-            hints.append("See Carwash")
+            hints.append("<span class='hint-carwash'>See Carwash</span>")
         return " • ".join(hints)
+
+    area_colors = _normalize_area_colors(getattr(model.store_info, "area_colors", {}) or {})
+    cstore_color = area_colors.get("CSTORE", _default_area_colors()["CSTORE"])
+    kitchen_color = area_colors.get("KITCHEN", _default_area_colors()["KITCHEN"])
+    carwash_color = area_colors.get("CARWASH", _default_area_colors()["CARWASH"])
 
     title = f"{html_escape(model.store_info.store_name or 'Schedule')} — Employee Calendar"
     phone = html_escape(model.store_info.store_phone or "")
@@ -6664,9 +6698,15 @@ def make_employee_calendar_html(model: DataModel, label: str, assignments: List[
       td.cell { font-size: 10px; line-height: 1.15; white-space: normal; overflow-wrap:anywhere; word-break: break-word; }
       .off { color:#111; font-weight:700; text-align:center; }
       .hint { color:#777; font-size: 9px; font-weight: 600; }
+      .main-cstore { color:__CSTORE_COLOR__; }
+      .hint-kitchen { color:__KITCHEN_COLOR__; }
+      .hint-carwash { color:__CARWASH_COLOR__; }
+      .kitchen-cell { color:__KITCHEN_COLOR__; }
+      .carwash-cell { color:__CARWASH_COLOR__; }
       .foot { margin-top:8px; font-size: 9px; color:#555; }
     </style>
     """
+    css = css.replace("__CSTORE_COLOR__", cstore_color).replace("__KITCHEN_COLOR__", kitchen_color).replace("__CARWASH_COLOR__", carwash_color)
 
     def _weekly_hours_str(name: str) -> str:
         weekly = emp_hours.get(name, 0.0)
@@ -6686,9 +6726,10 @@ def make_employee_calendar_html(model: DataModel, label: str, assignments: List[
         for _, _, a_set in blocks:
             all_areas |= a_set
         hint = _format_hints(all_areas)
+        times_html = f"<span class='main-cstore'>{html_escape(times)}</span>"
         if hint:
-            return f"{html_escape(times)}<br><span class='hint'>{html_escape(hint)}</span>"
-        return html_escape(times)
+            return f"{times_html}<br><span class='hint'>{hint}</span>"
+        return times_html
 
     def cell_area_only(e: Employee, day: str, area: str) -> str:
         items = by_emp_day_area.get((e.name, day, area), [])
@@ -6697,6 +6738,9 @@ def make_employee_calendar_html(model: DataModel, label: str, assignments: List[
             return ''  # blank if not scheduled in this department
         blocks = _merge_blocks([(int(a.start_t), int(a.end_t), area) for a in items])
         times = _format_time_blocks(blocks)
+        css_class = "kitchen-cell" if area == "KITCHEN" else ("carwash-cell" if area == "CARWASH" else "")
+        if css_class:
+            return f"<span class='{css_class}'>{html_escape(times)}</span>"
         return html_escape(times)
 
     def build_table(kind: str) -> str:
@@ -6847,11 +6891,11 @@ def make_employee_calendar_html_with_overrides(model: DataModel, label: str, ass
             if include_hints:
                 hints = []
                 if "KITCHEN" in areas:
-                    hints.append("See Kitchen")
+                    hints.append("<span class=\'hint-kitchen\'>See Kitchen</span>")
                 if "CARWASH" in areas:
-                    hints.append("See Carwash")
+                    hints.append("<span class=\'hint-carwash\'>See Carwash</span>")
                 if hints:
-                    seg += f' <span class="hint">({html_escape(" / ".join(hints))})</span>'
+                    seg += f' <span class="hint">({" / ".join(hints)})</span>'
             parts.append(seg)
         return "; ".join(parts)
 
@@ -6882,7 +6926,7 @@ def make_employee_calendar_html_with_overrides(model: DataModel, label: str, ass
                 return ""
             if s.strip().lower() == "off":
                 return '<div class="off">Off</div>'
-            return s
+            return f"<span class='main-cstore'>{s}</span>"
 
         # Default behavior from assignments
         items = []
@@ -6891,19 +6935,31 @@ def make_employee_calendar_html_with_overrides(model: DataModel, label: str, ass
         merged = _merge_blocks(items)
         if not merged:
             return '<div class="off">Off</div>'
-        return _blocks_to_str(merged, include_hints=True)
+        return f"<span class='main-cstore'>{_blocks_to_str(merged, include_hints=True)}</span>"
 
     def cell_area_only(e: Employee, d: str, kind: str) -> str:
         ov = _override(kind, e.name or "", d)
         if ov is not None:
             s = html_escape(ov).replace("\n", "<br>")
+            css_class = "kitchen-cell" if kind == "KITCHEN" else ("carwash-cell" if kind == "CARWASH" else "")
+            if css_class:
+                return f"<span class='{css_class}'>{s}</span>"
             return s
         lst = by_emp_day_area.get((e.name, d, kind), [])
         if not lst:
             return ""  # blank cells on department pages
         items = [(int(a.start_t), int(a.end_t), None) for a in lst]
         merged = _merge_blocks(items)
-        return _blocks_to_str(merged, include_hints=False)
+        text = _blocks_to_str(merged, include_hints=False)
+        css_class = "kitchen-cell" if kind == "KITCHEN" else ("carwash-cell" if kind == "CARWASH" else "")
+        if css_class:
+            return f"<span class='{css_class}'>{text}</span>"
+        return text
+
+    area_colors = _normalize_area_colors(getattr(model.store_info, "area_colors", {}) or {})
+    cstore_color = area_colors.get("CSTORE", _default_area_colors()["CSTORE"])
+    kitchen_color = area_colors.get("KITCHEN", _default_area_colors()["KITCHEN"])
+    carwash_color = area_colors.get("CARWASH", _default_area_colors()["CARWASH"])
 
     title = f"Employee Calendar Schedule — {html_escape(label)}"
     mgr = html_escape(getattr(model.store_info, "manager_name", "") or "")
@@ -6928,9 +6984,15 @@ def make_employee_calendar_html_with_overrides(model: DataModel, label: str, ass
       td.cell { font-size: 10px; line-height: 1.15; white-space: normal; overflow-wrap:anywhere; word-break: break-word; }
       .off { color:#111; font-weight:700; text-align:center; }
       .hint { color:#777; font-size: 9px; font-weight: 600; }
+      .main-cstore { color:__CSTORE_COLOR__; }
+      .hint-kitchen { color:__KITCHEN_COLOR__; }
+      .hint-carwash { color:__CARWASH_COLOR__; }
+      .kitchen-cell { color:__KITCHEN_COLOR__; }
+      .carwash-cell { color:__CARWASH_COLOR__; }
       .foot { margin-top:8px; font-size: 9px; color:#555; }
     </style>
     """
+    css = css.replace("__CSTORE_COLOR__", cstore_color).replace("__KITCHEN_COLOR__", kitchen_color).replace("__CARWASH_COLOR__", carwash_color)
 
     def build_table(kind: str) -> str:
         day_label = {"Sun":"Sunday","Mon":"Monday","Tue":"Tuesday","Wed":"Wednesday","Thu":"Thursday","Fri":"Friday","Sat":"Saturday"}
@@ -8396,15 +8458,24 @@ class SchedulerApp(tk.Tk):
         ttk.Label(hours, text="Area").grid(row=0, column=0, padx=8, pady=4, sticky="w")
         ttk.Label(hours, text="Open").grid(row=0, column=1, padx=8, pady=4, sticky="w")
         ttk.Label(hours, text="Close").grid(row=0, column=2, padx=8, pady=4, sticky="w")
+        ttk.Label(hours, text="Color").grid(row=0, column=3, padx=8, pady=4, sticky="w")
         rows = [
-            ("C-Store", self.cstore_open_var, self.cstore_close_var),
-            ("Kitchen", self.kitchen_open_var, self.kitchen_close_var),
-            ("Carwash", self.carwash_open_var, self.carwash_close_var),
+            ("CSTORE", "C-Store", self.cstore_open_var, self.cstore_close_var),
+            ("KITCHEN", "Kitchen", self.kitchen_open_var, self.kitchen_close_var),
+            ("CARWASH", "Carwash", self.carwash_open_var, self.carwash_close_var),
         ]
-        for rr, (lbl, open_var, close_var) in enumerate(rows, start=1):
+        self.area_color_vars: Dict[str, tk.StringVar] = {a: tk.StringVar(value=_default_area_colors()[a]) for a in AREAS}
+        self.area_color_swatches: Dict[str, ttk.Label] = {}
+        for rr, (area, lbl, open_var, close_var) in enumerate(rows, start=1):
             ttk.Label(hours, text=lbl).grid(row=rr, column=0, padx=8, pady=4, sticky="w")
             ttk.Combobox(hours, textvariable=open_var, values=TIME_CHOICES, state="readonly", width=8).grid(row=rr, column=1, padx=8, pady=4, sticky="w")
             ttk.Combobox(hours, textvariable=close_var, values=TIME_CHOICES, state="readonly", width=8).grid(row=rr, column=2, padx=8, pady=4, sticky="w")
+            color_host = ttk.Frame(hours)
+            color_host.grid(row=rr, column=3, padx=8, pady=4, sticky="w")
+            sw = ttk.Label(color_host, text="     ", background=self.area_color_vars[area].get())
+            sw.pack(side="left")
+            self.area_color_swatches[area] = sw
+            ttk.Button(color_host, text="Choose...", command=lambda a=area: self._pick_area_color(a)).pack(side="left", padx=(6, 0))
 
         r += 1
         peak = ttk.LabelFrame(box, text="Peak Hours (Soft Rules)")
@@ -8435,6 +8506,24 @@ class SchedulerApp(tk.Tk):
 
         ttk.Button(frm, text="Save Store Info", command=self.save_store_info).pack(anchor="w", padx=6, pady=10)
 
+    def _refresh_area_color_swatch(self, area: str):
+        try:
+            color = _normalize_area_colors({area: self.area_color_vars[area].get()}).get(area, _default_area_colors().get(area, "#444444"))
+            self.area_color_vars[area].set(color)
+            lbl = self.area_color_swatches.get(area)
+            if lbl is not None:
+                lbl.configure(background=color)
+        except Exception:
+            pass
+
+    def _pick_area_color(self, area: str):
+        base = _normalize_area_colors({area: self.area_color_vars.get(area, tk.StringVar(value="")).get()}).get(area, _default_area_colors().get(area, "#444444"))
+        chosen = colorchooser.askcolor(color=base, title=f"Select {AREA_LABEL.get(area, area)} Calendar Color")
+        if not chosen or not chosen[1]:
+            return
+        self.area_color_vars[area].set(str(chosen[1]))
+        self._refresh_area_color_swatch(area)
+
     def save_store_info(self):
         raw_state = str(self.store_state_var.get() or "").strip()
         store_state = raw_state.split(" - ", 1)[0].strip().upper() if raw_state else ""
@@ -8454,6 +8543,8 @@ class SchedulerApp(tk.Tk):
                 messagebox.showerror("Store", f"{area} close time must be after open time.")
                 return
             area_hours[area] = (int(op_t), int(cl_t))
+
+        area_colors = _normalize_area_colors({a: self.area_color_vars.get(a, tk.StringVar(value="")).get() for a in AREAS})
 
         peak_hours_soft: Dict[str, List[Tuple[str, str]]] = {}
         area_labels = {"CSTORE": "C-Store", "KITCHEN": "Kitchen", "CARWASH": "Carwash"}
@@ -8495,6 +8586,7 @@ class SchedulerApp(tk.Tk):
             carwash_open=self.carwash_open_var.get().strip() or "00:00",
             carwash_close=self.carwash_close_var.get().strip() or "24:00",
             peak_hours_soft=peak_hours_soft,
+            area_colors=area_colors,
         )
         prof, warn = load_state_law_profile(store_state)
         applied = False
@@ -9096,7 +9188,7 @@ class SchedulerApp(tk.Tk):
         c.create_text(left, top + row_h * len(AREAS) + 8, text=f'Day: {DAY_FULL.get(day, day)} | This timeline is read-only and derived from canonical requirement rows.', anchor='nw', fill='#555', font=('Segoe UI', 8))
 
     def _build_reqs_tab(self):
-        frm = ttk.Frame(self.tab_reqs); frm.pack(fill='both', expand=True, padx=12, pady=12)
+        _outer, frm, _canvas = _build_scrollable_canvas_host(self.tab_reqs, padding=(12, 12, 12, 12), min_width=1240)
 
         expl = ttk.LabelFrame(frm, text='Staffing Requirements Drive the Engine')
         expl.pack(fill='x', pady=(0,10))
@@ -13680,6 +13772,8 @@ class SchedulerApp(tk.Tk):
         self.carwash_close_var.set(_norm_hhmm_or_default(getattr(self.model.store_info, "carwash_close", "24:00"), "24:00"))
         peak_soft = _normalize_peak_hours_soft(getattr(self.model.store_info, "peak_hours_soft", {}) or {})
         self.model.store_info.peak_hours_soft = peak_soft
+        area_colors = _normalize_area_colors(getattr(self.model.store_info, "area_colors", {}) or {})
+        self.model.store_info.area_colors = area_colors
         for area in AREAS:
             vars_for_area = self.peak_soft_vars.get(area, [])
             windows = peak_soft.get(area, [("", ""), ("", ""), ("", "")])
@@ -13687,6 +13781,10 @@ class SchedulerApp(tk.Tk):
                 st, en = windows[idx] if idx < len(windows) else ("", "")
                 vars_for_area[idx][0].set(st or "")
                 vars_for_area[idx][1].set(en or "")
+        for area in AREAS:
+            if hasattr(self, "area_color_vars") and area in self.area_color_vars:
+                self.area_color_vars[area].set(area_colors.get(area, _default_area_colors().get(area, "#444444")))
+                self._refresh_area_color_swatch(area)
 
         self.refresh_emp_tree()
         self.refresh_override_dropdowns()
