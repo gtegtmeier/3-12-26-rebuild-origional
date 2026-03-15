@@ -2904,7 +2904,9 @@ def evaluate_schedule_hard_rules(model: DataModel, label: str, assignments: List
             return ASSIGNMENT_SOURCE_FIXED_LOCKED, True
         return ASSIGNMENT_SOURCE_ENGINE, False
 
-    for emp_name, pairs in by_emp.items():
+    all_emp_names = set(by_emp.keys()) | set(emp_by_name.keys())
+    for emp_name in sorted(all_emp_names):
+        pairs = list(by_emp.get(emp_name, []))
         e = emp_by_name.get(emp_name)
         if e is None:
             violations.append(HardRuleViolation(code="unknown-employee", message=f"unknown employee in assignment set ({len(pairs)} assignments)", employee_name=emp_name))
@@ -2969,10 +2971,10 @@ def evaluate_schedule_hard_rules(model: DataModel, label: str, assignments: List
         if (not weekly_override) and max_weekly > 0.0 and (weekly_hours - max_weekly) > 1e-9:
             violations.append(HardRuleViolation(code="employee-max-weekly-hours", message=f"scheduled={weekly_hours:.1f} max={max_weekly:.1f}", employee_name=emp_name, assignment_source=weekly_src, is_override_allowed=weekly_override))
 
-        # Best-effort participation floor: warning-only signal (does not block legality).
+        # Hard minimum weekly floor: true hard requirement.
         hard_min_weekly = float(getattr(e, "hard_min_weekly_hours", 0.0) or 0.0)
-        if e.work_status == "Active" and bool(getattr(e, "wants_hours", True)) and hard_min_weekly > 0.0 and weekly_hours + 1e-9 < hard_min_weekly:
-            violations.append(HardRuleViolation(code="employee-hard-min-weekly-shortfall", severity="warning", message=f"scheduled={weekly_hours:.1f} min={hard_min_weekly:.1f}", employee_name=emp_name, assignment_source=ASSIGNMENT_SOURCE_ENGINE))
+        if e.work_status == "Active" and hard_min_weekly > 0.0 and weekly_hours + 1e-9 < hard_min_weekly:
+            violations.append(HardRuleViolation(code="employee-hard-min-weekly-shortfall", severity="error", message=f"scheduled={weekly_hours:.1f} min={hard_min_weekly:.1f}", employee_name=emp_name, assignment_source=ASSIGNMENT_SOURCE_ENGINE))
 
         if model.nd_rules.enforce and e.minor_type == "MINOR_14_15":
             weekly_cap = nd_minor_weekly_hour_cap(model, e)
@@ -5013,6 +5015,180 @@ def generate_schedule(model: DataModel, label: str,
         "envelope_consistency": validate_master_envelope_consistency(assignments),
     }
 
+    hard_min_phase_details: Dict[str, Dict[str, Any]] = {}
+
+    def phase_assign_hard_minimum_hours() -> Dict[str, Any]:
+        stats: Dict[str, Any] = {
+            "employees_considered": 0,
+            "employees_with_targets": 0,
+            "employees_met": 0,
+            "employees_unmet": 0,
+            "hours_added": 0.0,
+            "per_employee": hard_min_phase_details,
+        }
+
+        def _base_entry(emp: Employee) -> Dict[str, Any]:
+            pre_h = float(emp_hours.get(emp.name, 0.0) or 0.0)
+            locked_h = float(sum(
+                hours_between_ticks(int(a.start_t), int(a.end_t))
+                for a in assignments
+                if a.employee_name == emp.name and assignment_provenance(a) == ASSIGNMENT_SOURCE_FIXED_LOCKED
+            ))
+            req_h = max(0.0, float(getattr(emp, "hard_min_weekly_hours", 0.0) or 0.0))
+            return {
+                "requested_min": req_h,
+                "locked_credit": locked_h,
+                "pre_phase_hours": pre_h,
+                "added_in_hard_min_phase": 0.0,
+                "post_phase_hours": pre_h,
+                "remaining_shortfall": max(0.0, req_h - pre_h),
+                "blockers": [],
+                "attempt_counters": {
+                    "considered": 0,
+                    "not_cstore": 0,
+                    "blocked_by_weekly_cap": 0,
+                    "blocked_by_hard_rules": 0,
+                    "no_legal_slot": 0,
+                },
+            }
+
+        target_emps: List[Employee] = [
+            e for e in model.employees
+            if e.work_status == "Active" and float(getattr(e, "hard_min_weekly_hours", 0.0) or 0.0) > 0.0
+        ]
+        stats["employees_considered"] = int(len(target_emps))
+        for e in target_emps:
+            hard_min_phase_details[e.name] = _base_entry(e)
+
+        target_emps.sort(key=lambda e: (
+            -(float(getattr(e, "hard_min_weekly_hours", 0.0) or 0.0) - float(emp_hours.get(e.name, 0.0) or 0.0)),
+            float(emp_hours.get(e.name, 0.0) or 0.0),
+            e.name.lower(),
+        ))
+
+        for e in target_emps:
+            detail = hard_min_phase_details.get(e.name, {})
+            requested = float(detail.get("requested_min", 0.0) or 0.0)
+            current = float(emp_hours.get(e.name, 0.0) or 0.0)
+            deficit = max(0.0, requested - current)
+            if deficit <= 1e-9:
+                detail["post_phase_hours"] = current
+                detail["remaining_shortfall"] = 0.0
+                stats["employees_met"] = int(stats.get("employees_met", 0)) + 1
+                continue
+
+            stats["employees_with_targets"] = int(stats.get("employees_with_targets", 0)) + 1
+            max_shift_h = max(0.0, float(employee_allowed_max_shift_hours(e) or 0.0))
+            min_shift_h = max(0.5, float(getattr(e, "min_hours_per_shift", 1.0) or 1.0))
+            practical_lengths = [8.0, 6.0, 4.0, 3.0, 2.0, min_shift_h]
+            practical_lengths = [h for h in practical_lengths if h >= min_shift_h - 1e-9 and h <= max_shift_h + 1e-9]
+            practical_lengths = sorted(set(max(min_shift_h, round(h * 2.0) / 2.0) for h in practical_lengths), reverse=True)
+            if not practical_lengths:
+                detail.setdefault("blockers", []).append("no_valid_shift_length_profile")
+                detail["remaining_shortfall"] = max(0.0, requested - float(emp_hours.get(e.name, 0.0) or 0.0))
+                stats["employees_unmet"] = int(stats.get("employees_unmet", 0)) + 1
+                continue
+
+            preferred_areas = []
+            if "CSTORE" in (getattr(e, "areas_allowed", []) or []):
+                preferred_areas.append("CSTORE")
+            else:
+                detail.setdefault("attempt_counters", {}).setdefault("not_cstore", 0)
+                detail["attempt_counters"]["not_cstore"] += 1
+            for ar in (getattr(e, "areas_allowed", []) or []):
+                if ar not in preferred_areas:
+                    preferred_areas.append(ar)
+            if not preferred_areas:
+                detail.setdefault("blockers", []).append("no_allowed_area")
+                detail["remaining_shortfall"] = max(0.0, requested - float(emp_hours.get(e.name, 0.0) or 0.0))
+                stats["employees_unmet"] = int(stats.get("employees_unmet", 0)) + 1
+                continue
+
+            passes = 0
+            while max(0.0, requested - float(emp_hours.get(e.name, 0.0) or 0.0)) > 1e-9 and passes < 8:
+                passes += 1
+                placed = False
+                remaining = max(0.0, requested - float(emp_hours.get(e.name, 0.0) or 0.0))
+                for day in DAYS:
+                    for area in preferred_areas:
+                        for seg_h in practical_lengths:
+                            if seg_h - remaining > max(min_shift_h, 1.0) + 1e-9:
+                                continue
+                            seg_ticks = max(1, int(round(seg_h * TICKS_PER_HOUR)))
+                            earliest = 0
+                            latest = DAY_TICKS - seg_ticks
+                            if latest < earliest:
+                                continue
+                            for st in range(earliest, latest + 1):
+                                detail["attempt_counters"]["considered"] = int(detail["attempt_counters"].get("considered", 0)) + 1
+                                en = int(st + seg_ticks)
+                                cand = Assignment(day, area, int(st), int(en), e.name, locked=False, source=ASSIGNMENT_SOURCE_ENGINE)
+                                before_h = float(emp_hours.get(e.name, 0.0) or 0.0)
+                                if not add_assignment(cand, locked_ok=False, cov=coverage, enforce_weekly_cap=False):
+                                    trial = assignments + [cand]
+                                    hard_ok = True
+                                    for v in evaluate_schedule_hard_rules(model, label, trial, include_override_warnings=False):
+                                        if v.severity == "error" and is_engine_managed_source(v.assignment_source):
+                                            hard_ok = False
+                                            break
+                                    if hard_ok:
+                                        detail["attempt_counters"]["blocked_by_weekly_cap"] = int(detail["attempt_counters"].get("blocked_by_weekly_cap", 0)) + 1
+                                    else:
+                                        detail["attempt_counters"]["blocked_by_hard_rules"] = int(detail["attempt_counters"].get("blocked_by_hard_rules", 0)) + 1
+                                    continue
+                                after_h = float(emp_hours.get(e.name, 0.0) or 0.0)
+                                added_h = max(0.0, after_h - before_h)
+                                detail["added_in_hard_min_phase"] = float(detail.get("added_in_hard_min_phase", 0.0) or 0.0) + added_h
+                                stats["hours_added"] = float(stats.get("hours_added", 0.0) or 0.0) + added_h
+                                placed = True
+                                break
+                            if placed:
+                                break
+                        if placed:
+                            break
+                    if placed:
+                        break
+                if not placed:
+                    detail["attempt_counters"]["no_legal_slot"] = int(detail["attempt_counters"].get("no_legal_slot", 0)) + 1
+                    break
+
+            final_h = float(emp_hours.get(e.name, 0.0) or 0.0)
+            detail["post_phase_hours"] = final_h
+            detail["remaining_shortfall"] = max(0.0, requested - final_h)
+            if float(detail.get("remaining_shortfall", 0.0) or 0.0) > 1e-9:
+                blockers = detail.setdefault("blockers", [])
+                c = detail.get("attempt_counters", {})
+                if int(c.get("blocked_by_hard_rules", 0)) > 0:
+                    blockers.append("blocked_by_employee_hard_legality")
+                if int(c.get("blocked_by_weekly_cap", 0)) > 0:
+                    blockers.append("blocked_by_employee_weekly_cap")
+                if int(c.get("no_legal_slot", 0)) > 0:
+                    blockers.append("no_legal_slot_found")
+                if not blockers:
+                    blockers.append("unknown_infeasibility")
+                stats["employees_unmet"] = int(stats.get("employees_unmet", 0)) + 1
+            else:
+                stats["employees_met"] = int(stats.get("employees_met", 0)) + 1
+
+        return stats
+
+    phase_diagnostics["phase0b_hard_minimum_hours"] = phase_assign_hard_minimum_hours()
+    try:
+        for emp_name, detail in (hard_min_phase_details or {}).items():
+            short_h = float(detail.get("remaining_shortfall", 0.0) or 0.0)
+            req_h = float(detail.get("requested_min", 0.0) or 0.0)
+            if req_h <= 0.0 or short_h <= 1e-9:
+                continue
+            blockers = list(detail.get("blockers", []) or [])
+            blocker_txt = ", ".join(blockers) if blockers else "no_clear_blocker_recorded"
+            warnings.append(
+                f"INFEASIBLE HARD-MIN: {emp_name} short by {short_h:.1f}h "
+                f"(requested={req_h:.1f}, pre={float(detail.get('pre_phase_hours', 0.0) or 0.0):.1f}, "
+                f"added={float(detail.get('added_in_hard_min_phase', 0.0) or 0.0):.1f}) blockers={blocker_txt}."
+            )
+    except Exception:
+        pass
+
     phase_diagnostics["phase1_cstore_primary"] = phase_fill_area_min(
         "CSTORE",
         lengths=(8, 6, 4, 2),
@@ -6062,14 +6238,14 @@ def generate_schedule(model: DataModel, label: str,
         details["attach_mode"] = attach_kind
         return seg_h
 
-    # unified participation + best-effort min-hours target routine
+    # unified participation routine (hard-minimum weekly hours are enforced earlier in phase0b)
     for nm in sorted(eligible_map.keys()):
         e = next((x for x in model.employees if x.name == nm), None)
         if e is None:
             participation_missed[nm] = "Employee record not found."
             continue
         cur_h = float(emp_hours.get(nm, 0.0) or 0.0)
-        target_h = max(1.0, float(getattr(e, "hard_min_weekly_hours", 0.0) or 0.0))
+        target_h = 1.0
         if cur_h + 1e-9 >= target_h:
             participation_details[nm] = {"result": "already_met", "current_hours": cur_h, "target_hours": target_h}
             continue
@@ -6102,7 +6278,7 @@ def generate_schedule(model: DataModel, label: str,
                 reasons.append("attach/extend gate prevented isolated dead-time block")
             if not reasons:
                 reasons.append("no feasible demand-window attach/extend slot under hard rules")
-            participation_missed[nm] = f"Could not reach weekly minimum target ({final_h:.1f}/{target_h:.1f}h): " + ", ".join(reasons)
+            participation_missed[nm] = f"Could not reach participation target ({final_h:.1f}/{target_h:.1f}h): " + ", ".join(reasons)
             participation_details[nm] = {
                 "result": "shortfall",
                 "current_hours": final_h,
@@ -6153,10 +6329,10 @@ def generate_schedule(model: DataModel, label: str,
                 if daily_cap is not None and h - daily_cap > 1e-9:
                     warnings.append(f"INTERNAL CHECK: ND minor daily cap violated for {e.name} on {d} ({h:.1f} > {daily_cap:.1f}).")
 
-    # participation / best-effort minimum-hours reporting
+    # participation reporting (separate from hard-minimum weekly enforcement)
     if participation_missed:
         for nm, reason in participation_missed.items():
-            warnings.append(f"Participation minimum-hours target shortfall: {nm} ({reason})")
+            warnings.append(f"Participation target shortfall: {nm} ({reason})")
     if floor_shortfall_hours > 1e-9:
         warnings.append(f"Labor floor shortfall: could not reach minimum_weekly_floor by {floor_shortfall_hours:.1f} hours under hard constraints.")
 
@@ -8237,6 +8413,9 @@ class SchedulerApp(tk.Tk):
         # branding images (optional)
         self.brand_img_header = None
         self.brand_img_store = None
+        self.brand_source_image = None
+        self._brand_tab_photo_refs: Dict[str, Any] = {}
+        self._brand_tab_last_size: Dict[str, Tuple[int, int]] = {}
         self._load_brand_images()
 
         self._setup_style()
@@ -8384,6 +8563,7 @@ class SchedulerApp(tk.Tk):
                 return
 
             base = Image.open(img_path)
+            self.brand_source_image = base.copy()
 
             def make(max_px: int):
                 im = base.copy()
@@ -8397,6 +8577,58 @@ class SchedulerApp(tk.Tk):
             # branding is optional; never block launch
             self.brand_img_header = None
             self.brand_img_store = None
+            self.brand_source_image = None
+
+    def _brand_make_tab_photo(self, max_w: int, max_h: int):
+        try:
+            if max_w <= 0 or max_h <= 0:
+                return None
+            if Image is None or ImageTk is None or getattr(self, "brand_source_image", None) is None:
+                return getattr(self, "brand_img_store", None)
+            im = self.brand_source_image.copy()
+            im.thumbnail((int(max_w), int(max_h)), Image.LANCZOS)
+            return ImageTk.PhotoImage(im)
+        except Exception:
+            return getattr(self, "brand_img_store", None)
+
+    def _attach_tab_brand_panel(self,
+                                host: tk.Misc,
+                                *,
+                                slot_key: str,
+                                min_w: int = 120,
+                                max_w: int = 280,
+                                min_h: int = 70,
+                                max_h: int = 180,
+                                rel_w: float = 0.22,
+                                rel_h: float = 0.28) -> Optional[ttk.Label]:
+        if getattr(self, "brand_img_store", None) is None and getattr(self, "brand_source_image", None) is None:
+            return None
+        try:
+            lbl = ttk.Label(host)
+            lbl.pack(anchor="ne", pady=(2, 2))
+
+            def _refresh(_e=None):
+                try:
+                    w = int(host.winfo_width())
+                    h = int(host.winfo_height())
+                except Exception:
+                    w, h = max_w, max_h
+                tgt_w = max(int(min_w), min(int(max_w), int(max(1, w) * float(rel_w))))
+                tgt_h = max(int(min_h), min(int(max_h), int(max(1, h) * float(rel_h))))
+                prev = self._brand_tab_last_size.get(slot_key)
+                if prev is not None and abs(prev[0] - tgt_w) < 8 and abs(prev[1] - tgt_h) < 6:
+                    return
+                photo = self._brand_make_tab_photo(tgt_w, tgt_h)
+                if photo is None:
+                    return
+                self._brand_tab_last_size[slot_key] = (tgt_w, tgt_h)
+                self._brand_tab_photo_refs[slot_key] = photo
+                lbl.configure(image=photo)
+            host.bind("<Configure>", _refresh, add="+")
+            self.after_idle(_refresh)
+            return lbl
+        except Exception:
+            return None
 
     def _setup_style(self):
         style = ttk.Style(self)
@@ -8818,8 +9050,7 @@ class SchedulerApp(tk.Tk):
             style="SubHeader.TLabel",
         ).grid(row=len(peak_rows)+1, column=0, columnspan=7, padx=8, pady=(6,4), sticky="w")
 
-        if getattr(self, "brand_img_store", None) is not None:
-            ttk.Label(right, image=self.brand_img_store).pack(anchor="ne")
+        self._attach_tab_brand_panel(right, slot_key="store_tab_brand", min_w=180, max_w=320, min_h=100, max_h=220, rel_w=0.95, rel_h=0.90)
 
         ttk.Button(frm, text="Save Store Info", command=self.save_store_info).pack(anchor="w", padx=6, pady=10)
 
@@ -13349,8 +13580,15 @@ class SchedulerApp(tk.Tk):
 
     def _build_manager_tab(self):
         _outer, frm, _canvas = _build_scrollable_canvas_host(self.tab_mgr, padding=(10, 10, 10, 10), min_width=980)
+        top = ttk.Frame(frm, style="Section.TFrame")
+        top.pack(fill="x", pady=(0, 8))
+        left_top = ttk.Frame(top, style="Section.TFrame")
+        left_top.pack(side="left", fill="x", expand=True)
+        right_top = ttk.Frame(top, style="Section.TFrame")
+        right_top.pack(side="right", anchor="ne", padx=(10, 0))
 
-        ttk.Label(frm, text="Manager Goals (caps are saved/validated; solver enforcement starts later)", style="Header.TLabel").pack(anchor="w", pady=(0,8))
+        ttk.Label(left_top, text="Manager Goals (caps are saved/validated; solver enforcement starts later)", style="Header.TLabel").pack(anchor="w")
+        self._attach_tab_brand_panel(right_top, slot_key="manager_tab_brand", min_w=150, max_w=280, min_h=90, max_h=180, rel_w=0.95, rel_h=0.85)
 
         goals = self.model.manager_goals
 
@@ -13747,7 +13985,14 @@ class SchedulerApp(tk.Tk):
     # -------- Settings tab --------
     def _build_settings_tab(self):
         _outer, frm, _canvas = _build_scrollable_canvas_host(self.tab_settings, padding=(12, 12, 12, 12), min_width=980)
-        ttk.Label(frm, text="Solver + UI settings.", style="SubHeader.TLabel").pack(anchor="w", pady=(0,8))
+        top = ttk.Frame(frm, style="Section.TFrame")
+        top.pack(fill="x", pady=(0, 8))
+        left_top = ttk.Frame(top, style="Section.TFrame")
+        left_top.pack(side="left", fill="x", expand=True)
+        right_top = ttk.Frame(top, style="Section.TFrame")
+        right_top.pack(side="right", anchor="ne", padx=(10, 0))
+        ttk.Label(left_top, text="Solver + UI settings.", style="SubHeader.TLabel").pack(anchor="w")
+        self._attach_tab_brand_panel(right_top, slot_key="settings_tab_brand", min_w=140, max_w=250, min_h=80, max_h=160, rel_w=0.90, rel_h=0.80)
 
         box = ttk.LabelFrame(frm, text="UI")
         box.pack(fill="x", pady=10)
