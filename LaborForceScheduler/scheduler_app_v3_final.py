@@ -7553,6 +7553,161 @@ def _build_scrollable_canvas_host(parent: tk.Misc,
 
     return outer, inner, canvas
 
+
+class ContextHelpManager:
+    """Reusable delayed hover help manager for Tk/ttk widgets."""
+
+    def __init__(self, parent: tk.Misc, delay_ms: int = 4000):
+        self.parent = parent
+        self.delay_ms = max(500, int(delay_ms))
+        self._registry: Dict[str, Dict[str, str]] = {}
+        self._after_id: Optional[str] = None
+        self._hovered_widget: Optional[tk.Misc] = None
+        self._active_widget: Optional[tk.Misc] = None
+        self._active_help_id: Optional[str] = None
+        self._bubble_win: Optional[tk.Toplevel] = None
+        self._more_win: Optional[tk.Toplevel] = None
+        self._short_var = tk.StringVar(value="")
+
+    def register(self, widget: tk.Misc, help_id: str, short_text: str, long_text: str):
+        hid = str(help_id or "").strip()
+        if not hid:
+            return
+        self._registry[hid] = {"short": str(short_text or "").strip(), "long": str(long_text or "").strip()}
+        try:
+            widget.bind("<Enter>", lambda _e, w=widget, h=hid: self._on_enter(w, h), add="+")
+            widget.bind("<Leave>", lambda _e: self.hide_all(), add="+")
+            widget.bind("<ButtonPress>", lambda _e: self.hide_all(), add="+")
+            widget.bind("<FocusOut>", lambda _e: self.hide_bubble(), add="+")
+            widget.bind("<Destroy>", lambda _e: self._on_widget_destroy(widget), add="+")
+        except Exception:
+            pass
+
+    def _on_widget_destroy(self, widget: tk.Misc):
+        if self._hovered_widget is widget or self._active_widget is widget:
+            self.hide_all()
+
+    def _on_enter(self, widget: tk.Misc, help_id: str):
+        self.hide_bubble()
+        self._cancel_pending()
+        self._hovered_widget = widget
+        self._after_id = self.parent.after(self.delay_ms, lambda w=widget, h=help_id: self._show_if_still_hovering(w, h))
+
+    def _cancel_pending(self):
+        if self._after_id:
+            try:
+                self.parent.after_cancel(self._after_id)
+            except Exception:
+                pass
+        self._after_id = None
+
+    def _show_if_still_hovering(self, widget: tk.Misc, help_id: str):
+        self._after_id = None
+        if widget is not self._hovered_widget:
+            return
+        try:
+            if not bool(widget.winfo_exists()):
+                return
+        except Exception:
+            return
+        self._show_bubble(widget, help_id)
+
+    def _show_bubble(self, widget: tk.Misc, help_id: str):
+        info = self._registry.get(help_id, {})
+        short = str(info.get("short", "") or "").strip()
+        if not short:
+            return
+        self.hide_bubble()
+        self._active_widget = widget
+        self._active_help_id = help_id
+
+        win = tk.Toplevel(self.parent)
+        self._bubble_win = win
+        win.wm_overrideredirect(True)
+        win.transient(self.parent)
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        body = ttk.Frame(win, style="HelpBubble.TFrame", padding=(8, 6, 8, 6))
+        body.pack(fill="both", expand=True)
+        self._short_var.set(short)
+        ttk.Label(body, textvariable=self._short_var, style="HelpBubble.TLabel", wraplength=320, justify="left").pack(anchor="w")
+        ttk.Button(body, text="More…", style="HelpMore.TButton", command=self._open_more).pack(anchor="e", pady=(4, 0))
+
+        try:
+            x = int(widget.winfo_rootx()) + 18
+            y = int(widget.winfo_rooty()) + int(max(26, widget.winfo_height())) + 4
+            sw = int(self.parent.winfo_screenwidth())
+            sh = int(self.parent.winfo_screenheight())
+            win.update_idletasks()
+            ww = int(win.winfo_reqwidth())
+            wh = int(win.winfo_reqheight())
+            x = max(6, min(x, sw - ww - 6))
+            y = max(6, min(y, sh - wh - 6))
+            win.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
+    def _open_more(self):
+        help_id = str(self._active_help_id or "").strip()
+        if not help_id:
+            return
+        info = self._registry.get(help_id, {})
+        short = str(info.get("short", "") or "").strip()
+        long_text = str(info.get("long", "") or "").strip()
+        if not long_text:
+            long_text = short
+
+        self.hide_bubble()
+        try:
+            if self._more_win is not None and bool(self._more_win.winfo_exists()):
+                self._more_win.destroy()
+        except Exception:
+            pass
+        self._more_win = tk.Toplevel(self.parent)
+        self._more_win.title("Context Help")
+        self._more_win.transient(self.parent)
+        self._more_win.geometry("560x360")
+        outer = ttk.Frame(self._more_win, padding=12)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text=short or "Help", style="SubHeader.TLabel").pack(anchor="w", pady=(0, 8))
+
+        txt = tk.Text(outer, wrap="word", relief="solid", borderwidth=1)
+        txt.pack(fill="both", expand=True)
+        txt.insert("1.0", long_text)
+        txt.configure(state="disabled")
+        ttk.Button(outer, text="Close", command=self._more_win.destroy).pack(anchor="e", pady=(8, 0))
+        self._more_win.bind("<FocusOut>", lambda _e: self._safe_close_more(), add="+")
+
+    def _safe_close_more(self):
+        try:
+            if self._more_win is not None and bool(self._more_win.winfo_exists()):
+                self._more_win.destroy()
+        except Exception:
+            pass
+        self._more_win = None
+
+    def hide_bubble(self):
+        self._cancel_pending()
+        self._hovered_widget = None
+        self._active_widget = None
+        self._active_help_id = None
+        try:
+            if self._bubble_win is not None and bool(self._bubble_win.winfo_exists()):
+                self._bubble_win.destroy()
+        except Exception:
+            pass
+        self._bubble_win = None
+
+    def hide_all(self):
+        self.hide_bubble()
+        self._safe_close_more()
+
+    def destroy(self):
+        self.hide_all()
+
 class FixedScheduleEditorDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, model: "DataModel", initial_entries: List[FixedShift], minor_type: str, label_hint: str):
         super().__init__(parent)
@@ -8085,9 +8240,14 @@ class SchedulerApp(tk.Tk):
         self._load_brand_images()
 
         self._setup_style()
+        self.help_manager = ContextHelpManager(self, delay_ms=4000)
+        self._help_catalog = self._build_help_catalog()
         self._build_ui()
+        self._register_phase1_help_controls()
         self._refresh_all()
         self._set_status(f"Data file: {self.data_path}")
+
+        self.bind("<FocusOut>", lambda _e: self.help_manager.hide_all(), add="+")
 
         # --- Autosave (prevents lost work) ---
         # Keep it simple: periodic best-effort autosave + save-on-exit.
@@ -8186,6 +8346,10 @@ class SchedulerApp(tk.Tk):
             save_data(self.model, self.data_path)
         except Exception:
             pass
+        try:
+            self.help_manager.destroy()
+        except Exception:
+            pass
         self.destroy()
 
     def _apply_ui_scale(self, scale: float):
@@ -8245,15 +8409,27 @@ class SchedulerApp(tk.Tk):
         style.configure("Treeview", rowheight=rh)
         style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
         style.configure("TButton", padding=10)
+        style.configure("TFrame", background="#eceff3")
+        style.configure("TLabelframe", background="#eceff3")
+        style.configure("TLabelframe.Label", background="#eceff3", foreground="#2a3240")
+        style.configure("TLabel", background="#eceff3", foreground="#2c3646")
         style.configure("Header.TLabel", font=("Segoe UI", 18, "bold"))
         style.configure("SubHeader.TLabel", font=("Segoe UI", 12, "bold"))
+        style.configure("Hint.TLabel", foreground="#566170", background="#eceff3")
+        style.configure("Shell.TFrame", background="#e6eaf0")
+        style.configure("Section.TFrame", background="#eef1f5")
+        style.configure("Panel.TLabelframe", background="#eef1f5")
+        style.configure("Panel.TLabelframe.Label", background="#eef1f5", foreground="#2a3240")
+        style.configure("HelpBubble.TFrame", background="#f6f7f9")
+        style.configure("HelpBubble.TLabel", background="#f6f7f9", foreground="#283142")
+        style.configure("HelpMore.TButton", padding=(6, 2))
 
         # Shared workspace faux-tab chrome (visual-only; architecture unchanged).
         style.configure("MainTabInactive.TButton", padding=(10, 3), relief="raised")
         style.configure("MainTabActive.TButton", padding=(10, 3), relief="sunken")
 
     def _build_ui(self):
-        topbar = ttk.Frame(self); topbar.pack(fill="x", padx=10, pady=8)
+        topbar = ttk.Frame(self, style="Shell.TFrame"); topbar.pack(fill="x", padx=10, pady=8)
         # Global header (image only)
         if getattr(self, "brand_img_header", None) is not None:
             ttk.Label(topbar, image=self.brand_img_header).pack(side="left", padx=(0,10))
@@ -8262,30 +8438,34 @@ class SchedulerApp(tk.Tk):
         self.status_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self.status_var, foreground="#555").pack(anchor="w", padx=12)
 
-        btns = ttk.Frame(topbar); btns.pack(side="right")
-        ttk.Button(btns, text="Save Now", command=self.autosave).pack(side="right", padx=6)
+        btns = ttk.Frame(topbar, style="Shell.TFrame"); btns.pack(side="right")
+        self.btn_save_now = ttk.Button(btns, text="Save Now", command=self.autosave)
+        self.btn_save_now.pack(side="right", padx=6)
         ttk.Button(btns, text="Desktop Shortcut", command=self.create_desktop_shortcut).pack(side="right", padx=6)
-        ttk.Button(btns, text="Open...", command=self.open_dialog).pack(side="right", padx=6)
-        ttk.Button(btns, text="Save As...", command=self.save_as_dialog).pack(side="right", padx=6)
-        ttk.Button(btns, text="New", command=self.new_data).pack(side="right", padx=6)
+        self.btn_open_data = ttk.Button(btns, text="Open...", command=self.open_dialog)
+        self.btn_open_data.pack(side="right", padx=6)
+        self.btn_save_as = ttk.Button(btns, text="Save As...", command=self.save_as_dialog)
+        self.btn_save_as.pack(side="right", padx=6)
+        self.btn_new_data = ttk.Button(btns, text="New", command=self.new_data)
+        self.btn_new_data.pack(side="right", padx=6)
 
-        shell = ttk.Frame(self); shell.pack(fill="both", expand=True, padx=10, pady=(6,10))
+        shell = ttk.Frame(self, style="Shell.TFrame"); shell.pack(fill="both", expand=True, padx=10, pady=(6,10))
         shell.columnconfigure(0, weight=1)
         shell.rowconfigure(2, weight=1)
 
         schedule_row = ttk.Frame(shell)
         schedule_row.grid(row=0, column=0, sticky="ew")
         ttk.Label(schedule_row, text="Schedule Tabs:", style="SubHeader.TLabel").pack(side="left", padx=(0, 8))
-        self.schedule_tabs_host = ttk.Frame(schedule_row)
+        self.schedule_tabs_host = ttk.Frame(schedule_row, style="Shell.TFrame")
         self.schedule_tabs_host.pack(side="left", fill="x", expand=True)
 
         manager_row = ttk.Frame(shell)
         manager_row.grid(row=1, column=0, sticky="ew", pady=(2, 6))
         ttk.Label(manager_row, text="Manager Tabs:", style="SubHeader.TLabel").pack(side="left", padx=(0, 8))
-        self.manager_tabs_host = ttk.Frame(manager_row)
+        self.manager_tabs_host = ttk.Frame(manager_row, style="Shell.TFrame")
         self.manager_tabs_host.pack(side="left", fill="x", expand=True)
 
-        self.shared_main_host = ttk.Frame(shell)
+        self.shared_main_host = ttk.Frame(shell, style="Section.TFrame")
         self.shared_main_host.grid(row=2, column=0, sticky="nsew")
 
         self.tab_store = ttk.Frame(self.shared_main_host)
@@ -8379,6 +8559,10 @@ class SchedulerApp(tk.Tk):
                 pass
 
     def show_main_tab(self, tab_key: str):
+        try:
+            self.help_manager.hide_all()
+        except Exception:
+            pass
         key = str(tab_key or "").strip()
         if key not in getattr(self, "main_tab_frames", {}):
             return
@@ -8391,16 +8575,142 @@ class SchedulerApp(tk.Tk):
             self.manager_tab_var.set(key)
         self._refresh_main_tab_chrome(key)
 
+    def _build_help_catalog(self) -> Dict[str, Dict[str, str]]:
+        return {
+            "new_data": {
+                "short": "Start a new dataset for scheduling.",
+                "long": "Creates a fresh in-memory dataset and clears the current week output. Use Open to return to an existing data file.",
+            },
+            "open_data": {
+                "short": "Load scheduler data from a file.",
+                "long": "Opens a saved scheduler data file and refreshes tabs with that dataset.",
+            },
+            "save_as": {
+                "short": "Save current data to a new file path.",
+                "long": "Use Save As when creating snapshots or separate scenario files without overwriting the current default data file.",
+            },
+            "save_now": {
+                "short": "Immediately save current scheduler data.",
+                "long": "Writes current in-memory data to disk now. Autosave still runs in the background on an interval.",
+            },
+            "generate_fresh": {
+                "short": "Generate a new schedule from current rules.",
+                "long": "Runs schedule generation for the selected week label using current requirements, employees, settings, and constraints.",
+            },
+            "generate_regen": {
+                "short": "Regenerate using the current schedule as context.",
+                "long": "Runs generation again while using the current schedule context for continuity and comparison.",
+            },
+            "save_history": {
+                "short": "Save the current result to schedule history.",
+                "long": "Stores a summary snapshot of the current week schedule for later manager review and comparison.",
+            },
+            "open_manual": {
+                "short": "Open manual edit tools in a popup.",
+                "long": "Launches the manual schedule editing workspace in a popup window for direct manager adjustments.",
+            },
+            "open_heatmap": {
+                "short": "Open coverage heatmap popup.",
+                "long": "Shows scheduled headcount versus staffing requirements across day/time blocks.",
+            },
+            "open_analyzer": {
+                "short": "Run analyzer review in popup.",
+                "long": "Opens the analyzer view with findings and suggested push-fix actions for schedule review.",
+            },
+            "compare_versions": {
+                "short": "Compare available schedule versions.",
+                "long": "Compares generated/current/finalized versions to review differences before publishing decisions.",
+            },
+            "store_state": {
+                "short": "Select store state for labor-rule profile loading.",
+                "long": "State selection controls labor-law profile loading. Incomplete profiles fall back to current/default rules.",
+            },
+            "store_hours": {
+                "short": "Set area open/close hard boundaries.",
+                "long": "Hours of operation define hard scheduling boundaries for each area and are used in validation.",
+            },
+            "area_color": {
+                "short": "Choose area color used in employee calendar exports.",
+                "long": "These colors apply to employee calendar export visuals only and are separate from app runtime theme styling.",
+            },
+            "req_area": {
+                "short": "Choose area to apply staffing pattern.",
+                "long": "Select which department receives the requirement pattern before applying selected day/time settings.",
+            },
+            "req_days": {
+                "short": "Select target days for requirement updates.",
+                "long": "Day checkboxes define which days will receive the Min/Preferred/Max pattern when Apply Pattern is used.",
+            },
+            "req_time": {
+                "short": "Set time range for requirement pattern.",
+                "long": "Start/End define the staffing block range used when applying requirements to selected days.",
+            },
+            "req_counts": {
+                "short": "Set Min / Preferred / Max staffing counts.",
+                "long": "Min is required coverage, Preferred is target coverage, and Max is the upper soft ceiling.",
+            },
+            "req_apply": {
+                "short": "Apply pattern to selected days.",
+                "long": "Writes or updates requirement blocks for selected days using the chosen area, time window, and staffing counts.",
+            },
+            "req_copy": {
+                "short": "Copy one day pattern to selected target days.",
+                "long": "Copies the source day requirement pattern into selected target days for faster weekly setup.",
+            },
+        }
+
+    def _register_help_control(self, widget: Optional[tk.Misc], help_id: str):
+        if widget is None:
+            return
+        info = (self._help_catalog or {}).get(str(help_id or "").strip(), {})
+        short = str(info.get("short", "") or "").strip()
+        long_txt = str(info.get("long", "") or "").strip()
+        if not short:
+            return
+        self.help_manager.register(widget, help_id, short, long_txt)
+
+    def _register_phase1_help_controls(self):
+        for attr, hid in [
+            ("btn_new_data", "new_data"),
+            ("btn_open_data", "open_data"),
+            ("btn_save_as", "save_as"),
+            ("btn_save_now", "save_now"),
+            ("btn_generate_fresh", "generate_fresh"),
+            ("btn_regen_current", "generate_regen"),
+            ("btn_save_history", "save_history"),
+            ("btn_open_manual", "open_manual"),
+            ("btn_open_heatmap", "open_heatmap"),
+            ("btn_open_analyzer", "open_analyzer"),
+            ("btn_compare_versions", "compare_versions"),
+            ("store_state_combo", "store_state"),
+            ("req_area_combo", "req_area"),
+            ("req_start_combo", "req_time"),
+            ("req_end_combo", "req_time"),
+            ("req_min_combo", "req_counts"),
+            ("req_pref_combo", "req_counts"),
+            ("req_max_combo", "req_counts"),
+            ("btn_apply_pattern", "req_apply"),
+            ("btn_copy_pattern", "req_copy"),
+        ]:
+            self._register_help_control(getattr(self, attr, None), hid)
+        for _d, chk in getattr(self, "req_day_checks", {}).items():
+            self._register_help_control(chk, "req_days")
+        for area, widgets in getattr(self, "store_hours_widgets", {}).items():
+            self._register_help_control(widgets.get("open"), "store_hours")
+            self._register_help_control(widgets.get("close"), "store_hours")
+        for _area, btn in getattr(self, "area_color_buttons", {}).items():
+            self._register_help_control(btn, "area_color")
+
     # -------- Store tab --------
     def _build_store_tab(self):
         _outer, frm, _canvas = _build_scrollable_canvas_host(self.tab_store, padding=(14, 14, 14, 14), min_width=1120)
         ttk.Label(frm, text="Store Info prints on schedules.", style="SubHeader.TLabel").pack(anchor="w", pady=(0,8))
 
-        top = ttk.Frame(frm); top.pack(fill="x", expand=False, pady=10)
-        left = ttk.Frame(top); left.pack(side="left", fill="x", expand=True)
-        right = ttk.Frame(top); right.pack(side="right", padx=(10,0))
+        top = ttk.Frame(frm, style="Section.TFrame"); top.pack(fill="x", expand=False, pady=10)
+        left = ttk.Frame(top, style="Section.TFrame"); left.pack(side="left", fill="x", expand=True)
+        right = ttk.Frame(top, style="Section.TFrame"); right.pack(side="right", padx=(10,0))
 
-        box = ttk.LabelFrame(left, text="Store")
+        box = ttk.LabelFrame(left, text="Store", style="Panel.TLabelframe")
         box.pack(fill="x")
 
         self.store_name_var = tk.StringVar()
@@ -8435,7 +8745,7 @@ class SchedulerApp(tk.Tk):
         ttk.Entry(box, textvariable=self.store_mgr_var, width=28).grid(row=r, column=1, sticky="w", padx=10, pady=6)
 
         r += 1
-        law = ttk.LabelFrame(box, text="Labor Rule Jurisdiction")
+        law = ttk.LabelFrame(box, text="Labor Rule Jurisdiction", style="Panel.TLabelframe")
         law.grid(row=r, column=0, columnspan=4, sticky="ew", padx=10, pady=8)
         ttk.Label(law, text="Store State (Required):").grid(row=0, column=0, sticky="w", padx=8, pady=6)
         self.store_state_combo = ttk.Combobox(
@@ -8453,7 +8763,7 @@ class SchedulerApp(tk.Tk):
         ).grid(row=1, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 6))
 
         r += 1
-        hours = ttk.LabelFrame(box, text="Hours of Operation (Hard Rules)")
+        hours = ttk.LabelFrame(box, text="Hours of Operation (Hard Rules)", style="Panel.TLabelframe")
         hours.grid(row=r, column=0, columnspan=4, sticky="ew", padx=10, pady=8)
         ttk.Label(hours, text="Area").grid(row=0, column=0, padx=8, pady=4, sticky="w")
         ttk.Label(hours, text="Open").grid(row=0, column=1, padx=8, pady=4, sticky="w")
@@ -8465,20 +8775,27 @@ class SchedulerApp(tk.Tk):
             ("CARWASH", "Carwash", self.carwash_open_var, self.carwash_close_var),
         ]
         self.area_color_vars: Dict[str, tk.StringVar] = {a: tk.StringVar(value=_default_area_colors()[a]) for a in AREAS}
+        self.store_hours_widgets: Dict[str, Dict[str, tk.Misc]] = {}
+        self.area_color_buttons: Dict[str, ttk.Button] = {}
         self.area_color_swatches: Dict[str, ttk.Label] = {}
         for rr, (area, lbl, open_var, close_var) in enumerate(rows, start=1):
             ttk.Label(hours, text=lbl).grid(row=rr, column=0, padx=8, pady=4, sticky="w")
-            ttk.Combobox(hours, textvariable=open_var, values=TIME_CHOICES, state="readonly", width=8).grid(row=rr, column=1, padx=8, pady=4, sticky="w")
-            ttk.Combobox(hours, textvariable=close_var, values=TIME_CHOICES, state="readonly", width=8).grid(row=rr, column=2, padx=8, pady=4, sticky="w")
+            open_combo = ttk.Combobox(hours, textvariable=open_var, values=TIME_CHOICES, state="readonly", width=8)
+            open_combo.grid(row=rr, column=1, padx=8, pady=4, sticky="w")
+            close_combo = ttk.Combobox(hours, textvariable=close_var, values=TIME_CHOICES, state="readonly", width=8)
+            close_combo.grid(row=rr, column=2, padx=8, pady=4, sticky="w")
             color_host = ttk.Frame(hours)
             color_host.grid(row=rr, column=3, padx=8, pady=4, sticky="w")
             sw = ttk.Label(color_host, text="     ", background=self.area_color_vars[area].get())
             sw.pack(side="left")
             self.area_color_swatches[area] = sw
-            ttk.Button(color_host, text="Choose...", command=lambda a=area: self._pick_area_color(a)).pack(side="left", padx=(6, 0))
+            choose_btn = ttk.Button(color_host, text="Choose...", command=lambda a=area: self._pick_area_color(a))
+            choose_btn.pack(side="left", padx=(6, 0))
+            self.area_color_buttons[area] = choose_btn
+            self.store_hours_widgets[area] = {"open": open_combo, "close": close_combo}
 
         r += 1
-        peak = ttk.LabelFrame(box, text="Peak Hours (Soft Rules)")
+        peak = ttk.LabelFrame(box, text="Peak Hours (Soft Rules)", style="Panel.TLabelframe")
         peak.grid(row=r, column=0, columnspan=4, sticky="ew", padx=10, pady=8)
         headers = ["Area", "P1 Start", "P1 End", "P2 Start", "P2 End", "P3 Start", "P3 End"]
         for cc, hdr in enumerate(headers):
@@ -9111,23 +9428,23 @@ class SchedulerApp(tk.Tk):
         self._on_req_day_toggle()
 
     def _build_req_timeline_section(self, parent):
-        box = ttk.LabelFrame(parent, text='Visual Daily Timeline / Block View (Read Only)')
+        box = ttk.LabelFrame(parent, text='Visual Daily Timeline / Block View (Read Only)', style='Panel.TLabelframe')
         box.pack(fill='both', expand=True, pady=(0,8))
         ttk.Label(
             box,
             text='Read-only visual map of staffing blocks by day and area. This view helps with time-block planning and does not directly edit solver inputs.',
-            foreground='#555',
+            style='Hint.TLabel',
             wraplength=1200,
             justify='left',
         ).pack(anchor='w', padx=8, pady=(6,6))
 
-        top = ttk.Frame(box)
+        top = ttk.Frame(box, style='Section.TFrame')
         top.pack(fill='x', padx=8, pady=(0,6))
         ttk.Label(top, text='View Day:').pack(side='left')
         self.req_timeline_day_var = tk.StringVar(value='Sun')
         ttk.Combobox(top, textvariable=self.req_timeline_day_var, values=DAYS, state='readonly', width=10).pack(side='left', padx=(6,10))
         ttk.Button(top, text='Refresh Timeline', command=self.refresh_req_timeline).pack(side='left')
-        ttk.Label(top, text='Area priority: C-Store (Primary) → Kitchen (Secondary) → Carwash (Tertiary)', foreground='#555').pack(side='left', padx=(12,0))
+        ttk.Label(top, text='Area priority: C-Store (Primary) → Kitchen (Secondary) → Carwash (Tertiary)', style='Hint.TLabel').pack(side='left', padx=(12,0))
 
         self.req_timeline_canvas = tk.Canvas(box, height=240, background='#ffffff', highlightthickness=1, highlightbackground='#d9d9d9')
         self.req_timeline_canvas.pack(fill='x', padx=8, pady=(0,8))
@@ -9190,7 +9507,7 @@ class SchedulerApp(tk.Tk):
     def _build_reqs_tab(self):
         _outer, frm, _canvas = _build_scrollable_canvas_host(self.tab_reqs, padding=(12, 12, 12, 12), min_width=1240)
 
-        expl = ttk.LabelFrame(frm, text='Staffing Requirements Drive the Engine')
+        expl = ttk.LabelFrame(frm, text='Staffing Requirements Drive the Engine', style='Panel.TLabelframe')
         expl.pack(fill='x', pady=(0,10))
         ttk.Label(
             expl,
@@ -9208,7 +9525,7 @@ class SchedulerApp(tk.Tk):
         ).pack(anchor='w', padx=10, pady=(0,8))
 
         # Section 1: pattern builder
-        builder = ttk.LabelFrame(frm, text='Staffing Pattern Builder')
+        builder = ttk.LabelFrame(frm, text='Staffing Pattern Builder', style='Panel.TLabelframe')
         builder.pack(fill='x', pady=(0,10))
 
         self.req_area_var = tk.StringVar(value='CSTORE')
@@ -9220,27 +9537,35 @@ class SchedulerApp(tk.Tk):
         self.req_area_hint_var = tk.StringVar(value=self._area_priority_label('CSTORE'))
 
         ttk.Label(builder, text='Area:').grid(row=0, column=0, padx=8, pady=6, sticky='w')
-        area_combo = ttk.Combobox(builder, textvariable=self.req_area_var, values=AREAS, state='readonly', width=12)
-        area_combo.grid(row=0, column=1, padx=8, pady=6, sticky='w')
+        self.req_area_combo = ttk.Combobox(builder, textvariable=self.req_area_var, values=AREAS, state='readonly', width=12)
+        self.req_area_combo.grid(row=0, column=1, padx=8, pady=6, sticky='w')
         ttk.Label(builder, textvariable=self.req_area_hint_var, foreground='#555').grid(row=0, column=2, columnspan=3, padx=8, pady=6, sticky='w')
-        area_combo.bind('<<ComboboxSelected>>', lambda _e: self.req_area_hint_var.set(self._area_priority_label(self.req_area_var.get())))
+        self.req_area_combo.bind('<<ComboboxSelected>>', lambda _e: self.req_area_hint_var.set(self._area_priority_label(self.req_area_var.get())))
 
         ttk.Label(builder, text='Start:').grid(row=1, column=0, padx=8, pady=6, sticky='w')
-        ttk.Combobox(builder, textvariable=self.req_start_var, values=TIME_CHOICES, state='readonly', width=8).grid(row=1, column=1, padx=8, pady=6, sticky='w')
+        self.req_start_combo = ttk.Combobox(builder, textvariable=self.req_start_var, values=TIME_CHOICES, state='readonly', width=8)
+        self.req_start_combo.grid(row=1, column=1, padx=8, pady=6, sticky='w')
         ttk.Label(builder, text='End:').grid(row=1, column=2, padx=8, pady=6, sticky='w')
-        ttk.Combobox(builder, textvariable=self.req_end_var, values=TIME_CHOICES, state='readonly', width=8).grid(row=1, column=3, padx=8, pady=6, sticky='w')
+        self.req_end_combo = ttk.Combobox(builder, textvariable=self.req_end_var, values=TIME_CHOICES, state='readonly', width=8)
+        self.req_end_combo.grid(row=1, column=3, padx=8, pady=6, sticky='w')
 
         ttk.Label(builder, text='Min (Required):').grid(row=1, column=4, padx=8, pady=6, sticky='w')
-        ttk.Combobox(builder, textvariable=self.req_min_var, values=[str(i) for i in range(0,21)], state='readonly', width=6).grid(row=1, column=5, padx=8, pady=6, sticky='w')
+        self.req_min_combo = ttk.Combobox(builder, textvariable=self.req_min_var, values=[str(i) for i in range(0,21)], state='readonly', width=6)
+        self.req_min_combo.grid(row=1, column=5, padx=8, pady=6, sticky='w')
         ttk.Label(builder, text='Preferred (Target):').grid(row=1, column=6, padx=8, pady=6, sticky='w')
-        ttk.Combobox(builder, textvariable=self.req_pref_var, values=[str(i) for i in range(0,21)], state='readonly', width=6).grid(row=1, column=7, padx=8, pady=6, sticky='w')
+        self.req_pref_combo = ttk.Combobox(builder, textvariable=self.req_pref_var, values=[str(i) for i in range(0,21)], state='readonly', width=6)
+        self.req_pref_combo.grid(row=1, column=7, padx=8, pady=6, sticky='w')
         ttk.Label(builder, text='Max Allowed:').grid(row=1, column=8, padx=8, pady=6, sticky='w')
-        ttk.Combobox(builder, textvariable=self.req_max_var, values=[str(i) for i in range(0,21)], state='readonly', width=6).grid(row=1, column=9, padx=8, pady=6, sticky='w')
+        self.req_max_combo = ttk.Combobox(builder, textvariable=self.req_max_var, values=[str(i) for i in range(0,21)], state='readonly', width=6)
+        self.req_max_combo.grid(row=1, column=9, padx=8, pady=6, sticky='w')
 
         ttk.Label(builder, text='Days:').grid(row=2, column=0, padx=8, pady=(2,6), sticky='w')
         self.day_vars = {d: tk.BooleanVar(value=(d in ['Mon','Tue','Wed','Thu','Fri'])) for d in DAYS}
+        self.req_day_checks = {}
         for i, d in enumerate(DAYS):
-            ttk.Checkbutton(builder, text=DAY_FULL.get(d, d), variable=self.day_vars[d], command=self._on_req_day_toggle).grid(row=2, column=1+i, padx=4, pady=(2,6), sticky='w')
+            cb = ttk.Checkbutton(builder, text=DAY_FULL.get(d, d), variable=self.day_vars[d], command=self._on_req_day_toggle)
+            cb.grid(row=2, column=1+i, padx=4, pady=(2,6), sticky='w')
+            self.req_day_checks[d] = cb
 
         quick = ttk.Frame(builder)
         quick.grid(row=3, column=0, columnspan=8, sticky='w', padx=8, pady=(0,8))
@@ -9249,10 +9574,11 @@ class SchedulerApp(tk.Tk):
         ttk.Button(quick, text='All', command=lambda: self._select_days('all')).pack(side='left', padx=(0,6))
         ttk.Button(quick, text='Clear', command=lambda: self._select_days('none')).pack(side='left', padx=(0,6))
 
-        ttk.Button(builder, text='Apply Pattern', command=self.apply_req_range).grid(row=3, column=8, columnspan=2, padx=8, pady=(0,8), sticky='e')
+        self.btn_apply_pattern = ttk.Button(builder, text='Apply Pattern', command=self.apply_req_range)
+        self.btn_apply_pattern.grid(row=3, column=8, columnspan=2, padx=8, pady=(0,8), sticky='e')
 
         # Section 2: copy day template
-        copy_box = ttk.LabelFrame(frm, text='Copy Day Template')
+        copy_box = ttk.LabelFrame(frm, text='Copy Day Template', style='Panel.TLabelframe')
         copy_box.pack(fill='x', pady=(0,10))
         self.copy_day_var = tk.StringVar(value='Mon')
         self.copy_targets_var = tk.StringVar(value='No target days selected')
@@ -9260,7 +9586,8 @@ class SchedulerApp(tk.Tk):
         ttk.Combobox(copy_box, textvariable=self.copy_day_var, values=DAYS, state='readonly', width=10).grid(row=0, column=1, padx=8, pady=6, sticky='w')
         ttk.Label(copy_box, text='Target Days (from selected days above):').grid(row=0, column=2, padx=8, pady=6, sticky='w')
         ttk.Label(copy_box, textvariable=self.copy_targets_var, foreground='#555').grid(row=0, column=3, padx=8, pady=6, sticky='w')
-        ttk.Button(copy_box, text='Copy Pattern to Selected Days', command=self.copy_paste_day).grid(row=0, column=4, padx=8, pady=6, sticky='e')
+        self.btn_copy_pattern = ttk.Button(copy_box, text='Copy Pattern to Selected Days', command=self.copy_paste_day)
+        self.btn_copy_pattern.grid(row=0, column=4, padx=8, pady=6, sticky='e')
 
         # Section 3: visual timeline (read-only)
         self._build_req_timeline_section(frm)
@@ -9268,8 +9595,8 @@ class SchedulerApp(tk.Tk):
         # Section 4 + 5: advanced rows and solver interpretation
         cols = ('Day','Area','Start','End','Min','Preferred','Max')
         req_wrap = ttk.Panedwindow(frm, orient='vertical'); req_wrap.pack(fill='both', expand=True)
-        raw_box = ttk.LabelFrame(req_wrap, text='Detailed Requirement Rows (Advanced)')
-        eff_box = ttk.LabelFrame(req_wrap, text='Solver Interpretation (Read Only)')
+        raw_box = ttk.LabelFrame(req_wrap, text='Detailed Requirement Rows (Advanced)', style='Panel.TLabelframe')
+        eff_box = ttk.LabelFrame(req_wrap, text='Solver Interpretation (Read Only)', style='Panel.TLabelframe')
         req_wrap.add(raw_box, weight=3)
         req_wrap.add(eff_box, weight=2)
 
@@ -9530,7 +9857,7 @@ class SchedulerApp(tk.Tk):
         self.refresh_req_timeline()
     # -------- Generate tab --------
     def _build_generate_tab(self):
-        frm = ttk.Frame(self.tab_gen); frm.pack(fill="both", expand=True, padx=12, pady=12)
+        frm = ttk.Frame(self.tab_gen, style="Section.TFrame"); frm.pack(fill="both", expand=True, padx=12, pady=12)
 
         ttk.Label(
             frm,
@@ -9538,39 +9865,46 @@ class SchedulerApp(tk.Tk):
             style="SubHeader.TLabel",
         ).pack(anchor="w", pady=(0, 8))
 
-        gen_box = ttk.LabelFrame(frm, text="Generate / Regenerate")
+        gen_box = ttk.LabelFrame(frm, text="Generate / Regenerate", style="Panel.TLabelframe")
         gen_box.pack(fill="x", pady=(0, 8))
 
-        top = ttk.Frame(gen_box); top.pack(fill="x", padx=8, pady=8)
+        top = ttk.Frame(gen_box, style="Section.TFrame"); top.pack(fill="x", padx=8, pady=8)
         self.label_var = tk.StringVar(value=self.current_label)
         ttk.Label(top, text="Week Label:").pack(side="left", padx=(0,6))
         ttk.Entry(top, textvariable=self.label_var, width=42).pack(side="left")
         ttk.Button(top, text="Set to This Week (Sun)", command=self.set_label_to_this_week).pack(side="left", padx=8)
-        ttk.Button(top, text="Generate Fresh", command=lambda: self.on_generate(mode="fresh")).pack(side="left", padx=(18, 6))
-        ttk.Button(top, text="Regenerate From Current", command=lambda: self.on_generate(mode="regenerate")).pack(side="left", padx=6)
-        ttk.Button(top, text="Save to History", command=self.save_to_history).pack(side="left", padx=6)
+        self.btn_generate_fresh = ttk.Button(top, text="Generate Fresh", command=lambda: self.on_generate(mode="fresh"))
+        self.btn_generate_fresh.pack(side="left", padx=(18, 6))
+        self.btn_regen_current = ttk.Button(top, text="Regenerate From Current", command=lambda: self.on_generate(mode="regenerate"))
+        self.btn_regen_current.pack(side="left", padx=6)
+        self.btn_save_history = ttk.Button(top, text="Save to History", command=self.save_to_history)
+        self.btn_save_history.pack(side="left", padx=6)
 
-        engine_row = ttk.Frame(gen_box)
+        engine_row = ttk.Frame(gen_box, style="Section.TFrame")
         engine_row.pack(fill="x", padx=8, pady=(0, 8))
         self.engine_status_var = tk.StringVar(value="Engine Status: Engine Idle")
         ttk.Label(engine_row, textvariable=self.engine_status_var, foreground="#2f2f2f").pack(anchor="w")
         self.engine_progress = ttk.Progressbar(engine_row, orient="horizontal", mode="indeterminate")
         self.engine_progress.pack(fill="x", pady=(4, 0))
 
-        tools_box = ttk.LabelFrame(frm, text="Schedule Workspace Tools")
+        tools_box = ttk.LabelFrame(frm, text="Schedule Workspace Tools", style="Panel.TLabelframe")
         tools_box.pack(fill="x", pady=(0, 8))
-        trow = ttk.Frame(tools_box); trow.pack(fill="x", padx=8, pady=8)
-        ttk.Button(trow, text="Open Manual Edit (Popup)", command=self._open_manual_popup).pack(side="left", padx=(0, 8))
-        ttk.Button(trow, text="Open Coverage Heatmap (Popup)", command=self._open_heatmap_popup).pack(side="left", padx=8)
-        ttk.Button(trow, text="Run Analyzer Review (Popup)", command=self._open_analyzer_popup).pack(side="left", padx=8)
-        ttk.Button(trow, text="Compare Versions", command=self._open_changes_popup).pack(side="left", padx=8)
+        trow = ttk.Frame(tools_box, style="Section.TFrame"); trow.pack(fill="x", padx=8, pady=8)
+        self.btn_open_manual = ttk.Button(trow, text="Open Manual Edit (Popup)", command=self._open_manual_popup)
+        self.btn_open_manual.pack(side="left", padx=(0, 8))
+        self.btn_open_heatmap = ttk.Button(trow, text="Open Coverage Heatmap (Popup)", command=self._open_heatmap_popup)
+        self.btn_open_heatmap.pack(side="left", padx=8)
+        self.btn_open_analyzer = ttk.Button(trow, text="Run Analyzer Review (Popup)", command=self._open_analyzer_popup)
+        self.btn_open_analyzer.pack(side="left", padx=8)
+        self.btn_compare_versions = ttk.Button(trow, text="Compare Versions", command=self._open_changes_popup)
+        self.btn_compare_versions.pack(side="left", padx=8)
         ttk.Button(trow, text="Call-Off Simulator", command=self._show_calloff_tab).pack(side="left", padx=8)
 
-        ns_box = ttk.LabelFrame(frm, text="Selected-Week No School Days")
+        ns_box = ttk.LabelFrame(frm, text="Selected-Week No School Days", style="Panel.TLabelframe")
         ns_box.pack(fill="x", pady=(0, 8))
         self.ws_no_school_vars = {d: tk.BooleanVar(value=False) for d in DAYS}
         ttk.Label(ns_box, text="Uses the same selected-week exception bucket as Schedule Exceptions. No duplicate data source.").pack(anchor="w", padx=8, pady=(6,4))
-        ns_row = ttk.Frame(ns_box); ns_row.pack(fill="x", padx=8, pady=(0,8))
+        ns_row = ttk.Frame(ns_box, style="Section.TFrame"); ns_row.pack(fill="x", padx=8, pady=(0,8))
         for d in DAYS:
             ttk.Checkbutton(ns_row, text=d, variable=self.ws_no_school_vars[d], command=self._workspace_apply_no_school_days).pack(side="left", padx=(0, 10))
         ttk.Button(ns_row, text="Sync From Week Settings", command=self._workspace_sync_no_school_days).pack(side="left", padx=(10,6))
@@ -9580,7 +9914,7 @@ class SchedulerApp(tk.Tk):
         self.summary_lbl.pack(fill="x", pady=(0,8))
 
         cols = ("Day","Area","Start","End","Employee","Source","Locked")
-        out_wrap = ttk.Frame(frm)
+        out_wrap = ttk.Frame(frm, style="Section.TFrame")
         out_wrap.pack(fill="both", expand=True)
         self.out_tree = ttk.Treeview(out_wrap, columns=cols, show="headings", height=18)
         for c in cols:
