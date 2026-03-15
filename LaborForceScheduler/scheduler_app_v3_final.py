@@ -3688,7 +3688,7 @@ def improve_weak_areas(model: DataModel,
         return base_assignments, diagnostics
 
     history_stats = history_stats_from(model)
-    min_req, pref_req, max_req = build_requirement_maps(model.requirements, goals=getattr(model, 'manager_goals', None))
+    min_req, pref_req, max_req = build_requirement_maps(model.requirements, goals=getattr(model, 'manager_goals', None), store_info=getattr(model, "store_info", None))
 
     def _asig(a: Assignment) -> Tuple[str, str, int, int, str, bool, str]:
         return (
@@ -3927,7 +3927,7 @@ def requirement_sanity_checker(model: DataModel,
     warnings: List[str] = []
     details: Dict[str, Any] = {}
     goals = getattr(model, "manager_goals", None)
-    min_req, pref_req, max_req = build_requirement_maps(getattr(model, "requirements", []) or [], goals=goals)
+    min_req, pref_req, max_req = build_requirement_maps(getattr(model, "requirements", []) or [], goals=goals, store_info=getattr(model, "store_info", None))
     total_min_hours = float(sum(int(v) for v in min_req.values())) / float(TICKS_PER_HOUR)
     total_pref_hours = float(sum(int(v) for v in pref_req.values())) / float(TICKS_PER_HOUR)
     hard_cap = float(getattr(goals, "maximum_weekly_cap", 0.0) or 0.0)
@@ -4116,7 +4116,7 @@ def explain_assignment(model: DataModel, label: str, assignments: List[Assignmen
     emp = next((e for e in (model.employees or []) if e.name == target.employee_name), None)
     baseline = list(assignments or [])
     without_target = [a for a in baseline if not (a.employee_name == target.employee_name and a.day == target.day and a.area == target.area and int(a.start_t) == int(target.start_t) and int(a.end_t) == int(target.end_t))]
-    min_req, pref_req, max_req = build_requirement_maps(model.requirements, goals=getattr(model, "manager_goals", None))
+    min_req, pref_req, max_req = build_requirement_maps(model.requirements, goals=getattr(model, "manager_goals", None), store_info=getattr(model, "store_info", None))
     delta_required_ticks = 0; delta_pref_ticks = 0; cov_without = count_coverage_per_tick(without_target)
     for tt in range(int(target.start_t), int(target.end_t)):
         k = (target.day, target.area, int(tt))
@@ -4131,7 +4131,7 @@ def explain_assignment(model: DataModel, label: str, assignments: List[Assignmen
     return out
 
 def explain_shortage_window(model: DataModel, label: str, assignments: List[Assignment], day: str, area: str, start_t: int, end_t: int) -> Dict[str, Any]:
-    min_req, pref_req, max_req = build_requirement_maps(model.requirements, goals=getattr(model, "manager_goals", None))
+    min_req, pref_req, max_req = build_requirement_maps(model.requirements, goals=getattr(model, "manager_goals", None), store_info=getattr(model, "store_info", None))
     cov = count_coverage_per_tick(assignments or [])
     deficit_ticks = 0; peak_deficit = 0
     for tt in range(int(start_t), int(end_t)):
@@ -5554,7 +5554,7 @@ def generate_schedule(model: DataModel, label: str,
     t0 = datetime.datetime.now()
 
     # Compute unfilled MIN requirement headcount (hard)
-    min_req_ls, pref_req_ls, max_req_ls = build_requirement_maps(model.requirements, goals=getattr(model,'manager_goals',None))
+    min_req_ls, pref_req_ls, max_req_ls = build_requirement_maps(model.requirements, goals=getattr(model,'manager_goals',None), store_info=getattr(model, "store_info", None))
     # OP1: per-run memo caches (never cross-run/global).
     unfilled_cache: Dict[Tuple[Tuple[str, str, int, int, str, bool, str], ...], int] = {}
     score_cache: Dict[Tuple[Tuple[Tuple[str, str, int, int, str, bool, str], ...], int], float] = {}
@@ -9819,7 +9819,7 @@ class SchedulerApp(tk.Tk):
                 self.hm_popup_canvas.configure(scrollregion=(0,0,800,200))
                 return
 
-            min_req, pref_req, max_req = build_requirement_maps(self.model.requirements, goals=getattr(self.model, "manager_goals", None))
+            min_req, pref_req, max_req = build_requirement_maps(self.model.requirements, goals=getattr(self.model, "manager_goals", None), store_info=getattr(self.model, "store_info", None))
             cov = count_coverage_per_tick(assignments)
             self.hm_popup_last_req_map = dict(pref_req if target.lower().startswith("pref") else min_req)
             self.hm_popup_last_cov = dict(cov)
@@ -10956,7 +10956,7 @@ class SchedulerApp(tk.Tk):
             warnings.append(_viol_to_text(v))
 
         cov = count_coverage_per_tick(normalized)
-        min_req, pref_req, max_req = build_requirement_maps(self.model.requirements, goals=getattr(self.model, 'manager_goals', None))
+        min_req, pref_req, max_req = build_requirement_maps(self.model.requirements, goals=getattr(self.model, 'manager_goals', None), store_info=getattr(self.model, "store_info", None))
         min_short, pref_short, max_viol = compute_requirement_shortfalls(min_req, pref_req, max_req, cov)
         if min_short > 0:
             warnings.append(f'Coverage risk created: {min_short} required 30-minute staffing blocks are unfilled.')
@@ -11149,7 +11149,7 @@ class SchedulerApp(tk.Tk):
 
         weak_areas = []
         try:
-            min_req_ls, pref_req_ls, max_req_ls = build_requirement_maps(self.model.requirements, goals=getattr(self.model, 'manager_goals', None))
+            min_req_ls, pref_req_ls, max_req_ls = build_requirement_maps(self.model.requirements, goals=getattr(self.model, 'manager_goals', None), store_info=getattr(self.model, "store_info", None))
             cov_map = count_coverage_per_tick(self.current_assignments)
             shortages = []
             for (day, area, tick), req in min_req_ls.items():
@@ -11645,7 +11645,7 @@ class SchedulerApp(tk.Tk):
                 return
 
             # build maps
-            min_req, pref_req, max_req = build_requirement_maps(self.model.requirements, goals=getattr(self.model, "manager_goals", None))
+            min_req, pref_req, max_req = build_requirement_maps(self.model.requirements, goals=getattr(self.model, "manager_goals", None), store_info=getattr(self.model, "store_info", None))
             req_map = pref_req if use_pref else min_req
             cov = count_coverage_per_tick(assignments)
 
@@ -12064,7 +12064,7 @@ class SchedulerApp(tk.Tk):
                 messagebox.showinfo("Call-Off Simulator", "No schedule found. Generate a schedule or lock a final schedule first.")
                 return
 
-            min_req, _pref_req, _max_req = build_requirement_maps(self.model.requirements, goals=getattr(self.model, "manager_goals", None))
+            min_req, _pref_req, _max_req = build_requirement_maps(self.model.requirements, goals=getattr(self.model, "manager_goals", None), store_info=getattr(self.model, "store_info", None))
             req = dict(min_req)
 
             removed = [a for a in assignments if (a.employee_name == emp_name and a.day in days)]
