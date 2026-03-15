@@ -5461,49 +5461,52 @@ def generate_schedule(model: DataModel, label: str,
                 return cands[0].area
         return None
 
-    short_growth_progress = True
-    short_growth_passes = 0
-    while short_growth_progress and short_growth_passes < 4:
-        short_growth_progress = False
-        short_growth_passes += 1
-        active_names = [e.name for e in model.employees if getattr(e, "work_status", "") == "Active"]
-        for emp_name in active_names:
-            e = emp_by_name.get(emp_name)
-            if not e:
-                continue
-            for day in DAYS:
-                blocks = daily_shift_blocks(assignments, emp_name, day)
-                if len(blocks) != 1:
+    # Only run short-shift growth while preferred demand still has deficits.
+    # This avoids adding hours when coverage is already fully satisfied.
+    if any(coverage.get(k, 0) < pref_req.get(k, 0) for k in pref_req.keys()):
+        short_growth_progress = True
+        short_growth_passes = 0
+        while short_growth_progress and short_growth_passes < 4:
+            short_growth_progress = False
+            short_growth_passes += 1
+            active_names = [e.name for e in model.employees if getattr(e, "work_status", "") == "Active"]
+            for emp_name in active_names:
+                e = emp_by_name.get(emp_name)
+                if not e:
                     continue
-                bst, ben = blocks[0]
-                bh = hours_between_ticks(bst, ben)
-                if bh >= 3.0 - 1e-9:
-                    continue
+                for day in DAYS:
+                    blocks = daily_shift_blocks(assignments, emp_name, day)
+                    if len(blocks) != 1:
+                        continue
+                    bst, ben = blocks[0]
+                    bh = hours_between_ticks(bst, ben)
+                    if bh >= 3.0 - 1e-9:
+                        continue
 
-                # Prefer 2-hour growth first, then 1-hour, on either side of the existing block.
-                attempts: List[Tuple[str, int]] = [("left", 4), ("right", 4), ("left", 2), ("right", 2)]
-                for side, L in attempts:
-                    if side == "left":
-                        st = int(bst) - int(L)
-                        en = int(bst)
-                        area = _edge_area_for_block(emp_name, day, int(bst), "left")
-                    else:
-                        st = int(ben)
-                        en = int(ben) + int(L)
-                        area = _edge_area_for_block(emp_name, day, int(ben), "right")
-                    if st < 0 or en > DAY_TICKS or en <= st or not area:
-                        continue
-                    if area not in getattr(e, "areas_allowed", []):
-                        continue
-                    if not feasible_segment(e, day, area, st, en):
-                        continue
-                    if add_assignment(Assignment(day, area, st, en, emp_name, locked=False, source="short_shift_repair"), locked_ok=False, cov=coverage):
-                        short_growth_progress = True
+                    # Prefer 2-hour growth first, then 1-hour, on either side of the existing block.
+                    attempts: List[Tuple[str, int]] = [("left", 4), ("right", 4), ("left", 2), ("right", 2)]
+                    for side, L in attempts:
+                        if side == "left":
+                            st = int(bst) - int(L)
+                            en = int(bst)
+                            area = _edge_area_for_block(emp_name, day, int(bst), "left")
+                        else:
+                            st = int(ben)
+                            en = int(ben) + int(L)
+                            area = _edge_area_for_block(emp_name, day, int(ben), "right")
+                        if st < 0 or en > DAY_TICKS or en <= st or not area:
+                            continue
+                        if area not in getattr(e, "areas_allowed", []):
+                            continue
+                        if not feasible_segment(e, day, area, st, en):
+                            continue
+                        if add_assignment(Assignment(day, area, st, en, emp_name, locked=False, source="short_shift_repair"), locked_ok=False, cov=coverage):
+                            short_growth_progress = True
+                            break
+                    if short_growth_progress:
                         break
                 if short_growth_progress:
                     break
-            if short_growth_progress:
-                break
 
     # Step 3: late targeted micro-fill of highest-shortfall contiguous windows, prioritizing specialty areas.
     late_micro_fill_stats = _targeted_late_micro_fill()
