@@ -8419,7 +8419,7 @@ class SchedulerApp(tk.Tk):
         self._load_brand_images()
 
         self._setup_style()
-        self.help_manager = ContextHelpManager(self, delay_ms=4000)
+        self.help_manager = ContextHelpManager(self, delay_ms=1300)
         self._help_catalog = self._build_help_catalog()
         self._build_ui()
         self._register_phase1_help_controls()
