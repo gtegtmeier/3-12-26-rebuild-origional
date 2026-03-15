@@ -2981,6 +2981,8 @@ def schedule_score(model: DataModel, label: str,
     w_low_hours = float(getattr(goals, "w_low_hours_priority_bonus", 2.5) or 0.0)
     w_near_cap = float(getattr(goals, "w_near_cap_penalty", 5.0) or 0.0)
     balance_tol = float(getattr(goals, "utilization_balance_tolerance_hours", 2.0) or 0.0)
+    w_new_emp = float(getattr(goals, "w_new_employee_penalty", 3.0) or 0.0)
+    w_frag = float(getattr(goals, "w_fragmentation_penalty", 2.5) or 0.0)
     prefer_longer = bool(getattr(goals, "prefer_longer_shifts", True))
     prefer_area_consistency = bool(getattr(goals, "prefer_area_consistency", False))
     # Phase 3 weights (safe defaults)
@@ -3262,6 +3264,7 @@ def schedule_score_breakdown(model: DataModel, label: str,
     # Weight helpers (safe defaults)
     w_under_pref_cov = float(getattr(goals, "w_under_preferred_coverage", 5.0) or 5.0)
     w_over_pref_cap = float(getattr(goals, "w_over_preferred_cap", 20.0) or 20.0)
+    w_over_max_soft_ceiling = float(getattr(goals, "w_over_max_soft_ceiling", 80.0) or 80.0)
     w_part_miss = float(getattr(goals, "w_participation_miss", 250.0) or 250.0)
     w_split = float(getattr(goals, "w_split_shifts", 30.0) or 30.0)
     w_imb = float(getattr(goals, "w_hour_imbalance", 2.0) or 2.0)
@@ -3271,10 +3274,16 @@ def schedule_score_breakdown(model: DataModel, label: str,
     w_low_hours = float(getattr(goals, "w_low_hours_priority_bonus", 2.5) or 0.0)
     w_near_cap = float(getattr(goals, "w_near_cap_penalty", 5.0) or 0.0)
     balance_tol = float(getattr(goals, "utilization_balance_tolerance_hours", 2.0) or 0.0)
+    w_new_emp = float(getattr(goals, "w_new_employee_penalty", 3.0) or 0.0)
+    w_frag = float(getattr(goals, "w_fragmentation_penalty", 2.5) or 0.0)
 
     # Coverage shortfalls/violations
     try:
-        min_req_ls, pref_req_ls, max_req_ls = build_requirement_maps(model.requirements, goals=getattr(model,'manager_goals',None))
+        min_req_ls, pref_req_ls, max_req_ls = build_requirement_maps(
+            model.requirements,
+            goals=getattr(model,'manager_goals',None),
+            store_info=getattr(model, "store_info", None),
+        )
         cov_map = count_coverage_per_tick(assignments)
         min_short, pref_short, max_viol = compute_requirement_shortfalls(min_req_ls, pref_req_ls, max_req_ls, cov_map)
     except Exception:
@@ -3282,7 +3291,7 @@ def schedule_score_breakdown(model: DataModel, label: str,
 
     out: Dict[str, float] = {
         "min_coverage_pen": float(int(min_short) * 1000.0),
-        "max_staffing_violation_pen": float(int(max_viol) * 5000.0),
+        "max_staffing_violation_pen": float(int(max_viol) * w_over_max_soft_ceiling),
         "preferred_coverage_shortfall_pen": float(int(pref_short) * w_under_pref_cov),
         "risk_fragile_pen": 0.0,
         "risk_single_point_pen": 0.0,
@@ -3300,8 +3309,10 @@ def schedule_score_breakdown(model: DataModel, label: str,
         "hour_imbalance_pen": 0.0,
         "pattern_pen": 0.0,
         "employee_fit_pen": 0.0,
-        "utilization_balance_pen": 0.0,
-        "utilization_near_cap_pen": 0.0,
+        "utilization_new_employee_pen": 0.0,
+        "utilization_fragmentation_pen": 0.0,
+        "utilization_balance_pen": 0.0,  # advisory-only (not part of schedule_score total)
+        "utilization_near_cap_pen": 0.0,  # advisory-only (not part of schedule_score total)
         "fragmentation_quality_pen": 0.0,
         "micro_shift_quality_pen": 0.0,
         "preferred_length_quality_pen": 0.0,
@@ -3497,12 +3508,23 @@ def schedule_score_breakdown(model: DataModel, label: str,
     except Exception:
         pass
 
+    if enable_util and (w_new_emp > 0.0 or w_frag > 0.0):
+        try:
+            used = {a.employee_name for a in assignments}
+            out["utilization_new_employee_pen"] += float(len(used)) * w_new_emp
+        except Exception:
+            pass
+        try:
+            out["utilization_fragmentation_pen"] += float(len(assignments)) * w_frag
+        except Exception:
+            pass
+
     try:
         pats = getattr(model, "learned_patterns", {}) or {}
         q = _schedule_quality_penalty_units(model, assignments, pats)
         split_weight = max(6.0, w_split * 1.8)
-        short_weight = 9.0 if prefer_longer else 6.0
-        pref_len_weight = 2.5
+        short_weight = 12.0 if prefer_longer else 8.0
+        pref_len_weight = 3.2
         out["fragmentation_quality_pen"] += q.get("frag_units", 0.0) * split_weight
         out["micro_shift_quality_pen"] += q.get("short_units", 0.0) * short_weight
         out["preferred_length_quality_pen"] += q.get("pref_len_units", 0.0) * pref_len_weight
@@ -3535,7 +3557,8 @@ def schedule_score_breakdown(model: DataModel, label: str,
     except Exception:
         pass
 
-    out["total"] = float(sum(v for k,v in out.items() if k != "total"))
+    advisory_only = {"utilization_balance_pen", "utilization_near_cap_pen", "employee_fit_pen"}
+    out["total"] = float(sum(v for k,v in out.items() if k != "total" and k not in advisory_only))
     return out
 
 
@@ -8061,10 +8084,13 @@ class SchedulerApp(tk.Tk):
         ttk.Button(btns, text="New", command=self.new_data).pack(side="right", padx=6)
 
         shell = ttk.Frame(self); shell.pack(fill="both", expand=True, padx=10, pady=(6,10))
+        shell.columnconfigure(0, weight=1)
+        shell.rowconfigure(0, weight=1)
+        shell.rowconfigure(1, weight=1)
         sched_box = ttk.LabelFrame(shell, text="Scheduling")
-        sched_box.pack(fill="both", expand=True, pady=(0,8))
+        sched_box.grid(row=0, column=0, sticky="nsew", pady=(0,8))
         mgmt_box = ttk.LabelFrame(shell, text="Management & System")
-        mgmt_box.pack(fill="both", expand=True)
+        mgmt_box.grid(row=1, column=0, sticky="nsew")
 
         self.nb_sched = ttk.Notebook(sched_box); self.nb_sched.pack(fill="both", expand=True, padx=6, pady=6)
         self.nb_mgmt = ttk.Notebook(mgmt_box); self.nb_mgmt.pack(fill="both", expand=True, padx=6, pady=6)
@@ -9920,6 +9946,8 @@ class SchedulerApp(tk.Tk):
         if not self.model.requirements:
             messagebox.showerror("Generate", "Set staffing requirements first.")
             return
+        if not self._validate_store_state_preflight():
+            return
 
         progress_win, progress_update = self._open_generation_progress_popup("Regenerating Schedule" if mode == "regenerate" else "Generating Schedule")
         preserved: List[Assignment] = []
@@ -10032,6 +10060,16 @@ class SchedulerApp(tk.Tk):
             return "No actionable overlap found."
         return "This finding is advisory in v1; no safe local auto-fix is available."
 
+    def _validate_store_state_preflight(self) -> bool:
+        code = str(getattr(getattr(self.model, "store_info", None), "store_state", "") or "").strip().upper()
+        if code not in US_STATE_CODES:
+            messagebox.showerror(
+                "Generate",
+                "Store State is required before schedule generation.\n\nGo to 1) Store, select one of the 50 U.S. states, and click Save Store Info."
+            )
+            return False
+        return True
+
     def _open_analyzer_popup(self):
         findings = self._build_analyzer_findings()
         win = tk.Toplevel(self)
@@ -10094,6 +10132,8 @@ class SchedulerApp(tk.Tk):
             return
         if not self.model.requirements:
             messagebox.showerror("Generate", "Set staffing requirements first.")
+            return
+        if not self._validate_store_state_preflight():
             return
 
         try:
@@ -11938,6 +11978,21 @@ class SchedulerApp(tk.Tk):
         week_label = str(self.current_label or self.label_var.get().strip() or self._default_week_label())
 
         day = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][dt.weekday()]
+        dup_key = (week_label, dt.isoformat(), emp_name, replacement)
+        for ex in list(getattr(self.model, "calloff_incidents", []) or []):
+            ex_key = (
+                str(getattr(ex, "week_label", "") or "").strip(),
+                str(getattr(ex, "incident_date", "") or "").strip(),
+                str(getattr(ex, "called_out_employee", "") or "").strip(),
+                str(getattr(ex, "replacement_employee", "") or "").strip(),
+            )
+            if ex_key == dup_key:
+                messagebox.showwarning(
+                    "Call-Off Simulator",
+                    "This call-off incident is already recorded for the same week/date/employee/replacement.\n\nDuplicate entry was blocked."
+                )
+                return
+
         incident = CallOffIncident(
             incident_id=f"incident_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}",
             week_label=week_label,
