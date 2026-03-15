@@ -785,7 +785,7 @@ class Employee:
     max_shifts_per_day: int = 1                 # contiguous work blocks/day (area changes w/o break count as same shift)
     max_weekly_hours: float = 30.0
     target_min_hours: float = 0.0               # soft preference
-    hard_min_weekly_hours: float = 0.0          # hard participation floor (if feasible)
+    hard_min_weekly_hours: float = 0.0          # best-effort participation target floor (warning if unmet)
     minor_type: str = "ADULT"                   # ADULT / MINOR_14_15 / MINOR_16_17
 
     areas_allowed: List[str] = field(default_factory=lambda: ["CSTORE"])
@@ -5872,7 +5872,7 @@ def generate_schedule(model: DataModel, label: str,
         return False
 
     def _attach_kind(emp_name: str, day: str, area: str, st: int, en: int, cov: Dict[Tuple[str,str,int], int]) -> str:
-        # Explicit attach/extend semantics used for hard-min/floor top-ups.
+        # Explicit attach/extend semantics used for min-hours-target/floor top-ups.
         same_day = [a for a in assignments if a.employee_name == emp_name and a.day == day]
         for ex in same_day:
             if (int(en) == int(ex.start_t)) or (int(st) == int(ex.end_t)):
@@ -5993,7 +5993,7 @@ def generate_schedule(model: DataModel, label: str,
         details["attach_mode"] = attach_kind
         return seg_h
 
-    # unified participation + hard-min routine
+    # unified participation + best-effort min-hours target routine
     for nm in sorted(eligible_map.keys()):
         e = next((x for x in model.employees if x.name == nm), None)
         if e is None:
@@ -6033,7 +6033,7 @@ def generate_schedule(model: DataModel, label: str,
                 reasons.append("attach/extend gate prevented isolated dead-time block")
             if not reasons:
                 reasons.append("no feasible demand-window attach/extend slot under hard rules")
-            participation_missed[nm] = f"Could not reach hard minimum ({final_h:.1f}/{target_h:.1f}h): " + ", ".join(reasons)
+            participation_missed[nm] = f"Could not reach weekly minimum target ({final_h:.1f}/{target_h:.1f}h): " + ", ".join(reasons)
             participation_details[nm] = {
                 "result": "shortfall",
                 "current_hours": final_h,
@@ -6084,10 +6084,10 @@ def generate_schedule(model: DataModel, label: str,
                 if daily_cap is not None and h - daily_cap > 1e-9:
                     warnings.append(f"INTERNAL CHECK: ND minor daily cap violated for {e.name} on {d} ({h:.1f} > {daily_cap:.1f}).")
 
-    # participation / hard-min reporting
+    # participation / best-effort minimum-hours reporting
     if participation_missed:
         for nm, reason in participation_missed.items():
-            warnings.append(f"Participation hard-min shortfall: {nm} ({reason})")
+            warnings.append(f"Participation minimum-hours target shortfall: {nm} ({reason})")
     if floor_shortfall_hours > 1e-9:
         warnings.append(f"Labor floor shortfall: could not reach minimum_weekly_floor by {floor_shortfall_hours:.1f} hours under hard constraints.")
 
@@ -7597,7 +7597,7 @@ class EmployeeDialog(tk.Toplevel):
         ttk.Radiobutton(hard_box, text="No", value="No", variable=self.split_ok_var).grid(row=r, column=4, sticky="w", padx=(2,8), pady=6)
         ttk.Label(hard_box, text="Max weekly hours:").grid(row=r, column=5, sticky="w", padx=8, pady=6)
         ttk.Entry(hard_box, textvariable=self.max_weekly_var, width=8).grid(row=r, column=6, sticky="w", padx=8, pady=6)
-        ttk.Label(hard_box, text="Hard min weekly hrs:").grid(row=r, column=7, sticky="w", padx=8, pady=6)
+        ttk.Label(hard_box, text="Weekly min hrs target (best-effort):").grid(row=r, column=7, sticky="w", padx=8, pady=6)
         ttk.Entry(hard_box, textvariable=self.hard_min_weekly_var, width=8).grid(row=r, column=8, sticky="w", padx=8, pady=6)
 
         r += 1
