@@ -7403,6 +7403,57 @@ def simple_input(parent, title: str, prompt: str, default: str="") -> Optional[s
     parent.wait_window(win)
     return out["v"]
 
+
+def _build_scrollable_canvas_host(parent: tk.Misc,
+                                  *,
+                                  padding: Tuple[int, int, int, int] = (0, 0, 0, 0),
+                                  min_width: int = 0,
+                                  bind_mousewheel: bool = True) -> Tuple[ttk.Frame, ttk.Frame, tk.Canvas]:
+    """Create a reusable scrollable host with horizontal + vertical recovery."""
+    outer = ttk.Frame(parent)
+    outer.pack(fill="both", expand=True)
+    canvas = tk.Canvas(outer, highlightthickness=0)
+    vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    hsb = ttk.Scrollbar(outer, orient="horizontal", command=canvas.xview)
+    canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    canvas.grid(row=0, column=0, sticky="nsew")
+    vsb.grid(row=0, column=1, sticky="ns")
+    hsb.grid(row=1, column=0, sticky="ew")
+    outer.rowconfigure(0, weight=1)
+    outer.columnconfigure(0, weight=1)
+
+    inner = ttk.Frame(canvas, padding=padding)
+    win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+    def _on_inner_config(_e=None):
+        try:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _on_canvas_config(e):
+        try:
+            if min_width > 0:
+                canvas.itemconfigure(win_id, width=max(int(e.width), int(min_width)))
+            else:
+                canvas.itemconfigure(win_id, width=int(e.width))
+        except Exception:
+            pass
+
+    inner.bind("<Configure>", _on_inner_config)
+    canvas.bind("<Configure>", _on_canvas_config)
+
+    if bind_mousewheel:
+        def _on_mousewheel(e):
+            try:
+                canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+                return "break"
+            except Exception:
+                return None
+        canvas.bind("<MouseWheel>", _on_mousewheel)
+
+    return outer, inner, canvas
+
 class FixedScheduleEditorDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, model: "DataModel", initial_entries: List[FixedShift], minor_type: str, label_hint: str):
         super().__init__(parent)
@@ -7411,7 +7462,7 @@ class FixedScheduleEditorDialog(tk.Toplevel):
         self.title(label_hint)
         self.transient(parent)
         self.grab_set()
-        self.geometry("1320x420")
+        self.geometry("1320x520")
 
         norm = _normalize_fixed_schedule_entries(list(initial_entries or []))
         by_day: Dict[str, FixedShift] = {x.day: x for x in norm}
@@ -7421,8 +7472,7 @@ class FixedScheduleEditorDialog(tk.Toplevel):
         self.end_vars: Dict[str, tk.StringVar] = {}
         self.minor_type = str(minor_type or "ADULT")
 
-        frm = ttk.Frame(self, padding=(12, 12, 12, 12))
-        frm.pack(fill="both", expand=True)
+        _outer, frm, _canvas = _build_scrollable_canvas_host(self, padding=(12, 12, 12, 12), min_width=1240)
 
         cols = ttk.Frame(frm)
         cols.pack(fill="x", expand=False)
@@ -7630,7 +7680,10 @@ class EmployeeDialog(tk.Toplevel):
         b = ttk.Frame(fixed_box); b.pack(fill="x", padx=8, pady=(6,4))
         ttk.Button(b, text="Create Fixed Schedule", command=self._create_fixed_schedule).pack(side="left")
         ttk.Button(b, text="Modify Fixed Schedule", command=self._modify_fixed_schedule).pack(side="left", padx=6)
-        ttk.Button(b, text="Pause Fixed Schedule", command=self._pause_fixed_schedule).pack(side="left", padx=6)
+        self.fixed_pause_btn = ttk.Button(b, text="Pause Fixed Schedule", command=self._pause_fixed_schedule)
+        self.fixed_pause_btn.pack(side="left", padx=6)
+        self.fixed_resume_btn = ttk.Button(b, text="Resume Fixed Schedule", command=self._resume_fixed_schedule)
+        self.fixed_resume_btn.pack(side="left", padx=6)
         ttk.Button(b, text="Remove Fixed Schedule", command=self._remove_fixed_schedule).pack(side="left", padx=6)
         self.fixed_status_lbl = ttk.Label(b, text="Status: None")
         self.fixed_status_lbl.pack(side="right")
@@ -7695,7 +7748,18 @@ class EmployeeDialog(tk.Toplevel):
 
     def _refresh_fixed_summary(self):
         self.fixed_schedule_entries = _normalize_fixed_schedule_entries(self.fixed_schedule_entries)
+        s = _normalize_fixed_schedule_status(self.fixed_schedule_status)
+        if not self.fixed_schedule_entries:
+            s = "none"
+            self.fixed_schedule_status = "none"
         self.fixed_status_lbl.configure(text=f"Status: {self._fixed_status_display()}")
+        try:
+            if hasattr(self, "fixed_pause_btn"):
+                self.fixed_pause_btn.configure(state=("normal" if (s == "active" and bool(self.fixed_schedule_entries)) else "disabled"))
+            if hasattr(self, "fixed_resume_btn"):
+                self.fixed_resume_btn.configure(state=("normal" if (s == "paused" and bool(self.fixed_schedule_entries)) else "disabled"))
+        except Exception:
+            pass
         by = {x.day: x for x in self.fixed_schedule_entries}
         for d in DAYS:
             fs = by.get(d)
@@ -7728,6 +7792,13 @@ class EmployeeDialog(tk.Toplevel):
             self.fixed_schedule_status = "none"
         else:
             self.fixed_schedule_status = "paused"
+        self._refresh_fixed_summary()
+
+    def _resume_fixed_schedule(self):
+        if not self.fixed_schedule_entries:
+            self.fixed_schedule_status = "none"
+        else:
+            self.fixed_schedule_status = "active"
         self._refresh_fixed_summary()
 
     def _remove_fixed_schedule(self):
@@ -7967,8 +8038,17 @@ class SchedulerApp(tk.Tk):
             win = tk.Toplevel(self)
             win.title('Diagnostics')
             win.geometry('760x520')
-            txt = tk.Text(win, wrap='word')
-            txt.pack(fill='both', expand=True)
+            body = ttk.Frame(win)
+            body.pack(fill='both', expand=True)
+            txt = tk.Text(body, wrap='none')
+            ysb = ttk.Scrollbar(body, orient='vertical', command=txt.yview)
+            xsb = ttk.Scrollbar(body, orient='horizontal', command=txt.xview)
+            txt.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+            txt.grid(row=0, column=0, sticky='nsew')
+            ysb.grid(row=0, column=1, sticky='ns')
+            xsb.grid(row=1, column=0, sticky='ew')
+            body.rowconfigure(0, weight=1)
+            body.columnconfigure(0, weight=1)
             data_path = self.data_path
             appdir = _app_dir()
             last = self.last_solver_summary or {}
@@ -8088,30 +8168,33 @@ class SchedulerApp(tk.Tk):
 
         shell = ttk.Frame(self); shell.pack(fill="both", expand=True, padx=10, pady=(6,10))
         shell.columnconfigure(0, weight=1)
-        shell.rowconfigure(0, weight=1)
-        shell.rowconfigure(1, weight=1)
-        sched_box = ttk.LabelFrame(shell, text="Scheduling")
-        sched_box.grid(row=0, column=0, sticky="nsew", pady=(0,8))
-        mgmt_box = ttk.LabelFrame(shell, text="Management & System")
-        mgmt_box.grid(row=1, column=0, sticky="nsew")
+        shell.rowconfigure(2, weight=1)
 
-        self.nb_sched = ttk.Notebook(sched_box); self.nb_sched.pack(fill="both", expand=True, padx=6, pady=6)
-        self.nb_mgmt = ttk.Notebook(mgmt_box); self.nb_mgmt.pack(fill="both", expand=True, padx=6, pady=6)
+        schedule_row = ttk.Frame(shell)
+        schedule_row.grid(row=0, column=0, sticky="ew")
+        ttk.Label(schedule_row, text="Schedule Tabs:", style="SubHeader.TLabel").pack(side="left", padx=(0, 8))
 
-        self.tab_store = ttk.Frame(self.nb_sched)
-        self.tab_reqs = ttk.Frame(self.nb_sched)
-        self.tab_emps = ttk.Frame(self.nb_sched)
-        self.tab_over = ttk.Frame(self.nb_sched)
-        self.tab_gen = ttk.Frame(self.nb_sched)
-        self.tab_preview = ttk.Frame(self.nb_sched)
+        manager_row = ttk.Frame(shell)
+        manager_row.grid(row=1, column=0, sticky="ew", pady=(2, 6))
+        ttk.Label(manager_row, text="Manager Tabs:", style="SubHeader.TLabel").pack(side="left", padx=(0, 8))
 
-        self.tab_manager_tasks = ttk.Frame(self.nb_mgmt)
-        self.tab_perf = ttk.Frame(self.nb_mgmt)
-        self.tab_analysis = ttk.Frame(self.nb_mgmt)
-        self.tab_calloff = ttk.Frame(self.nb_mgmt)
-        self.tab_mgr = ttk.Frame(self.nb_mgmt)
-        self.tab_history = ttk.Frame(self.nb_mgmt)
-        self.tab_settings = ttk.Frame(self.nb_mgmt)
+        self.shared_main_host = ttk.Frame(shell)
+        self.shared_main_host.grid(row=2, column=0, sticky="nsew")
+
+        self.tab_store = ttk.Frame(self.shared_main_host)
+        self.tab_reqs = ttk.Frame(self.shared_main_host)
+        self.tab_emps = ttk.Frame(self.shared_main_host)
+        self.tab_over = ttk.Frame(self.shared_main_host)
+        self.tab_gen = ttk.Frame(self.shared_main_host)
+        self.tab_preview = ttk.Frame(self.shared_main_host)
+
+        self.tab_manager_tasks = ttk.Frame(self.shared_main_host)
+        self.tab_perf = ttk.Frame(self.shared_main_host)
+        self.tab_analysis = ttk.Frame(self.shared_main_host)
+        self.tab_calloff = ttk.Frame(self.shared_main_host)
+        self.tab_mgr = ttk.Frame(self.shared_main_host)
+        self.tab_history = ttk.Frame(self.shared_main_host)
+        self.tab_settings = ttk.Frame(self.shared_main_host)
 
         # Hidden/internal tool frames retained for popup workflows and compatibility.
         self.hidden_tools_host = ttk.Frame(self)
@@ -8119,20 +8202,35 @@ class SchedulerApp(tk.Tk):
         self.tab_changes = ttk.Frame(self.hidden_tools_host)
         self.tab_heatmap = ttk.Frame(self.hidden_tools_host)
 
-        self.nb_sched.add(self.tab_store, text="1) Store")
-        self.nb_sched.add(self.tab_reqs, text="2) Staffing Requirements")
-        self.nb_sched.add(self.tab_emps, text="3) Employee")
-        self.nb_sched.add(self.tab_over, text="4) Schedule Exceptions (One-Week)")
-        self.nb_sched.add(self.tab_gen, text="5) Schedule Workspace / Generate")
-        self.nb_sched.add(self.tab_preview, text="6) Print / Export")
+        self._schedule_tabs = [
+            ("store", "Store", self.tab_store),
+            ("reqs", "Staffing Requirements", self.tab_reqs),
+            ("emps", "Employees", self.tab_emps),
+            ("over", "Schedule Exceptions", self.tab_over),
+            ("gen", "Schedule Workspace / Generate", self.tab_gen),
+            ("preview", "Print / Export", self.tab_preview),
+        ]
+        self._manager_tabs = [
+            ("manager_tasks", "Manager Tasks", self.tab_manager_tasks),
+            ("perf", "Employee Performance & Reliability", self.tab_perf),
+            ("analysis", "Schedule Analysis", self.tab_analysis),
+            ("calloff", "Call-Off Simulator", self.tab_calloff),
+            ("mgr", "Manager Goals", self.tab_mgr),
+            ("history", "History", self.tab_history),
+            ("settings", "Settings", self.tab_settings),
+        ]
+        self.main_tab_frames: Dict[str, ttk.Frame] = {k: f for k, _t, f in (self._schedule_tabs + self._manager_tabs)}
+        self.main_tab_group: Dict[str, str] = {k: "schedule" for k, _t, _f in self._schedule_tabs}
+        self.main_tab_group.update({k: "manager" for k, _t, _f in self._manager_tabs})
+        self.schedule_tab_var = tk.StringVar(value="store")
+        self.manager_tab_var = tk.StringVar(value="manager_tasks")
 
-        self.nb_mgmt.add(self.tab_manager_tasks, text="1) Manager Tasks")
-        self.nb_mgmt.add(self.tab_perf, text="2) Employee Performance & Reliability")
-        self.nb_mgmt.add(self.tab_analysis, text="3) Schedule Analysis")
-        self.nb_mgmt.add(self.tab_calloff, text="4) Call-Off Simulator")
-        self.nb_mgmt.add(self.tab_mgr, text="5) Manager Goals")
-        self.nb_mgmt.add(self.tab_history, text="6) History")
-        self.nb_mgmt.add(self.tab_settings, text="7) Settings")
+        for key, label, _frame in self._schedule_tabs:
+            ttk.Radiobutton(schedule_row, text=label, value=key, variable=self.schedule_tab_var,
+                            command=lambda k=key: self.show_main_tab(k)).pack(side="left", padx=(0, 4))
+        for key, label, _frame in self._manager_tabs:
+            ttk.Radiobutton(manager_row, text=label, value=key, variable=self.manager_tab_var,
+                            command=lambda k=key: self.show_main_tab(k)).pack(side="left", padx=(0, 4))
 
         self._build_store_tab()
         self._build_emps_tab()
@@ -8150,10 +8248,23 @@ class SchedulerApp(tk.Tk):
         self._build_calloff_tab()
         self._build_history_tab()
         self._build_settings_tab()
+        self.show_main_tab("store")
+
+    def show_main_tab(self, tab_key: str):
+        key = str(tab_key or "").strip()
+        if key not in getattr(self, "main_tab_frames", {}):
+            return
+        for frame in self.main_tab_frames.values():
+            frame.pack_forget()
+        self.main_tab_frames[key].pack(fill="both", expand=True)
+        if self.main_tab_group.get(key) == "schedule":
+            self.schedule_tab_var.set(key)
+        else:
+            self.manager_tab_var.set(key)
 
     # -------- Store tab --------
     def _build_store_tab(self):
-        frm = ttk.Frame(self.tab_store); frm.pack(fill="both", expand=True, padx=14, pady=14)
+        _outer, frm, _canvas = _build_scrollable_canvas_host(self.tab_store, padding=(14, 14, 14, 14), min_width=1120)
         ttk.Label(frm, text="Store Info prints on schedules.", style="SubHeader.TLabel").pack(anchor="w", pady=(0,8))
 
         top = ttk.Frame(frm); top.pack(fill="x", expand=False, pady=10)
@@ -8599,8 +8710,7 @@ class SchedulerApp(tk.Tk):
         top.transient(self)
         top.grab_set()
 
-        frame = ttk.Frame(top)
-        frame.pack(fill='both', expand=True, padx=10, pady=10)
+        _outer, frame, _canvas = _build_scrollable_canvas_host(top, padding=(10, 10, 10, 10), min_width=860)
 
         emp_var = tk.StringVar()
         names = self._active_employee_names()
@@ -9259,6 +9369,13 @@ class SchedulerApp(tk.Tk):
         ttk.Button(top, text="Regenerate From Current", command=lambda: self.on_generate(mode="regenerate")).pack(side="left", padx=6)
         ttk.Button(top, text="Save to History", command=self.save_to_history).pack(side="left", padx=6)
 
+        engine_row = ttk.Frame(gen_box)
+        engine_row.pack(fill="x", padx=8, pady=(0, 8))
+        self.engine_status_var = tk.StringVar(value="Engine Status: Engine Idle")
+        ttk.Label(engine_row, textvariable=self.engine_status_var, foreground="#2f2f2f").pack(anchor="w")
+        self.engine_progress = ttk.Progressbar(engine_row, orient="horizontal", mode="indeterminate")
+        self.engine_progress.pack(fill="x", pady=(4, 0))
+
         tools_box = ttk.LabelFrame(frm, text="Schedule Workspace Tools")
         tools_box.pack(fill="x", pady=(0, 8))
         trow = ttk.Frame(tools_box); trow.pack(fill="x", padx=8, pady=8)
@@ -9327,6 +9444,31 @@ class SchedulerApp(tk.Tk):
                 self.explain_selected_assignment()
         except Exception:
             pass
+
+    def _set_engine_status(self, text: str, busy: bool = False):
+        msg = str(text or "Engine Idle").strip() or "Engine Idle"
+        if not msg.lower().startswith("engine status:"):
+            msg = f"Engine Status: {msg}"
+        if hasattr(self, "engine_status_var"):
+            self.engine_status_var.set(msg)
+        if hasattr(self, "engine_progress"):
+            try:
+                if busy:
+                    self.engine_progress.start(12)
+                else:
+                    self.engine_progress.stop()
+            except Exception:
+                pass
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+
+    def _engine_status_start(self, text: str):
+        self._set_engine_status(text, busy=True)
+
+    def _engine_status_stop(self, text: str = "Engine Idle"):
+        self._set_engine_status(text, busy=False)
 
     def explain_selected_assignment(self):
         if not self.current_assignments:
@@ -9952,17 +10094,17 @@ class SchedulerApp(tk.Tk):
         if not self._validate_store_state_preflight():
             return
 
-        progress_win, progress_update = self._open_generation_progress_popup("Regenerating Schedule" if mode == "regenerate" else "Generating Schedule")
         preserved: List[Assignment] = []
         try:
+            self._engine_status_start("Preparing inputs...")
             if mode == "regenerate":
                 for a in list(self.current_assignments or []):
                     src = assignment_provenance(a)
                     if src in {ASSIGNMENT_SOURCE_MANUAL, ASSIGNMENT_SOURCE_FIXED_LOCKED} or bool(getattr(a, "locked", False)):
                         preserved.append(copy.deepcopy(a))
-            progress_update(8, "Preparing generation", f"Mode: {mode}")
+            self._set_engine_status("Loading employee availability...", busy=True)
             self.on_generate(mode="fresh", _suppress_progress=True)
-            progress_update(72, "Applying preserve policy", f"Preserved assignments: {len(preserved)}")
+            self._set_engine_status("Applying soft rules...", busy=True)
             if mode == "regenerate" and preserved:
                 self.current_assignments, removed = self._overlay_preserved_assignments(list(self.current_assignments or []), preserved)
                 self.current_emp_hours, self.current_total_hours, self.current_filled, self.current_total_slots = calc_schedule_stats(self.model, self.current_assignments)
@@ -9971,19 +10113,17 @@ class SchedulerApp(tk.Tk):
                     extra.append(f"Removed {removed} overlapping engine-created assignments to honor preserved work.")
                 self.current_warnings = list(self.current_warnings or []) + extra
                 self._apply_current_schedule_to_output_views()
-            progress_update(92, "Refreshing analysis")
+            self._set_engine_status("Updating schedule workspace...", busy=True)
             try:
                 self._refresh_schedule_analysis()
                 self._refresh_change_viewer()
             except Exception:
                 pass
-            progress_update(100, "Done")
+            self._engine_status_stop("Generation complete")
+            self.after(900, lambda: self._engine_status_stop("Engine Idle"))
         finally:
-            try:
-                progress_win.grab_release()
-                progress_win.destroy()
-            except Exception:
-                pass
+            if not (self.engine_status_var.get() or "").strip().endswith("Generation complete"):
+                self._engine_status_stop("Engine Idle")
 
     def _build_analyzer_findings(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
@@ -10080,13 +10220,30 @@ class SchedulerApp(tk.Tk):
         win.geometry("1080x720")
         ttk.Label(win, text="Analyzer is advisory. It does not auto-fix. Select a finding, then choose Push Fix or Leave Manual Entry.", wraplength=1020).pack(anchor="w", padx=12, pady=(10,8))
         cols = ("Type", "Code", "Fix", "Finding")
-        tree = ttk.Treeview(win, columns=cols, show="headings", height=16)
+        tree_wrap = ttk.Frame(win)
+        tree_wrap.pack(fill="both", expand=False, padx=12, pady=(0,8))
+        tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", height=16)
         for c in cols:
             tree.heading(c, text=c)
             tree.column(c, width=120 if c != "Finding" else 640)
-        tree.pack(fill="both", expand=False, padx=12, pady=(0,8))
-        detail = tk.Text(win, height=12, wrap="word")
-        detail.pack(fill="both", expand=True, padx=12, pady=(0,10))
+        tree_ys = ttk.Scrollbar(tree_wrap, orient="vertical", command=tree.yview)
+        tree_xs = ttk.Scrollbar(tree_wrap, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=tree_ys.set, xscrollcommand=tree_xs.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        tree_ys.grid(row=0, column=1, sticky="ns")
+        tree_xs.grid(row=1, column=0, sticky="ew")
+        tree_wrap.rowconfigure(0, weight=1)
+        tree_wrap.columnconfigure(0, weight=1)
+
+        detail_wrap = ttk.Frame(win)
+        detail_wrap.pack(fill="both", expand=True, padx=12, pady=(0,10))
+        detail = tk.Text(detail_wrap, height=12, wrap="word")
+        detail_ys = ttk.Scrollbar(detail_wrap, orient="vertical", command=detail.yview)
+        detail.configure(yscrollcommand=detail_ys.set)
+        detail.grid(row=0, column=0, sticky="nsew")
+        detail_ys.grid(row=0, column=1, sticky="ns")
+        detail_wrap.rowconfigure(0, weight=1)
+        detail_wrap.columnconfigure(0, weight=1)
 
         for i, f in enumerate(findings):
             tree.insert("", "end", iid=str(i), values=(f.get("kind", ""), f.get("code", ""), "Yes" if f.get("fixable") else "No", f.get("title", "")))
@@ -10138,6 +10295,8 @@ class SchedulerApp(tk.Tk):
             return
         if not self._validate_store_state_preflight():
             return
+        if not _suppress_progress:
+            self._engine_status_start("Preparing inputs...")
 
         try:
             _write_run_log(f"GENERATE_START | {label}")
@@ -10152,6 +10311,8 @@ class SchedulerApp(tk.Tk):
 
         # P2-4: refresh learned patterns (if enabled)
         try:
+            if not _suppress_progress:
+                self._set_engine_status("Loading employee availability...", busy=True)
             if bool(getattr(self.model.settings, "learn_from_history", True)):
                 self._refresh_learned_patterns()
         except Exception:
@@ -10174,6 +10335,8 @@ class SchedulerApp(tk.Tk):
 
 
         try:
+            if not _suppress_progress:
+                self._set_engine_status("Evaluating staffing requirements...", busy=True)
             model_for_generation = copy.deepcopy(self.model)
             forecast_used = {}
             if bool(getattr(self.model.settings, "enable_demand_forecast_engine", True)):
@@ -10181,6 +10344,8 @@ class SchedulerApp(tk.Tk):
                     forecast_used = apply_demand_forecast_to_model(model_for_generation, (getattr(self.model, "learned_patterns", {}) or {}).get("__demand_forecast__"))
                 except Exception:
                     forecast_used = {}
+            if not _suppress_progress:
+                self._set_engine_status("Running solver...", busy=True)
             if bool(getattr(self.model.settings, "enable_multi_scenario_generation", True)):
                 assigns, emp_hours, total_hours, warnings, filled, total_slots, iters_done, restarts_done, diag = generate_schedule_multi_scenario(model_for_generation, label, prev_tick_map=prev_tick_map)
             else:
@@ -10208,6 +10373,8 @@ class SchedulerApp(tk.Tk):
         self.current_filled = filled
         self.current_total_slots = total_slots
         self.current_diagnostics = diag
+        if not _suppress_progress:
+            self._set_engine_status("Balancing coverage...", busy=True)
         # Store last run summary for Diagnostics (Milestone 0 helper)
         self.last_solver_summary = {
             'label': label,
@@ -10351,8 +10518,14 @@ class SchedulerApp(tk.Tk):
             self._refresh_change_viewer()
         except Exception:
             pass
+        if not _suppress_progress:
+            self._set_engine_status("Finalizing assignments...", busy=True)
+            self._set_engine_status("Updating schedule workspace...", busy=True)
         self._set_status("Schedule generated.")
         self.autosave()
+        if not _suppress_progress:
+            self._engine_status_stop("Generation complete")
+            self.after(900, lambda: self._engine_status_stop("Engine Idle"))
 
     def save_to_history(self):
         if not self.current_assignments:
@@ -10423,8 +10596,17 @@ class SchedulerApp(tk.Tk):
         self.export_lbl = ttk.Label(frm, text="", foreground="#555")
         self.export_lbl.pack(anchor="w")
 
-        self.preview_txt = tk.Text(frm, height=24)
-        self.preview_txt.pack(fill="both", expand=True, pady=(10,0))
+        prev_wrap = ttk.Frame(frm)
+        prev_wrap.pack(fill="both", expand=True, pady=(10,0))
+        self.preview_txt = tk.Text(prev_wrap, height=24, wrap="none")
+        pv_y = ttk.Scrollbar(prev_wrap, orient="vertical", command=self.preview_txt.yview)
+        pv_x = ttk.Scrollbar(prev_wrap, orient="horizontal", command=self.preview_txt.xview)
+        self.preview_txt.configure(yscrollcommand=pv_y.set, xscrollcommand=pv_x.set)
+        self.preview_txt.grid(row=0, column=0, sticky="nsew")
+        pv_y.grid(row=0, column=1, sticky="ns")
+        pv_x.grid(row=1, column=0, sticky="ew")
+        prev_wrap.rowconfigure(0, weight=1)
+        prev_wrap.columnconfigure(0, weight=1)
 
     def print_html(self):
         if not self.current_assignments:
@@ -11045,14 +11227,23 @@ class SchedulerApp(tk.Tk):
             ttk.Label(box, textvariable=self.analysis_metric_vars[key], style="SubHeader.TLabel").pack(anchor="w", padx=10, pady=(8,6))
 
         cols = ("Category", "Penalty", "Impact", "Notes")
-        self.analysis_tree = ttk.Treeview(frm, columns=cols, show="headings", height=10)
+        at_wrap = ttk.Frame(frm)
+        at_wrap.pack(fill="both", expand=False, pady=(0,8))
+        self.analysis_tree = ttk.Treeview(at_wrap, columns=cols, show="headings", height=10)
         for c in cols:
             self.analysis_tree.heading(c, text=c)
             w = 180
             if c == "Category": w = 220
             if c == "Notes": w = 520
             self.analysis_tree.column(c, width=w)
-        self.analysis_tree.pack(fill="both", expand=False, pady=(0,8))
+        at_ys = ttk.Scrollbar(at_wrap, orient="vertical", command=self.analysis_tree.yview)
+        at_xs = ttk.Scrollbar(at_wrap, orient="horizontal", command=self.analysis_tree.xview)
+        self.analysis_tree.configure(yscrollcommand=at_ys.set, xscrollcommand=at_xs.set)
+        self.analysis_tree.grid(row=0, column=0, sticky="nsew")
+        at_ys.grid(row=0, column=1, sticky="ns")
+        at_xs.grid(row=1, column=0, sticky="ew")
+        at_wrap.rowconfigure(0, weight=1)
+        at_wrap.columnconfigure(0, weight=1)
 
         body = ttk.Frame(frm); body.pack(fill="both", expand=True)
         self.analysis_text = tk.Text(body, wrap="word", height=14)
@@ -11279,7 +11470,7 @@ class SchedulerApp(tk.Tk):
     # -------- Schedule Change Viewer tab (Phase 4 D4) --------
     def _show_calloff_tab(self):
         try:
-            self.nb_mgmt.select(self.tab_calloff)
+            self.show_main_tab("calloff")
         except Exception:
             pass
 
@@ -11302,11 +11493,17 @@ class SchedulerApp(tk.Tk):
         wrap = ttk.Frame(win); wrap.pack(fill="both", expand=True, padx=10, pady=10)
         ttk.Label(wrap, text=f"Compare: {left_name} vs {right_name}", style="Header.TLabel").pack(anchor="w", pady=(0,8))
 
-        txt = tk.Text(wrap, wrap="word")
-        sb = ttk.Scrollbar(wrap, orient="vertical", command=txt.yview)
-        txt.configure(yscrollcommand=sb.set)
-        txt.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
+        txt_wrap = ttk.Frame(wrap)
+        txt_wrap.pack(fill="both", expand=True)
+        txt = tk.Text(txt_wrap, wrap="none")
+        sb = ttk.Scrollbar(txt_wrap, orient="vertical", command=txt.yview)
+        xb = ttk.Scrollbar(txt_wrap, orient="horizontal", command=txt.xview)
+        txt.configure(yscrollcommand=sb.set, xscrollcommand=xb.set)
+        txt.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        xb.grid(row=1, column=0, sticky="ew")
+        txt_wrap.rowconfigure(0, weight=1)
+        txt_wrap.columnconfigure(0, weight=1)
 
         if not segments:
             txt.insert("end", "No schedule differences were found between these two sources.\n")
@@ -11356,7 +11553,9 @@ class SchedulerApp(tk.Tk):
         self.change_summary_lbl.pack(fill="x", pady=(0,8))
 
         cols = ("Type", "Day", "Area", "Time", "From", "To")
-        self.change_tree = ttk.Treeview(frm, columns=cols, show="headings", height=12)
+        ch_wrap = ttk.Frame(frm)
+        ch_wrap.pack(fill="both", expand=False, pady=(0,8))
+        self.change_tree = ttk.Treeview(ch_wrap, columns=cols, show="headings", height=12)
         for c in cols:
             self.change_tree.heading(c, text=c)
             w = 120
@@ -11367,7 +11566,14 @@ class SchedulerApp(tk.Tk):
             if c == "Type":
                 w = 150
             self.change_tree.column(c, width=w, stretch=True)
-        self.change_tree.pack(fill="both", expand=False, pady=(0,8))
+        ch_ys = ttk.Scrollbar(ch_wrap, orient="vertical", command=self.change_tree.yview)
+        ch_xs = ttk.Scrollbar(ch_wrap, orient="horizontal", command=self.change_tree.xview)
+        self.change_tree.configure(yscrollcommand=ch_ys.set, xscrollcommand=ch_xs.set)
+        self.change_tree.grid(row=0, column=0, sticky="nsew")
+        ch_ys.grid(row=0, column=1, sticky="ns")
+        ch_xs.grid(row=1, column=0, sticky="ew")
+        ch_wrap.rowconfigure(0, weight=1)
+        ch_wrap.columnconfigure(0, weight=1)
 
         body = ttk.Frame(frm); body.pack(fill="both", expand=True)
         self.change_text = tk.Text(body, wrap="word", height=16)
@@ -12370,11 +12576,20 @@ class SchedulerApp(tk.Tk):
         ttk.Button(row, text="Toggle Done", command=self.toggle_manager_task_done).pack(side="left", padx=8)
 
         cols = ("Title", "Earliest", "Due", "Recurrence", "Status", "Description")
-        self.manager_tasks_tree = ttk.Treeview(frm, columns=cols, show="headings", height=12)
+        mt_wrap = ttk.Frame(frm)
+        mt_wrap.pack(fill="both", expand=True)
+        self.manager_tasks_tree = ttk.Treeview(mt_wrap, columns=cols, show="headings", height=12)
         for c in cols:
             self.manager_tasks_tree.heading(c, text=c)
             self.manager_tasks_tree.column(c, width=170 if c != "Description" else 360)
-        self.manager_tasks_tree.pack(fill="both", expand=True)
+        mt_ys = ttk.Scrollbar(mt_wrap, orient="vertical", command=self.manager_tasks_tree.yview)
+        mt_xs = ttk.Scrollbar(mt_wrap, orient="horizontal", command=self.manager_tasks_tree.xview)
+        self.manager_tasks_tree.configure(yscrollcommand=mt_ys.set, xscrollcommand=mt_xs.set)
+        self.manager_tasks_tree.grid(row=0, column=0, sticky="nsew")
+        mt_ys.grid(row=0, column=1, sticky="ns")
+        mt_xs.grid(row=1, column=0, sticky="ew")
+        mt_wrap.rowconfigure(0, weight=1)
+        mt_wrap.columnconfigure(0, weight=1)
         self.manager_tasks_tree.tag_configure("done", foreground="#8a8a8a")
         self.refresh_manager_tasks_tree()
 
@@ -12404,7 +12619,7 @@ class SchedulerApp(tk.Tk):
         top = tk.Toplevel(self)
         top.title("Add Manager Task" if mode == "add" else "Edit Manager Task")
         top.geometry("620x360")
-        box = ttk.Frame(top); box.pack(fill="both", expand=True, padx=12, pady=12)
+        _outer, box, _canvas = _build_scrollable_canvas_host(top, padding=(12, 12, 12, 12), min_width=560)
 
         title_var = tk.StringVar(value=getattr(seed, "title", ""))
         desc_var = tk.StringVar(value=getattr(seed, "description", ""))
@@ -12526,11 +12741,20 @@ class SchedulerApp(tk.Tk):
 
         ttk.Button(frm, text="Refresh", command=self.refresh_performance_view).pack(anchor="w", pady=(0,8))
         cols = ("Employee", "Call-Outs", "Time Off Requests", "Extra Shifts Picked Up")
-        self.perf_tree = ttk.Treeview(frm, columns=cols, show="headings", height=10)
+        perf_wrap = ttk.Frame(frm)
+        perf_wrap.pack(fill="x", expand=False)
+        self.perf_tree = ttk.Treeview(perf_wrap, columns=cols, show="headings", height=10)
         for c in cols:
             self.perf_tree.heading(c, text=c)
             self.perf_tree.column(c, width=220 if c == "Employee" else 170)
-        self.perf_tree.pack(fill="x", expand=False)
+        perf_ys = ttk.Scrollbar(perf_wrap, orient="vertical", command=self.perf_tree.yview)
+        perf_xs = ttk.Scrollbar(perf_wrap, orient="horizontal", command=self.perf_tree.xview)
+        self.perf_tree.configure(yscrollcommand=perf_ys.set, xscrollcommand=perf_xs.set)
+        self.perf_tree.grid(row=0, column=0, sticky="nsew")
+        perf_ys.grid(row=0, column=1, sticky="ns")
+        perf_xs.grid(row=1, column=0, sticky="ew")
+        perf_wrap.rowconfigure(0, weight=1)
+        perf_wrap.columnconfigure(0, weight=1)
         self.perf_tree.bind("<<TreeviewSelect>>", self._on_perf_select, add="+")
 
         body = ttk.Frame(frm); body.pack(fill="both", expand=True, pady=(8,0))
@@ -12921,13 +13145,22 @@ class SchedulerApp(tk.Tk):
             .pack(anchor="w", pady=(0,8))
 
         cols = ("Created","Label","TotalHours","Filled/Total","Warnings")
-        self.hist_tree = ttk.Treeview(frm, columns=cols, show="headings", height=18)
+        hist_wrap = ttk.Frame(frm)
+        hist_wrap.pack(fill="both", expand=True)
+        self.hist_tree = ttk.Treeview(hist_wrap, columns=cols, show="headings", height=18)
         for c in cols:
             self.hist_tree.heading(c, text=c)
             w=220 if c=="Label" else 140
             if c=="Warnings": w=520
             self.hist_tree.column(c, width=w)
-        self.hist_tree.pack(fill="both", expand=True)
+        hist_ys = ttk.Scrollbar(hist_wrap, orient="vertical", command=self.hist_tree.yview)
+        hist_xs = ttk.Scrollbar(hist_wrap, orient="horizontal", command=self.hist_tree.xview)
+        self.hist_tree.configure(yscrollcommand=hist_ys.set, xscrollcommand=hist_xs.set)
+        self.hist_tree.grid(row=0, column=0, sticky="nsew")
+        hist_ys.grid(row=0, column=1, sticky="ns")
+        hist_xs.grid(row=1, column=0, sticky="ew")
+        hist_wrap.rowconfigure(0, weight=1)
+        hist_wrap.columnconfigure(0, weight=1)
 
         btns = ttk.Frame(frm); btns.pack(fill="x", pady=(8,0))
         ttk.Button(btns, text="Delete Selected", command=self.delete_history).pack(side="left")
@@ -12966,7 +13199,7 @@ class SchedulerApp(tk.Tk):
 
     # -------- Settings tab --------
     def _build_settings_tab(self):
-        frm = ttk.Frame(self.tab_settings); frm.pack(fill="both", expand=True, padx=12, pady=12)
+        _outer, frm, _canvas = _build_scrollable_canvas_host(self.tab_settings, padding=(12, 12, 12, 12), min_width=980)
         ttk.Label(frm, text="Solver + UI settings.", style="SubHeader.TLabel").pack(anchor="w", pady=(0,8))
 
         box = ttk.LabelFrame(frm, text="UI")
